@@ -1,0 +1,155 @@
+﻿name: Build & Release
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  get-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      tag_exists: ${{ steps.t.outputs.exists }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - id: v
+        run: |
+          V=$(grep -oP '\.version\s*=\s*"\K[^"]+' build.zig.zon)
+          [ -z "$V" ] && echo "Cannot extract version" && exit 1
+          echo "version=v${V}" >> $GITHUB_OUTPUT
+      - id: t
+        run: |
+          git rev-parse "${{ steps.v.outputs.version }}" >/dev/null 2>&1 \
+            && echo "exists=true" >> $GITHUB_OUTPUT \
+            || echo "exists=false" >> $GITHUB_OUTPUT
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,  make: true }
+          - { os: windows-latest, make: false }
+          - { os: macos-latest,   make: true }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with: { version: "0.15.1" }
+      - if: ${{ matrix.make }}
+        run: make test && make release
+      - if: ${{ !matrix.make }}
+        shell: pwsh
+        run: |
+          zig build test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          zig build -Doptimize=ReleaseSmall
+
+  build-release:
+    needs: [get-version, test]
+    if: |
+      github.event_name == 'release' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && needs.get-version.outputs.tag_exists == 'false')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: mlugg/setup-zig@v2
+        with: { version: "0.15.1" }
+
+      - name: Build & collect
+        run: |
+          make release
+          mkdir -p release
+          cd zig-out/bin
+          for f in velora-*; do
+            [ -f "$f" ] || continue
+            case "$f" in
+              *.pdb)
+                continue
+                ;;
+              *)
+                cp "$f" ../../release/
+                ;;
+            esac
+          done
+          ls -lah ../../release/
+
+      - name: Generate changelog
+        id: cl
+        run: |
+          V="${{ needs.get-version.outputs.version }}"
+          REPO="${{ github.repository }}"
+          BASE="https://github.com/${REPO}/releases/download/${V}"
+          PREV=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          [ -z "$PREV" ] \
+            && COMMITS=$(git log --oneline --pretty=format:"- %s (%h)" | head -50) \
+            || COMMITS=$(git log ${PREV}..HEAD --oneline --pretty=format:"- %s (%h)")
+
+          badge() {
+            echo "| [![${1}](https://img.shields.io/badge/${2}-${3}-${4}?style=for-the-badge&logo=${5}&logoColor=${6})](${BASE}/${7}) | ${8} |"
+          }
+
+          {
+            echo "CHANGELOG<<EOF"
+            echo "## 鏇存柊鏃ュ織"
+            echo ""
+            echo "$COMMITS"
+            echo ""
+            echo "---"
+            echo ""
+            echo "## 馃摝 涓嬭浇"
+            echo ""
+            echo "| 涓嬭浇 | 璇存槑 |"
+            echo "|:----:|:-----|"
+            for f in release/*; do
+              n=$(basename "$f")
+              case "$n" in
+                *alpine*x86_64*)    badge "Alpine x86_64"       "Alpine"  "x86__64"      "0D597F" alpinelinux white "$n" "Alpine Linux x86_64 (musl)" ;;
+                *alpine*aarch64*)   badge "Alpine aarch64"      "Alpine"  "aarch64"      "0D597F" alpinelinux white "$n" "Alpine Linux ARM64 (musl)" ;;
+                *alpine*arm*)       badge "Alpine ARM"          "Alpine"  "ARM"          "0D597F" alpinelinux white "$n" "Alpine Linux ARM 32-bit (musl)" ;;
+                *linux*x86_64*)     badge "Linux x86_64"        "Linux"   "x86__64"      "FCC624" linux   black "$n" "Linux x86_64" ;;
+                *linux*aarch64*)    badge "Linux aarch64"       "Linux"   "aarch64"      "FCC624" linux   black "$n" "Linux ARM64" ;;
+                *linux*arm*)        badge "Linux ARM"           "Linux"   "ARM"          "FCC624" linux   black "$n" "Linux ARM 32-bit" ;;
+                *linux*i386*)       badge "Linux i386"          "Linux"   "i386"         "FCC624" linux   black "$n" "Linux x86 32-bit" ;;
+                *linux*loongarch64*)badge "Linux loongarch64"   "Linux"   "loongarch64"  "FCC624" linux   black "$n" "Linux LoongArch64" ;;
+                *linux*ppc64le*)    badge "Linux ppc64le"       "Linux"   "ppc64le"      "FCC624" linux   black "$n" "Linux PowerPC 64 LE" ;;
+                *linux*riscv64*)    badge "Linux riscv64"       "Linux"   "riscv64"      "FCC624" linux   black "$n" "Linux RISC-V 64" ;;
+                *linux*s390x*)      badge "Linux s390x"         "Linux"   "s390x"        "FCC624" linux   black "$n" "Linux s390x" ;;
+                *windows*x86_64*)   badge "Windows x86_64"      "Windows" "x86__64"      "0078D6" windows white "$n" "Windows x86_64" ;;
+                *windows*aarch64*)  badge "Windows aarch64"     "Windows" "aarch64"      "0078D6" windows white "$n" "Windows ARM64" ;;
+                *windows*i386*)     badge "Windows i386"        "Windows" "i386"         "0078D6" windows white "$n" "Windows x86 32-bit" ;;
+                *macos*x86_64*)     badge "macOS Intel"         "macOS"   "Intel"        "000000" apple   white "$n" "macOS Intel x86_64" ;;
+                *macos*aarch64*)    badge "macOS Apple Silicon" "macOS"   "Apple%20Silicon" "000000" apple white "$n" "macOS Apple Silicon" ;;
+                *freebsd*x86_64*)   badge "FreeBSD x86_64"      "FreeBSD" "x86__64"      "AB2B28" freebsd red "$n" "FreeBSD x86_64" ;;
+                *freebsd*aarch64*)  badge "FreeBSD aarch64"     "FreeBSD" "aarch64"      "AB2B28" freebsd red "$n" "FreeBSD ARM64" ;;
+                *)
+                  safe=$(echo "$n" | sed 's/-/--/g')
+                  badge "Download" "Download" "${safe}" "grey" "data:," white "$n" "$n"
+                  ;;
+              esac
+            done
+            echo ""
+            echo "---"
+            echo "> **Linux/macOS/FreeBSD**: download the raw binary, add execute permission if needed, then run \`--install\` | **Windows**: run \`velora-*.exe --install\` directly | **Alpine**: choose \`velora-alpine-*\` (musl)"
+            echo "EOF"
+          } >> $GITHUB_OUTPUT
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.get-version.outputs.version }}
+          name: Release ${{ needs.get-version.outputs.version }}
+          body: ${{ steps.cl.outputs.CHANGELOG }}
+          files: release/*
+          make_latest: true
