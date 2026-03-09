@@ -102,15 +102,15 @@ jobs:
 
           {
             echo "CHANGELOG<<EOF"
-            echo "## 鏇存柊鏃ュ織"
+            echo "##  更新日志"
             echo ""
             echo "$COMMITS"
             echo ""
             echo "---"
             echo ""
-            echo "## 馃摝 涓嬭浇"
+            echo "## 📦 下载"
             echo ""
-            echo "| 涓嬭浇 | 璇存槑 |"
+            echo "| 下载 | 说明 |"
             echo "|:----:|:-----|"
             for f in release/*; do
               n=$(basename "$f")
