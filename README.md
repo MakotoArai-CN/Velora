@@ -1,6 +1,6 @@
 # Velora
 
-`Velora` 是一个使用 Zig 编写的 OpenAI API Key 同步工具，用于全自动同步 `www.fuckopenai.net` 的 API Key ，免去繁杂的替换步骤。
+`Velora` 是一个使用 Zig 编写的 OpenAI API Key 同步工具，用于全自动同步 API Key ，免去繁杂的替换步骤。
 
 ## 支持平台
 
