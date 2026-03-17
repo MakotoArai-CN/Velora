@@ -1,9 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const app = @import("app.zig");
-const autostart = @import("autostart.zig");
 const config_mod = @import("config.zig");
-const env = @import("env.zig");
 
 pub fn install(allocator: std.mem.Allocator) ![]u8 {
     const source_path = try getSelfExePath(allocator);
@@ -25,14 +23,6 @@ pub fn install(allocator: std.mem.Allocator) ![]u8 {
 }
 
 pub fn uninstall(allocator: std.mem.Allocator) !void {
-    const binding = config_mod.loadBinding(allocator) catch null;
-
-    autostart.disable(allocator) catch {};
-
-    if (binding) |b| {
-        env.clearManagedKey(allocator, b.location) catch {};
-    }
-
     const bin_dir = config_mod.getInstallBinDir(allocator) catch null;
     defer if (bin_dir) |path| allocator.free(path);
     if (bin_dir) |path| {
@@ -65,8 +55,6 @@ pub fn uninstall(allocator: std.mem.Allocator) !void {
             };
         }
     }
-
-    config_mod.deleteLegacyBinding(allocator) catch {};
 }
 
 fn getSelfExePath(allocator: std.mem.Allocator) ![]u8 {
@@ -179,15 +167,22 @@ fn updatePathShellFile(allocator: std.mem.Allocator, path: []const u8, bin_dir: 
     var content: std.ArrayListUnmanaged(u8) = .empty;
     defer content.deinit(allocator);
 
-    const existing = blk: {
-        const file = std.fs.openFileAbsolute(path, .{}) catch break :blk false;
+    {
+        const file = std.fs.openFileAbsolute(path, .{}) catch {
+            if (add) {
+                const out_file = try std.fs.createFileAbsolute(path, .{});
+                defer out_file.close();
+                const export_line = try std.fmt.allocPrint(allocator, "{s}\nexport PATH=\"{s}:$PATH\"\n", .{ app.path_marker, bin_dir });
+                defer allocator.free(export_line);
+                try out_file.writeAll(export_line);
+            }
+            return;
+        };
         defer file.close();
         var buf: [65536]u8 = undefined;
-        const bytes_read = file.readAll(&buf) catch break :blk false;
+        const bytes_read = file.readAll(&buf) catch return;
         try content.appendSlice(allocator, buf[0..bytes_read]);
-        break :blk true;
-    };
-    _ = existing;
+    }
 
     const export_line = try std.fmt.allocPrint(allocator, "export PATH=\"{s}:$PATH\"", .{bin_dir});
     defer allocator.free(export_line);

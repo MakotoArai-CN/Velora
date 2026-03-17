@@ -5,13 +5,14 @@ const output = @import("output.zig");
 const terminal = @import("terminal.zig");
 const i18n = @import("i18n.zig");
 const config_mod = @import("config.zig");
-const env = @import("env.zig");
-const daemon = @import("daemon.zig");
-const autostart = @import("autostart.zig");
+const sites_mod = @import("sites.zig");
+const apply_mod = @import("apply.zig");
+const check_mod = @import("check.zig");
 const install_mod = @import("install.zig");
-const http = @import("http.zig");
+const update_mod = @import("update.zig");
+const app = @import("app.zig");
 
-pub const version = "1.0.0";
+pub const version = "2.0.0";
 
 pub fn main() !void {
     var gpa_impl: std.heap.DebugAllocator(.{}) = .init;
@@ -32,7 +33,7 @@ pub fn main() !void {
                 var stderr_buffer: [512]u8 = undefined;
                 var stderr_writer = std.fs.File.stderr().writer(&stderr_buffer);
                 const w = &stderr_writer.interface;
-                w.print("Unknown argument. Use --help for usage.\n", .{}) catch {};
+                w.print("Invalid argument. Use 'velora--help' for usage.\n", .{}) catch {};
                 w.flush() catch {};
                 return;
             },
@@ -49,218 +50,370 @@ pub fn main() !void {
 
     var stdout_buffer: [8192]u8 = undefined;
     var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
-    var discard_buffer: [1]u8 = undefined;
-    var discard_writer = std.Io.Writer.Discarding.init(&discard_buffer);
-    const w: *std.Io.Writer = switch (config.command) {
-        .background_sync => &discard_writer.writer,
-        else => &stdout_writer.interface,
-    };
+    const w: *std.Io.Writer = &stdout_writer.interface;
     const caps = terminal.TermCaps.detect();
     const lang = config.language;
 
-    if (config.command != .background_sync) {
-        try output.printBanner(w, caps, version);
-        try w.flush();
-    }
+    try output.printBanner(w, caps, version);
+    try w.flush();
 
     switch (config.command) {
-        .setup => try runSetup(gpa, w, caps, lang, config.interval_minutes),
-        .sync => try runSync(gpa, w, caps, lang),
-        .daemon => try runDaemon(gpa, w, caps, lang, config.interval_minutes),
-        .background_sync => try runBackgroundSync(gpa, lang),
-        .autostart_enable => try runAutostartEnable(gpa, w, caps, lang, config.interval_minutes),
-        .autostart_disable => try runAutostartDisable(gpa, w, caps, lang),
+        .add => |args| try runAdd(gpa, w, caps, lang, args),
+        .edit => |args| try runEdit(gpa, w, caps, lang, args),
+        .del => |args| try runDel(gpa, w, caps, lang, args),
+        .list => |args| try runList(gpa, w, caps, lang, args),
+        .use => |args| try runUse(gpa, w, caps, lang, args),
         .install => try runInstall(gpa, w, caps, lang),
         .uninstall => try runUninstall(gpa, w, caps, lang),
-        .status => try runStatus(gpa, w, caps, lang),
+        .update_check => try runUpdate(gpa, w, caps, lang),
+        .version => try runVersion(gpa, w, caps, lang),
+        .help => {},
     }
 }
 
-fn runSetup(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCaps, lang: i18n.Language, interval: u32) !void {
-    _ = try configureInteractively(allocator, w, caps, lang, interval);
+// --- Add ---
 
-    try output.printSeparator(w, caps);
-    try output.printInfo(w, i18n.tr(lang, "Running initial sync...", "正在执行首次同步...", "初回同期を実行中..."), caps);
-    try w.flush();
+fn runAdd(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCaps, lang: i18n.Language, args: cli.AddArgs) !void {
+    try output.printSectionHeader(w, i18n.tr(lang, "Add Site", "添加站点", "サイト追加"), caps);
 
-    _ = daemon.runOnce(allocator, w, caps, lang) catch {};
+    var store = try sites_mod.loadSites(allocator);
+    defer store.deinit(allocator);
 
-    try output.printSeparator(w, caps);
-    try w.flush();
-}
+    const existing = store.getSite(args.alias);
 
-fn configureInteractively(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCaps, lang: i18n.Language, interval: u32) !config_mod.BindingConfig {
-    try output.printSectionHeader(w, i18n.tr(lang, "Setup", "配置向导", "セットアップ"), caps);
+    // Direct mode: all fields provided via CLI
+    if (args.site_type != null and args.base_url != null and args.api_key != null) {
+        const site = sites_mod.Site{
+            .site_type = args.site_type.?,
+            .base_url = args.base_url.?,
+            .api_key = args.api_key.?,
+        };
+        try store.addOrUpdate(allocator, args.alias, site);
+        try sites_mod.saveSites(allocator, &store);
 
-    try output.printInfo(w, i18n.tr(lang, "Where should OPENAI_API_KEY be stored?", "OPENAI_API_KEY应该存储在哪里？", "OPENAI_API_KEYをどこに保存しますか？"), caps);
-
-    try output.printMenuItem(w, 1, i18n.tr(lang, "Environment variable (shell rc files / Windows registry)", "环境变量（shell配置文件 / Windows注册表）", "環境変数（シェル設定ファイル / Windowsレジストリ）"), caps);
-    try output.printMenuItem(w, 2, i18n.tr(lang, config_mod.display_auth_json_path, config_mod.display_auth_json_path, config_mod.display_auth_json_path), caps);
-    try output.printMenuItem(w, 3, i18n.tr(lang, config_mod.display_config_toml_path, config_mod.display_config_toml_path, config_mod.display_config_toml_path), caps);
-    try output.printMenuItem(w, 4, i18n.tr(lang, "Auto-detect existing configuration", "自动检测已有配置", "既存設定を自動検出"), caps);
-
-    try output.printPrompt(w, i18n.tr(lang, "Choose [1-4]:", "请选择 [1-4]:", "選択してください [1-4]:"), caps);
-    try w.flush();
-
-    var input_buf: [16]u8 = undefined;
-    const input_len = std.fs.File.stdin().read(&input_buf) catch 0;
-    const input = std.mem.trim(u8, input_buf[0..input_len], " \t\r\n");
-
-    const location: config_mod.StorageLocation = blk: {
-        if (std.mem.eql(u8, input, "1")) {
-            break :blk .env;
-        } else if (std.mem.eql(u8, input, "2")) {
-            break :blk .auth_json;
-        } else if (std.mem.eql(u8, input, "3")) {
-            break :blk .config_toml;
-        } else if (std.mem.eql(u8, input, "4")) {
-            try output.printInfo(w, i18n.tr(lang, "Scanning for existing OPENAI_API_KEY...", "正在扫描已有的OPENAI_API_KEY...", "既存のOPENAI_API_KEYをスキャン中..."), caps);
-            try w.flush();
-
-            const detected = env.detectExistingLocation(allocator) catch null;
-            if (detected) |loc| {
-                const loc_name: []const u8 = switch (loc) {
-                    .env => "Environment variable",
-                    .auth_json => config_mod.display_auth_json_path,
-                    .config_toml => config_mod.display_config_toml_path,
-                };
-                try output.printSuccess(w, loc_name, caps);
-                try w.flush();
-                break :blk loc;
-            } else {
-                try output.printWarning(w, i18n.tr(lang, "No existing config found, defaulting to environment variable", "未检测到已有配置，默认使用环境变量", "既存設定が見つかりません、環境変数をデフォルトにします"), caps);
-                try w.flush();
-                break :blk .env;
-            }
-        } else {
-            try output.printWarning(w, i18n.tr(lang, "Invalid choice, defaulting to environment variable", "无效选择，默认使用环境变量", "無効な選択、環境変数をデフォルトにします"), caps);
-            try w.flush();
-            break :blk .env;
-        }
-    };
-
-    const binding: config_mod.BindingConfig = .{
-        .location = location,
-        .interval_minutes = interval,
-    };
-
-    config_mod.saveBinding(allocator, binding) catch |err| {
-        try output.printError(w, i18n.tr(lang, "Failed to save configuration", "保存配置失败", "設定の保存に失敗しました"), caps);
+        var msg_buf: [128]u8 = undefined;
+        const msg = std.fmt.bufPrint(&msg_buf, "Site '{s}' added ({s})", .{ args.alias, site.site_type.displayName() }) catch "Site added";
+        try output.printSuccess(w, msg, caps);
         try w.flush();
-        return err;
-    };
+        return;
+    }
 
-    try output.printSuccess(w, i18n.tr(lang, "Configuration saved", "配置已保存", "設定を保存しました"), caps);
+    // Interactive mode
+    if (existing) |ex| {
+        // Site already exists
+        var alias_buf: [128]u8 = undefined;
+        const prompt_msg = std.fmt.bufPrint(&alias_buf, "{s} '{s}' {s}", .{
+            i18n.tr(lang, "Site", "站点", "サイト"),
+            args.alias,
+            i18n.tr(lang, "already exists. Continue configuring? [Y/n]", "已存在，继续配置？[Y/n]", "は既に存在します。設定を続けますか？[Y/n]"),
+        }) catch "Site exists. Continue? [Y/n]";
+        try output.printWarning(w, prompt_msg, caps);
+        try w.flush();
+
+        const answer = readLine();
+        const continue_edit = answer.len == 0 or answer[0] == 'y' or answer[0] == 'Y';
+
+        if (continue_edit) {
+            // Fill in missing fields
+            const site_type = args.site_type orelse askSiteType(w, caps, lang) orelse ex.site_type;
+            const base_url = askBaseUrl(w, caps, lang, ex.base_url);
+            const api_key = askApiKey(w, caps, lang, ex.api_key);
+
+            const site = sites_mod.Site{ .site_type = site_type, .base_url = base_url, .api_key = api_key };
+            try store.addOrUpdate(allocator, args.alias, site);
+            try sites_mod.saveSites(allocator, &store);
+            try output.printSuccess(w, i18n.tr(lang, "Site updated", "站点已更新", "サイトを更新しました"), caps);
+        } else {
+            // Full reconfigure
+            const site_type = args.site_type orelse askSiteType(w, caps, lang) orelse return;
+            const base_url = askBaseUrl(w, caps, lang, null);
+            const api_key = askApiKey(w, caps, lang, null);
+
+            const site = sites_mod.Site{ .site_type = site_type, .base_url = base_url, .api_key = api_key };
+            try store.addOrUpdate(allocator, args.alias, site);
+            try sites_mod.saveSites(allocator, &store);
+            try output.printSuccess(w, i18n.tr(lang, "Site reconfigured", "站点已重新配置", "サイトを再設定しました"), caps);
+        }
+    } else {
+        // New site
+        const site_type = args.site_type orelse askSiteType(w, caps, lang) orelse return;
+        const base_url = askBaseUrl(w, caps, lang, null);
+        const api_key = askApiKey(w, caps, lang, null);
+
+        const site = sites_mod.Site{ .site_type = site_type, .base_url = base_url, .api_key = api_key };
+        try store.addOrUpdate(allocator, args.alias, site);
+        try sites_mod.saveSites(allocator, &store);
+
+        var msg_buf: [128]u8 = undefined;
+        const msg = std.fmt.bufPrint(&msg_buf, "Site '{s}' added ({s})", .{ args.alias, site.site_type.displayName() }) catch "Site added";
+        try output.printSuccess(w, msg, caps);
+    }
     try w.flush();
-    return binding;
 }
 
-fn tryAutoConfigure(allocator: std.mem.Allocator, interval: u32) !?config_mod.BindingConfig {
-    const detected = try env.detectExistingLocation(allocator);
-    const location = detected orelse return null;
+// --- Edit ---
 
-    const binding: config_mod.BindingConfig = .{
-        .location = location,
-        .interval_minutes = interval,
-    };
-    try config_mod.saveBinding(allocator, binding);
-    return binding;
-}
+fn runEdit(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCaps, lang: i18n.Language, args: cli.EditArgs) !void {
+    try output.printSectionHeader(w, i18n.tr(lang, "Edit Site", "编辑站点", "サイト編集"), caps);
 
-fn ensureBindingInteractive(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCaps, lang: i18n.Language, interval: u32) !config_mod.BindingConfig {
-    if (try config_mod.loadBinding(allocator)) |binding| {
-        return binding;
-    }
+    var store = try sites_mod.loadSites(allocator);
+    defer store.deinit(allocator);
 
-    if (try tryAutoConfigure(allocator, interval)) |binding| {
-        return binding;
-    }
-
-    return try configureInteractively(allocator, w, caps, lang, interval);
-}
-
-fn ensureBindingSilently(allocator: std.mem.Allocator) !?config_mod.BindingConfig {
-    if (try config_mod.loadBinding(allocator)) |binding| {
-        return binding;
-    }
-
-    return try tryAutoConfigure(allocator, 60);
-}
-
-fn runSync(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCaps, lang: i18n.Language) !void {
-    _ = try ensureBindingInteractive(allocator, w, caps, lang, 60);
-
-    try output.printSectionHeader(w, i18n.tr(lang, "Sync", "同步", "同期"), caps);
-    try w.flush();
-
-    _ = daemon.runOnce(allocator, w, caps, lang) catch {};
-
-    try output.printSeparator(w, caps);
-    try w.flush();
-}
-
-fn runDaemon(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCaps, lang: i18n.Language, interval: u32) !void {
-    var binding = try ensureBindingInteractive(allocator, w, caps, lang, interval);
-    if (interval != 60) {
-        binding.interval_minutes = interval;
-        config_mod.saveBinding(allocator, binding) catch {};
-    }
-
-    try daemon.runLoop(allocator, w, caps, lang, binding.interval_minutes);
-}
-
-fn runBackgroundSync(allocator: std.mem.Allocator, lang: i18n.Language) !void {
-    _ = try ensureBindingSilently(allocator) orelse return;
-
-    var discard_buffer: [1]u8 = undefined;
-    var discard_writer = std.Io.Writer.Discarding.init(&discard_buffer);
-    const silent_caps: terminal.TermCaps = .{
-        .color = false,
-        .unicode = false,
-        .width = 80,
-    };
-
-    _ = daemon.runOnce(allocator, &discard_writer.writer, silent_caps, lang) catch {};
-}
-
-fn runAutostartEnable(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCaps, lang: i18n.Language, interval: u32) !void {
-    var binding = try ensureBindingInteractive(allocator, w, caps, lang, interval);
-    if (interval != 60) {
-        binding.interval_minutes = interval;
-        config_mod.saveBinding(allocator, binding) catch {};
-    }
-
-    try output.printSectionHeader(w, i18n.tr(lang, "Autostart", "自启动", "自動起動"), caps);
-
-    const exe_path = getExePath(allocator) catch {
-        try output.printError(w, i18n.tr(lang, "Cannot determine executable path", "无法确定可执行文件路径", "実行ファイルパスを特定できません"), caps);
+    const existing = store.getSite(args.alias) orelse {
+        var err_buf: [128]u8 = undefined;
+        const err_msg = std.fmt.bufPrint(&err_buf, "Site '{s}' not found", .{args.alias}) catch "Site not found";
+        try output.printError(w, err_msg, caps);
         try w.flush();
         return;
     };
-    defer allocator.free(exe_path);
 
-    autostart.enable(allocator, exe_path, interval) catch |err| {
-        try output.printError(w, i18n.tr(lang, "Failed to enable autostart", "启用自启动失败", "自動起動の有効化に失敗しました"), caps);
-        try w.flush();
-        return err;
-    };
+    // Show current config
+    try output.printInfo(w, i18n.tr(lang, "Current configuration:", "当前配置:", "現在の設定:"), caps);
+    try output.printKeyValue(w, "  Type:", existing.site_type.displayName(), caps);
+    try output.printKeyValue(w, "  Base URL:", existing.base_url, caps);
+    var masked_buf: [64]u8 = undefined;
+    const masked = sites_mod.maskKey(&masked_buf, existing.api_key);
+    try output.printKeyValue(w, "  API Key:", masked, caps);
+    try output.printSeparator(w, caps);
 
-    try output.printSuccess(w, i18n.tr(lang, "Autostart enabled", "自启动已启用", "自動起動が有効化されました"), caps);
+    try output.printInfo(w, i18n.tr(lang, "Press Enter to keep current value", "按回车保留当前值", "Enterキーで現在の値を保持"), caps);
+    try w.flush();
+
+    const site_type = askSiteType(w, caps, lang) orelse existing.site_type;
+    const base_url = askBaseUrl(w, caps, lang, existing.base_url);
+    const api_key = askApiKey(w, caps, lang, existing.api_key);
+
+    const site = sites_mod.Site{ .site_type = site_type, .base_url = base_url, .api_key = api_key };
+    try store.addOrUpdate(allocator, args.alias, site);
+    try sites_mod.saveSites(allocator, &store);
+
+    try output.printSuccess(w, i18n.tr(lang, "Site updated", "站点已更新", "サイトを更新しました"), caps);
     try w.flush();
 }
 
-fn runAutostartDisable(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCaps, lang: i18n.Language) !void {
-    try output.printSectionHeader(w, i18n.tr(lang, "Autostart", "自启动", "自動起動"), caps);
+// --- Del ---
 
-    autostart.disable(allocator) catch |err| {
-        try output.printError(w, i18n.tr(lang, "Failed to disable autostart", "禁用自启动失败", "自動起動の無効化に失敗しました"), caps);
+fn runDel(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCaps, lang: i18n.Language, args: cli.DelArgs) !void {
+    try output.printSectionHeader(w, i18n.tr(lang, "Delete Site", "删除站点", "サイト削除"), caps);
+
+    var store = try sites_mod.loadSites(allocator);
+    defer store.deinit(allocator);
+
+    if (store.getSite(args.alias) == null) {
+        var err_buf: [128]u8 = undefined;
+        const err_msg = std.fmt.bufPrint(&err_buf, "Site '{s}' not found", .{args.alias}) catch "Site not found";
+        try output.printError(w, err_msg, caps);
         try w.flush();
-        return err;
-    };
+        return;
+    }
 
-    try output.printSuccess(w, i18n.tr(lang, "Autostart disabled", "自启动已禁用", "自動起動が無効化されました"), caps);
+    var prompt_buf: [128]u8 = undefined;
+    const prompt_msg = std.fmt.bufPrint(&prompt_buf, "{s} '{s}'? [y/N]", .{
+        i18n.tr(lang, "Delete site", "删除站点", "サイトを削除"),
+        args.alias,
+    }) catch "Delete? [y/N]";
+    try output.printWarning(w, prompt_msg, caps);
+    try w.flush();
+
+    const answer = readLine();
+    if (answer.len > 0 and (answer[0] == 'y' or answer[0] == 'Y')) {
+        _ = store.remove(args.alias);
+        try sites_mod.saveSites(allocator, &store);
+        try output.printSuccess(w, i18n.tr(lang, "Site deleted", "站点已删除", "サイトを削除しました"), caps);
+    } else {
+        try output.printInfo(w, i18n.tr(lang, "Cancelled", "已取消", "キャンセルしました"), caps);
+    }
     try w.flush();
 }
+
+// --- List ---
+
+fn runList(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCaps, lang: i18n.Language, args: cli.ListArgs) !void {
+    try output.printSectionHeader(w, i18n.tr(lang, "Sites", "站点列表", "サイト一覧"), caps);
+
+    var store = try sites_mod.loadSites(allocator);
+    defer store.deinit(allocator);
+
+    if (store.count == 0) {
+        try output.printInfo(w, i18n.tr(lang, "No sites configured. Use 'velora add<alias>' to add one.", "未配置站点，使用 'velora add<别名>' 添加", "サイトが未設定です。'velora add<エイリアス>' で追加してください"), caps);
+        try w.flush();
+        return;
+    }
+
+    if (args.show_all) {
+        // Detailed view - single column, show base_url + masked api_key
+        for (0..store.count) |i| {
+            const entry = store.entries[i];
+            try w.print("\n", .{});
+
+            var alias_buf: [128]u8 = undefined;
+            const alias_display = std.fmt.bufPrint(&alias_buf, "{s} ({s})", .{ entry.alias, entry.site.site_type.displayName() }) catch entry.alias;
+            try output.printInfo(w, alias_display, caps);
+            try output.printKeyValue(w, "    Base URL:", entry.site.base_url, caps);
+            var masked_buf: [64]u8 = undefined;
+            const masked = sites_mod.maskKey(&masked_buf, entry.site.api_key);
+            try output.printKeyValue(w, "    API Key:", masked, caps);
+        }
+        try output.printSeparator(w, caps);
+        try w.flush();
+        return;
+    }
+
+    // Standard list with connectivity check
+    try output.printInfo(w, i18n.tr(lang, "Checking connectivity...", "正在检测连通性...", "接続を確認中..."), caps);
+    try w.flush();
+
+    const statuses = try check_mod.checkAllSites(allocator, &store);
+    defer if (statuses.len > 0) allocator.free(statuses);
+
+    const total = statuses.len;
+
+    if (total <= 8) {
+        // Single column
+        for (statuses) |status| {
+            try printSiteStatusLine(w, caps, status, 0);
+        }
+    } else {
+        // Two-column layout
+        const left_count = (total + 1) / 2;
+        const col_width: u32 = if (caps.width > 8) (caps.width - 4) / 2 else 40;
+
+        for (0..left_count) |i| {
+            try printSiteStatusLine(w, caps, statuses[i], col_width);
+            const right_idx = i + left_count;
+            if (right_idx < total) {
+                try printSiteStatusLine(w, caps, statuses[right_idx], 0);
+            } else {
+                try w.print("\n", .{});
+            }
+        }
+    }
+
+    try output.printSeparator(w, caps);
+    try w.flush();
+}
+
+fn printSiteStatusLine(w: *std.Io.Writer, caps: terminal.TermCaps, status: check_mod.SiteStatus, col_width: u32) !void {
+    const check_sym = if (caps.unicode) "✓" else "[OK]";
+    const fail_sym = if (caps.unicode) "✗" else "[X]";
+
+    if (status.conn.reachable) {
+        var latency_buf: [32]u8 = undefined;
+        const latency_str = if (status.conn.latency_ms) |ms|
+            std.fmt.bufPrint(&latency_buf, "{d}ms", .{ms}) catch "?"
+        else
+            "?";
+
+        var line_buf: [256]u8 = undefined;
+        const line = std.fmt.bufPrint(&line_buf, "  {s}{s}{s}{s} {s} ({s}) {s}{s}{s}", .{
+            if (caps.color) output.Color.miku_green else "",
+            check_sym,
+            if (caps.color) output.Color.reset else "",
+            if (caps.color) output.Color.miku_white else "",
+            status.alias,
+            status.site.site_type.displayName(),
+            if (caps.color) output.Color.miku_gray else "",
+            latency_str,
+            if (caps.color) output.Color.reset else "",
+        }) catch "";
+        try w.print("{s}", .{line});
+    } else {
+        var line_buf: [256]u8 = undefined;
+        const line = std.fmt.bufPrint(&line_buf, "  {s}{s}{s}{s} {s} ({s}) {s}unreachable{s}", .{
+            if (caps.color) output.Color.miku_red else "",
+            fail_sym,
+            if (caps.color) output.Color.reset else "",
+            if (caps.color) output.Color.miku_white else "",
+            status.alias,
+            status.site.site_type.displayName(),
+            if (caps.color) output.Color.miku_red else "",
+            if (caps.color) output.Color.reset else "",
+        }) catch "";
+        try w.print("{s}", .{line});
+    }
+
+    if (col_width > 0) {
+        // Pad to column width for two-column layout
+        const actual_w = output.displayWidth(status.alias) + 20; // rough estimate
+        if (actual_w < col_width) {
+            var remaining = col_width - actual_w;
+            while (remaining > 0) : (remaining -= 1) {
+                try w.print(" ", .{});
+            }
+        }
+    } else {
+        try w.print("\n", .{});
+    }
+}
+
+// --- Use ---
+
+fn runUse(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCaps, lang: i18n.Language, args: cli.UseArgs) !void {
+    const header = switch (args.site_type) {
+        .cx => i18n.tr(lang, "Apply to Codex", "应用到 Codex", "Codexに適用"),
+        .cc => i18n.tr(lang, "Apply to Claude Code", "应用到 Claude Code", "Claude Codeに適用"),
+        .oc => i18n.tr(lang, "Apply to OpenCode", "应用到 OpenCode", "OpenCodeに適用"),
+    };
+    try output.printSectionHeader(w, header, caps);
+
+    var store = try sites_mod.loadSites(allocator);
+    defer store.deinit(allocator);
+
+    const site = store.getSite(args.alias) orelse {
+        var err_buf: [128]u8 = undefined;
+        const err_msg = std.fmt.bufPrint(&err_buf, "Site '{s}' not found", .{args.alias}) catch "Site not found";
+        try output.printError(w, err_msg, caps);
+        try w.flush();
+        return;
+    };
+
+    // Type mismatch warning
+    if (site.site_type != args.site_type) {
+        var warn_buf: [256]u8 = undefined;
+        const warn_msg = std.fmt.bufPrint(&warn_buf, "{s} (site type: {s}, target: {s})", .{
+            i18n.tr(lang, "Type mismatch", "类型不匹配", "タイプ不一致"),
+            site.site_type.displayName(),
+            args.site_type.displayName(),
+        }) catch "Type mismatch";
+        try output.printWarning(w, warn_msg, caps);
+        try w.flush();
+    }
+
+    // Apply
+    switch (args.site_type) {
+        .cx => try apply_mod.applyToCodex(allocator, w, caps, lang, site),
+        .cc => try apply_mod.applyToClaudeCode(allocator, w, caps, lang, site),
+        .oc => try apply_mod.applyToOpenCode(allocator, w, caps, lang, site),
+    }
+
+    // Model detection
+    try output.printInfo(w, i18n.tr(lang, "Detecting models...", "正在检测模型...", "モデルを検出中..."), caps);
+    try w.flush();
+
+    const model_info = check_mod.detectModels(allocator, site.base_url, site.api_key, args.site_type);
+
+    if (model_info.models_found > 0) {
+        var model_buf: [128]u8 = undefined;
+        const model_msg = std.fmt.bufPrint(&model_buf, "{d} models found", .{model_info.models_found}) catch "Models found";
+        if (model_info.has_expected) {
+            try output.printSuccess(w, model_msg, caps);
+        } else {
+            try output.printWarning(w, model_msg, caps);
+            try output.printWarning(w, i18n.tr(lang, "Expected models not found", "未找到预期的模型", "期待するモデルが見つかりません"), caps);
+        }
+
+        if (model_info.is_reverse_proxy) {
+            try output.printWarning(w, i18n.tr(lang, "Reverse proxy detected (mixed provider models)", "检测到反向代理（混合提供商模型）", "リバースプロキシを検出（複数プロバイダーのモデル）"), caps);
+        }
+    } else {
+        try output.printWarning(w, i18n.tr(lang, "Could not detect models (auth may be required)", "无法检测模型（可能需要认证）", "モデルを検出できません（認証が必要な場合があります）"), caps);
+    }
+
+    try output.printSeparator(w, caps);
+    try w.flush();
+}
+
+// --- Install / Uninstall ---
 
 fn runInstall(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCaps, lang: i18n.Language) !void {
     try output.printSectionHeader(w, i18n.tr(lang, "Install", "安装", "インストール"), caps);
@@ -274,7 +427,7 @@ fn runInstall(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.Te
 
     try output.printSuccess(w, i18n.tr(lang, "Installed successfully", "安装成功", "インストールしました"), caps);
     try output.printKeyValue(w, i18n.tr(lang, "Executable:", "可执行文件:", "実行ファイル:"), installed_path, caps);
-    try output.printKeyValue(w, i18n.tr(lang, "PATH:", "PATH:", "PATH:"), config_mod.display_install_bin_path, caps);
+    try output.printKeyValue(w, i18n.tr(lang, "PATH:", "PATH:", "PATH:"), app.display_install_bin_path, caps);
     try w.flush();
 }
 
@@ -291,64 +444,156 @@ fn runUninstall(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.
     try w.flush();
 }
 
-fn runStatus(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCaps, lang: i18n.Language) !void {
-    try output.printSectionHeader(w, i18n.tr(lang, "Status", "状态", "ステータス"), caps);
+// --- Version ---
 
-    const binding = config_mod.loadBinding(allocator) catch null;
+fn runVersion(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCaps, lang: i18n.Language) !void {
+    // Print version only - clean single line
+    var ver_buf: [128]u8 = undefined;
+    const ver_msg = std.fmt.bufPrint(&ver_buf, "VELORA v{s} - {s}", .{
+        version,
+        i18n.tr(lang, "Multi-Site API Key Manager", "多站点 API Key 管理器", "マルチサイト APIキー マネージャー"),
+    }) catch version;
+    try output.printInfo(w, ver_msg, caps);
+    try w.flush();
 
-    if (binding) |b| {
-        const loc_name: []const u8 = switch (b.location) {
-            .env => i18n.tr(lang, "Environment variable", "环境变量", "環境変数"),
-            .auth_json => config_mod.display_auth_json_path,
-            .config_toml => config_mod.display_config_toml_path,
-        };
-        try output.printKeyValue(w, i18n.tr(lang, "Storage:", "存储位置:", "保存場所:"), loc_name, caps);
-
-        var interval_buf: [32]u8 = undefined;
-        const interval_str = std.fmt.bufPrint(&interval_buf, "{d} min", .{b.interval_minutes}) catch "?";
-        try output.printKeyValue(w, i18n.tr(lang, "Interval:", "检测间隔:", "チェック間隔:"), interval_str, caps);
-
-        const local_key = env.readCurrentKey(allocator, b.location) catch null;
-        defer if (local_key) |k| allocator.free(k);
-
-        if (local_key) |lk| {
-            var masked_buf: [64]u8 = undefined;
-            const masked = maskKey(&masked_buf, lk);
-            try output.printKeyValue(w, i18n.tr(lang, "Current Key:", "当前Key:", "現在のKey:"), masked, caps);
-        } else {
-            try output.printKeyValue(w, i18n.tr(lang, "Current Key:", "当前Key:", "現在のKey:"), i18n.tr(lang, "(not set)", "(未设置)", "(未設定)"), caps);
-        }
-    } else {
-        try output.printWarning(w, i18n.tr(lang, "Not configured. Run with --setup.", "尚未配置，请使用 --setup", "未設定です。--setup を実行してください"), caps);
+    // Silently check for updates - only show if new version exists
+    const info = update_mod.checkLatestVersion(allocator, version) catch {
+        return;
+    };
+    defer {
+        if (info.latest_version) |v| allocator.free(v);
+        if (info.download_url) |u| allocator.free(u);
     }
 
-    const autostart_enabled = autostart.isEnabled(allocator);
-    const autostart_str = if (autostart_enabled)
-        i18n.tr(lang, "Enabled", "已启用", "有効")
-    else
-        i18n.tr(lang, "Disabled", "已禁用", "無効");
-    try output.printKeyValue(w, i18n.tr(lang, "Autostart:", "自启动:", "自動起動:"), autostart_str, caps);
+    if (info.has_update) {
+        const latest = info.latest_version orelse "?";
+        var msg_buf: [128]u8 = undefined;
+        const msg = std.fmt.bufPrint(&msg_buf, "{s} v{s} {s} (velora --update)", .{
+            i18n.tr(lang, "New version available:", "有新版本:", "新バージョンあり:"),
+            latest,
+            i18n.tr(lang, "available", "待更新", "利用可能"),
+        }) catch "New version available";
+        try output.printWarning(w, msg, caps);
+        try w.flush();
+    }
+    // No output when already up to date - version line is enough
+}
 
-    try output.printSeparator(w, caps);
+// --- Update ---
+
+fn runUpdate(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCaps, lang: i18n.Language) !void {
+    try output.printSectionHeader(w, i18n.tr(lang, "Update", "更新", "アップデート"), caps);
+    try output.printInfo(w, i18n.tr(lang, "Checking for updates...", "正在检查更新...", "アップデートを確認中..."), caps);
+    try w.flush();
+
+    const info = update_mod.checkLatestVersion(allocator, version) catch {
+        try output.printError(w, i18n.tr(lang, "Failed to check for updates", "检查更新失败", "アップデートの確認に失敗しました"), caps);
+        try w.flush();
+        return;
+    };
+    defer {
+        if (info.latest_version) |v| allocator.free(v);
+        if (info.download_url) |u| allocator.free(u);
+    }
+
+    if (!info.has_update) {
+        var msg_buf: [64]u8 = undefined;
+        const latest = info.latest_version orelse version;
+        const msg = std.fmt.bufPrint(&msg_buf, "{s} ({s})", .{
+            i18n.tr(lang, "Already up to date", "已是最新版本", "最新版です"),
+            latest,
+        }) catch i18n.tr(lang, "Already up to date", "已是最新版本", "最新版です");
+        try output.printSuccess(w, msg, caps);
+        try w.flush();
+        return;
+    }
+
+    const latest = info.latest_version orelse "?";
+    var msg_buf: [128]u8 = undefined;
+    const found_msg = std.fmt.bufPrint(&msg_buf, "{s}: v{s} -> v{s}", .{
+        i18n.tr(lang, "New version available", "发现新版本", "新バージョンが利用可能"),
+        version,
+        latest,
+    }) catch "New version found";
+    try output.printInfo(w, found_msg, caps);
+
+    if (info.download_url) |url| {
+        try output.printInfo(w, i18n.tr(lang, "Downloading update...", "正在下载更新...", "アップデートをダウンロード中..."), caps);
+        try w.flush();
+
+        update_mod.performUpdate(allocator, url) catch {
+            try output.printError(w, i18n.tr(lang, "Update failed. Please download manually.", "更新失败，请手动下载", "アップデートに失敗しました。手動でダウンロードしてください"), caps);
+            try w.flush();
+            return;
+        };
+        try output.printSuccess(w, i18n.tr(lang, "Update complete! Restart to use new version.", "更新完成！重启以使用新版本", "アップデート完了！再起動して新バージョンをご利用ください"), caps);
+    } else {
+        try output.printWarning(w, i18n.tr(lang, "No binary found for this platform. Visit GitHub to download.", "未找到本平台的二进制文件，请前往 GitHub 下载", "このプラットフォーム用バイナリが見つかりません。GitHubからダウンロードしてください"), caps);
+    }
     try w.flush();
 }
 
-fn getExePath(allocator: std.mem.Allocator) ![]u8 {
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try std.fs.selfExePath(&path_buf);
-    return try allocator.dupe(u8, path);
+// --- Interactive helpers ---
+
+fn readLine() []const u8 {
+    var input_buf: [512]u8 = undefined;
+    const input_len = std.fs.File.stdin().read(&input_buf) catch 0;
+    return std.mem.trim(u8, input_buf[0..input_len], " \t\r\n");
 }
 
-fn maskKey(buf: []u8, key: []const u8) []const u8 {
-    if (key.len <= 8) {
-        return std.fmt.bufPrint(buf, "{s}****", .{key}) catch key;
+fn askSiteType(w: *std.Io.Writer, caps: terminal.TermCaps, lang: i18n.Language) ?sites_mod.SiteType {
+    output.printInfo(w, i18n.tr(lang, "Choose type:", "选择类型:", "タイプを選択:"), caps) catch {};
+    output.printMenuItem(w, 1, "Codex (cx)", caps) catch {};
+    output.printMenuItem(w, 2, "Claude Code (cc)", caps) catch {};
+    output.printMenuItem(w, 3, "OpenCode (oc)", caps) catch {};
+    output.printPrompt(w, i18n.tr(lang, "[1/2/3]:", "[1/2/3]:", "[1/2/3]:"), caps) catch {};
+    w.flush() catch {};
+
+    const input = readLine();
+    if (input.len == 0) return null; // Enter = keep current
+    if (std.mem.eql(u8, input, "1") or std.mem.eql(u8, input, "cx")) return .cx;
+    if (std.mem.eql(u8, input, "2") or std.mem.eql(u8, input, "cc")) return .cc;
+    if (std.mem.eql(u8, input, "3") or std.mem.eql(u8, input, "oc")) return .oc;
+    return null;
+}
+
+fn askBaseUrl(w: *std.Io.Writer, caps: terminal.TermCaps, _: i18n.Language, current: ?[]const u8) []const u8 {
+    if (current) |cur| {
+        var prompt_buf: [256]u8 = undefined;
+        const prompt = std.fmt.bufPrint(&prompt_buf, "Base URL [{s}]:", .{cur}) catch "Base URL:";
+        output.printPrompt(w, prompt, caps) catch {};
+    } else {
+        output.printPrompt(w, "Base URL:", caps) catch {};
     }
-    const prefix = key[0..6];
-    const suffix = key[key.len - 4 ..];
-    return std.fmt.bufPrint(buf, "{s}...{s}", .{ prefix, suffix }) catch key;
+    w.flush() catch {};
+
+    const input = readLine();
+    if (input.len == 0) {
+        return current orelse "";
+    }
+    return input;
+}
+
+fn askApiKey(w: *std.Io.Writer, caps: terminal.TermCaps, _: i18n.Language, current: ?[]const u8) []const u8 {
+    if (current) |cur| {
+        var masked_buf: [64]u8 = undefined;
+        const masked = sites_mod.maskKey(&masked_buf, cur);
+        var prompt_buf: [128]u8 = undefined;
+        const prompt = std.fmt.bufPrint(&prompt_buf, "API Key [{s}]:", .{masked}) catch "API Key:";
+        output.printPrompt(w, prompt, caps) catch {};
+    } else {
+        output.printPrompt(w, "API Key:", caps) catch {};
+    }
+    w.flush() catch {};
+
+    const input = readLine();
+    if (input.len == 0) {
+        return current orelse "";
+    }
+    return input;
 }
 
 test {
-    _ = @import("http.zig");
+    _ = @import("sites.zig");
     _ = @import("config.zig");
 }

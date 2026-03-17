@@ -1,6 +1,6 @@
 # Velora
 
-`Velora` 是一个使用 Zig 编写的 OpenAI API Key 同步工具，用于全自动同步 API Key ，免去繁杂的替换步骤。
+`Velora` 是一个使用 Zig 编写的多站点 API Key 管理器，用于统一管理并快速切换 Codex、Claude Code、OpenCode 等工具的 API Key 配置。
 
 ## 支持平台
 
@@ -10,12 +10,18 @@
 - Alpine Linux（musl）：`x86_64`、`aarch64`、`arm`
 - FreeBSD：`x86_64`、`aarch64`
 
-说明：Linux 内建自启动依赖 `systemd --user`；Alpine 和 FreeBSD 建议自行使用系统调度器执行 `velora --background-sync`。
+## 支持的目标工具
+
+| 类型 | 工具 | 配置方式 |
+|------|------|----------|
+| `cx` | OpenAI Codex | `~/.codex/config.toml`（`base_url` + `OPENAI_API_KEY`） |
+| `cc` | Claude Code | `~/.claude/settings.json`（`ANTHROPIC_AUTH_TOKEN`） |
+| `oc` | OpenCode | `~/.config/opencode/opencode.json` |
 
 ## 构建
 
 ```bash
-# 构建Debug版
+# 构建 Debug 版
 zig build -Doptimize=Debug
 # 构建最小版本
 zig build -Doptimize=ReleaseSmall
@@ -23,13 +29,6 @@ zig build -Doptimize=ReleaseSmall
 zig build -Doptimize=ReleaseSafe
 # 构建性能版本
 zig build -Doptimize=ReleaseFast
-```
-
-或：
-
-```bash
-make test
-make release
 ```
 
 ## 一键安装
@@ -73,23 +72,47 @@ velora
 ## 常用命令
 
 ```bash
-velora --setup
-velora
-velora --daemon --interval 30
-velora --autostart --interval 30
-velora --no-autostart
-velora --install
-velora --del
-velora --uninstall
-velora --status
+# 添加站点（交互式）
+velora add <别名>
+
+# 添加站点（直接指定）
+velora add <类型> <别名> <URL> <Key>
+
+# 编辑 / 删除站点
+velora edit <别名>
+velora del <别名>
+
+# 查看站点列表（含连通性检测）
+velora list
+velora list all
+
+# 应用站点配置到指定工具
+velora cx use <别名>      # 应用到 Codex
+velora cc use <别名>      # 应用到 Claude Code
+velora oc use <别名>      # 应用到 OpenCode
+
+# 安装 / 卸载
+velora install
+velora uninstall
+
+# 检查并自动更新
+velora --update
+```
+
+## 用法示例
+
+```bash
+velora add openai
+velora add cx openai https://api.example.com/v1 sk-xxx
+velora cx use openai
+velora cc use claude
+velora oc use openai
 ```
 
 ## 用户数据位置
 
-- `~/.velora/velora.conf`
-- `~/.velora/auth.json`
-- `~/.velora/config.toml`
-- `~/.velora/bin`
+- `~/.velora/sites.json`：站点配置（类型、URL、API Key）
+- `~/.velora/bin`：已安装的可执行文件
 
 ## LICENSE
 

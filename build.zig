@@ -49,7 +49,6 @@ pub fn build(b: *std.Build) void {
             .name = b.fmt("{s}-{s}", .{ app_name, ct.name }),
             .root_module = ct_module,
         });
-
         b.installArtifact(ct_exe);
     }
 
@@ -65,7 +64,6 @@ pub fn build(b: *std.Build) void {
         .name = app_name,
         .root_module = native_module,
     });
-
     b.installArtifact(native_exe);
 
     const run_cmd = b.addRunArtifact(native_exe);

@@ -2,24 +2,51 @@ const std = @import("std");
 const i18n = @import("i18n.zig");
 const output = @import("output.zig");
 const terminal = @import("terminal.zig");
+const sites = @import("sites.zig");
 const main_mod = @import("main.zig");
 
-pub const Command = enum {
-    sync,
-    daemon,
-    setup,
-    background_sync,
-    autostart_enable,
-    autostart_disable,
+pub const SiteType = sites.SiteType;
+
+pub const AddArgs = struct {
+    alias: []const u8,
+    site_type: ?SiteType = null,
+    base_url: ?[]const u8 = null,
+    api_key: ?[]const u8 = null,
+};
+
+pub const EditArgs = struct {
+    alias: []const u8,
+};
+
+pub const DelArgs = struct {
+    alias: []const u8,
+};
+
+pub const ListArgs = struct {
+    show_all: bool = false,
+};
+
+pub const UseArgs = struct {
+    site_type: SiteType,
+    alias: []const u8,
+};
+
+pub const Command = union(enum) {
+    add: AddArgs,
+    edit: EditArgs,
+    del: DelArgs,
+    list: ListArgs,
+    use: UseArgs,
     install,
     uninstall,
-    status,
+    update_check, // --update: check and apply update
+    help,
+    version,
 };
 
 pub const Config = struct {
     language: i18n.Language = .en,
-    command: Command = .sync,
-    interval_minutes: u32 = 60,
+    command: Command,
 };
 
 pub const ParseError = error{
@@ -29,53 +56,152 @@ pub const ParseError = error{
     OutOfMemory,
 };
 
-pub fn parseArgs(allocator: std.mem.Allocator) ParseError!Config {
-    var config: Config = .{};
+pub fn parseArgs(_: std.mem.Allocator) ParseError!Config {
+    // Use page_allocator for args to avoid debug leak reports.
+    // These tiny allocations live for the entire program lifetime anyway.
+    const alloc = std.heap.page_allocator;
+    var raw_args = std.process.argsWithAllocator(alloc) catch return error.OutOfMemory;
+    // Do not deinit: returned Config holds slices into the args buffer.
+    // page_allocator is not tracked by DebugAllocator so no leak reports.
+
+    _ = raw_args.skip(); // skip program name
+
+    // Collect all args into a buffer. Since we use page_allocator for the
+    // args iterator, the slices remain valid without explicit duping.
+    var args_buf: [32][]const u8 = undefined;
+    var arg_count: usize = 0;
+    while (raw_args.next()) |arg| {
+        if (arg_count >= 32) break;
+        args_buf[arg_count] = arg;
+        arg_count += 1;
+    }
+    const args = args_buf[0..arg_count];
+
+    // First pass: extract -l/--lang
     var lang_override: ?i18n.Language = null;
-
-    var args = std.process.argsWithAllocator(allocator) catch return error.OutOfMemory;
-    defer args.deinit();
-
-    _ = args.skip();
-
-    while (args.next()) |arg| {
-        if (eql(arg, "-h") or eql(arg, "--help")) {
-            const lang = lang_override orelse i18n.detect();
-            printHelp(lang);
-            return error.HelpRequested;
-        } else if (eql(arg, "-v") or eql(arg, "--version")) {
-            const lang = lang_override orelse i18n.detect();
-            printVersion(lang);
-            return error.VersionRequested;
-        } else if (eql(arg, "-l") or eql(arg, "--lang")) {
-            if (args.next()) |val| lang_override = parseLang(val);
-        } else if (eql(arg, "-d") or eql(arg, "--daemon")) {
-            config.command = .daemon;
-        } else if (eql(arg, "-i") or eql(arg, "--interval")) {
-            if (args.next()) |val| {
-                config.interval_minutes = @max(std.fmt.parseInt(u32, val, 10) catch 60, 1);
-            }
-        } else if (eql(arg, "--setup")) {
-            config.command = .setup;
-        } else if (eql(arg, "--background-sync")) {
-            config.command = .background_sync;
-        } else if (eql(arg, "--autostart")) {
-            config.command = .autostart_enable;
-        } else if (eql(arg, "--no-autostart")) {
-            config.command = .autostart_disable;
-        } else if (eql(arg, "--install")) {
-            config.command = .install;
-        } else if (eql(arg, "-del") or eql(arg, "--del") or eql(arg, "--uninstall")) {
-            config.command = .uninstall;
-        } else if (eql(arg, "--status")) {
-            config.command = .status;
-        } else if (std.mem.startsWith(u8, arg, "-")) {
-            return error.InvalidArgument;
+    for (0..args.len) |i| {
+        if ((eql(args[i], "-l") or eql(args[i], "--lang")) and i + 1 < args.len) {
+            lang_override = parseLang(args[i + 1]);
         }
     }
 
-    config.language = lang_override orelse i18n.detect();
+    const lang = lang_override orelse i18n.detect();
+
+    // No args -> show help
+    if (arg_count == 0) {
+        printHelp(lang);
+        return error.HelpRequested;
+    }
+
+    // Second pass: parse subcommand (skip -l/--lang and its value)
+    var cmd_args: [32][]const u8 = undefined;
+    var cmd_count: usize = 0;
+    {
+        var i: usize = 0;
+        while (i < args.len) : (i += 1) {
+            if (eql(args[i], "-l") or eql(args[i], "--lang")) {
+                i += 1; // skip value
+                continue;
+            }
+            if (cmd_count < 32) {
+                cmd_args[cmd_count] = args[i];
+                cmd_count += 1;
+            }
+        }
+    }
+
+    if (cmd_count == 0) {
+        printHelp(lang);
+        return error.HelpRequested;
+    }
+
+    const sub = cmd_args[0];
+    const rest = cmd_args[1..cmd_count];
+
+    var config: Config = .{ .language = lang, .command = .help };
+
+    if (eql(sub, "-h") or eql(sub, "--help") or eql(sub, "help")) {
+        printHelp(lang);
+        return error.HelpRequested;
+    } else if (eql(sub, "-v") or eql(sub, "--version") or eql(sub, "version")) {
+        config.command = .version;
+    } else if (eql(sub, "add")) {
+        config.command = try parseAdd(rest);
+    } else if (eql(sub, "edit")) {
+        if (rest.len < 1) return error.InvalidArgument;
+        config.command = .{ .edit = .{ .alias = rest[0] } };
+    } else if (eql(sub, "del") or eql(sub, "rm") or eql(sub, "remove") or eql(sub, "delete")) {
+        if (rest.len < 1) return error.InvalidArgument;
+        config.command = .{ .del = .{ .alias = rest[0] } };
+    } else if (eql(sub, "list") or eql(sub, "ls")) {
+        var show_all = false;
+        if (rest.len > 0 and eql(rest[0], "all")) {
+            show_all = true;
+        }
+        config.command = .{ .list = .{ .show_all = show_all } };
+    } else if (eql(sub, "cx") or eql(sub, "codex")) {
+        config.command = try parseUse(.cx, rest);
+    } else if (eql(sub, "cc") or eql(sub, "claude")) {
+        config.command = try parseUse(.cc, rest);
+    } else if (eql(sub, "oc") or eql(sub, "opencode")) {
+        config.command = try parseUse(.oc, rest);
+    } else if (eql(sub, "use")) {
+        // velorause cx <alias> or velorause cc <alias>
+        if (rest.len < 2) return error.InvalidArgument;
+        const st = SiteType.fromString(rest[0]) orelse return error.InvalidArgument;
+        config.command = .{ .use = .{ .site_type = st, .alias = rest[1] } };
+    } else if (eql(sub, "install") or eql(sub, "--install")) {
+        config.command = .install;
+    } else if (eql(sub, "uninstall") or eql(sub, "--uninstall") or eql(sub, "--del")) {
+        config.command = .uninstall;
+    } else if (eql(sub, "--update") or eql(sub, "update")) {
+        config.command = .update_check;
+    } else {
+        return error.InvalidArgument;
+    }
+
     return config;
+}
+
+fn parseAdd(rest: []const []const u8) ParseError!Command {
+    if (rest.len == 0) return error.InvalidArgument;
+
+    // Check if first arg is a type (cx/cc) -> direct mode: velora add<type> <alias> <url> <key>
+    if (SiteType.fromString(rest[0])) |st| {
+        if (rest.len >= 4) {
+            return .{ .add = .{
+                .alias = rest[1],
+                .site_type = st,
+                .base_url = rest[2],
+                .api_key = rest[3],
+            } };
+        }
+        // velora add<type> <alias> -> interactive with type pre-set
+        if (rest.len >= 2) {
+            return .{ .add = .{
+                .alias = rest[1],
+                .site_type = st,
+            } };
+        }
+        return error.InvalidArgument;
+    }
+
+    // velora add<alias> -> fully interactive
+    return .{ .add = .{
+        .alias = rest[0],
+    } };
+}
+
+fn parseUse(st: SiteType, rest: []const []const u8) ParseError!Command {
+    // veloracx use <alias> or veloracx <alias>
+    if (rest.len >= 2 and eql(rest[0], "use")) {
+        return .{ .use = .{ .site_type = st, .alias = rest[1] } };
+    }
+    if (rest.len >= 1 and !eql(rest[0], "use")) {
+        // veloracx <alias> (shorthand)
+        return .{ .use = .{ .site_type = st, .alias = rest[0] } };
+    }
+    return error.InvalidArgument;
 }
 
 fn eql(a: []const u8, b: []const u8) bool {
@@ -100,83 +226,118 @@ fn printHelp(lang: i18n.Language) void {
     const reset = if (caps.color) output.Color.reset else "";
 
     const title = switch (lang) {
-        .zh => "velora - OpenAI API Key 编排器",
-        .ja => "velora - OpenAI APIキー オーケストレーター",
-        .en => "velora - OpenAI API Key Orchestrator",
+        .zh => "velora - 多站点 API Key 管理器",
+        .ja => "velora - マルチサイト APIキー マネージャー",
+        .en => "velora - Multi-Site API Key Manager",
     };
 
     const body = switch (lang) {
         .zh =>
-            \\用法: velora [选项]
-            \\
-            \\选项:
-            \\  -h, --help             显示帮助
-            \\  -v, --version          显示版本
-            \\  -l, --lang <LANG>      语言: en, zh, ja
-            \\  -d, --daemon           前台守护模式运行
-            \\  -i, --interval <N>     轮询间隔（分钟，默认 60）
-            \\      --setup            进入配置向导
-            \\      --autostart        启用系统自启动
-            \\      --no-autostart     关闭系统自启动
-            \\      --install          安装到用户目录并加入 PATH
-            \\      --del, --uninstall 彻底卸载并清理配置与自启动
-            \\      --status           显示当前状态
-            \\
-            \\示例:
-            \\  velora --setup
-            \\  velora
-            \\  velora --autostart --interval 30
-            \\  velora --install
-            \\  velora --uninstall
-            \\
+        \\用法: velora <命令> [参数]
+        \\
+        \\命令:
+        \\  add <别名>                         交互式添加站点
+        \\  add <类型> <别名> <URL> <Key>      一次性添加站点 (类型: cx, cc)
+        \\  edit <别名>                        编辑站点配置
+        \\  del <别名>                         删除站点
+        \\  list                               显示站点列表（含连通性检测）
+        \\  list all                           显示详细站点信息
+        \\  cx use <别名>                      应用站点到 Codex
+        \\  cc use <别名>                      应用站点到 Claude Code
+        \\  oc use <别名>                      应用站点到 OpenCode
+        \\
+        \\类型:
+        \\  cx    Codex (OPENAI_API_KEY)
+        \\  cc    Claude Code (ANTHROPIC_AUTH_TOKEN)
+        \\  oc    OpenCode (~/.config/opencode/opencode.json)
+        \\
+        \\选项:
+        \\  -h, --help             显示帮助
+        \\  -v, --version          显示版本（检查更新）
+        \\  --update               检查并自动更新
+        \\  -l, --lang <LANG>      语言: en, zh, ja
+        \\
+        \\示例:
+        \\  velora add openai
+        \\  velora add cx openai https://api.example.com/v1 sk-xxx
+        \\  velora cx use openai
+        \\  velora cc use claude
+        \\  velora oc use openai
+        \\  velora list
+        \\  velora list all
+        \\  velora edit openai
+        \\  velora del openai
+        \\
         ,
         .ja =>
-            \\使い方: velora [オプション]
-            \\
-            \\オプション:
-            \\  -h, --help             ヘルプを表示
-            \\  -v, --version          バージョンを表示
-            \\  -l, --lang <LANG>      言語: en, zh, ja
-            \\  -d, --daemon           フォアグラウンドで常駐実行
-            \\  -i, --interval <N>     間隔（分、既定 60）
-            \\      --setup            セットアップを開始
-            \\      --autostart        自動起動を有効化
-            \\      --no-autostart     自動起動を無効化
-            \\      --install          ユーザー環境へインストールして PATH に追加
-            \\      --del, --uninstall 完全アンインストール
-            \\      --status           現在の状態を表示
-            \\
-            \\例:
-            \\  velora --setup
-            \\  velora
-            \\  velora --autostart --interval 30
-            \\  velora --install
-            \\  velora --uninstall
-            \\
+        \\使い方: velora <コマンド> [引数]
+        \\
+        \\コマンド:
+        \\  add <エイリアス>                       サイトを対話式で追加
+        \\  add <タイプ> <エイリアス> <URL> <Key>  サイトを一括で追加 (タイプ: cx, cc)
+        \\  edit <エイリアス>                      サイトの設定を編集
+        \\  del <エイリアス>                       サイトを削除
+        \\  list                                  サイト一覧表示（接続確認付き）
+        \\  list all                              サイト詳細表示
+        \\  cx use <エイリアス>                    サイトをCodexに適用
+        \\  cc use <エイリアス>                    サイトをClaude Codeに適用
+        \\
+        \\タイプ:
+        \\  cx    Codex (OPENAI_API_KEY)
+        \\  cc    Claude Code (ANTHROPIC_AUTH_TOKEN)
+        \\
+        \\オプション:
+        \\  -h, --help             ヘルプを表示
+        \\  -v, --version          バージョンを表示
+        \\  -l, --lang <LANG>      言語: en, zh, ja
+        \\
+        \\例:
+        \\  velora add openai
+        \\  velora add cx openai https://api.example.com/v1 sk-xxx
+        \\  velora cx use openai
+        \\  velora cc use claude
+        \\  velora list
+        \\  velora list all
+        \\  velora edit openai
+        \\  velora del openai
+        \\
         ,
         .en =>
-            \\Usage: velora [options]
-            \\
-            \\Options:
-            \\  -h, --help             Show help
-            \\  -v, --version          Show version
-            \\  -l, --lang <LANG>      Language: en, zh, ja
-            \\  -d, --daemon           Run in foreground daemon mode
-            \\  -i, --interval <N>     Poll interval in minutes (default: 60)
-            \\      --setup            Start interactive setup
-            \\      --autostart        Enable autostart
-            \\      --no-autostart     Disable autostart
-            \\      --install          Install to user space and add to PATH
-            \\      --del, --uninstall Fully uninstall and clean app data
-            \\      --status           Show current status
-            \\
-            \\Examples:
-            \\  velora --setup
-            \\  velora
-            \\  velora --autostart --interval 30
-            \\  velora --install
-            \\  velora --uninstall
-            \\
+        \\Usage: velora <command> [args]
+        \\
+        \\Commands:
+        \\  add <alias>                        Add a site interactively
+        \\  add <type> <alias> <url> <key>     Add a site directly (type: cx, cc)
+        \\  edit <alias>                       Edit site configuration
+        \\  del <alias>                        Delete a site
+        \\  list                               List sites with connectivity check
+        \\  list all                           List sites with full details
+        \\  cx use <alias>                     Apply site config to Codex
+        \\  cc use <alias>                     Apply site config to Claude Code
+        \\  oc use <alias>                     Apply site config to OpenCode
+        \\
+        \\Types:
+        \\  cx    Codex (OPENAI_API_KEY)
+        \\  cc    Claude Code (ANTHROPIC_AUTH_TOKEN)
+        \\  oc    OpenCode (~/.config/opencode/opencode.json)
+        \\
+        \\Options:
+        \\  -h, --help             Show help
+        \\  -v, --version          Show version (checks for updates)
+        \\  --update               Check and apply update
+        \\  -l, --lang <LANG>      Language: en, zh, ja
+        \\
+        \\Examples:
+        \\  velora add openai
+        \\  velora add cx openai https://api.example.com/v1 sk-xxx
+        \\  velora cx use openai
+        \\  velora cc use claude
+        \\  velora oc use openai
+        \\  velora list
+        \\  velora list all
+        \\  velora edit openai
+        \\  velora del openai
+        \\
         ,
     };
 
@@ -191,9 +352,9 @@ fn printVersion(lang: i18n.Language) void {
     const w = &stdout_writer.interface;
 
     switch (lang) {
-        .zh => w.print("Velora v{s} - OpenAI API Key 编排器\n", .{main_mod.version}) catch {},
-        .ja => w.print("Velora v{s} - OpenAI APIキー オーケストレーター\n", .{main_mod.version}) catch {},
-        .en => w.print("Velora v{s} - OpenAI API Key Orchestrator\n", .{main_mod.version}) catch {},
+        .zh => w.print("VELORAv{s} - 多站点 API Key 管理器\n", .{main_mod.version}) catch {},
+        .ja => w.print("VELORAv{s} - マルチサイト APIキー マネージャー\n", .{main_mod.version}) catch {},
+        .en => w.print("VELORAv{s} - Multi-Site API Key Manager\n", .{main_mod.version}) catch {},
     }
     w.flush() catch {};
 }

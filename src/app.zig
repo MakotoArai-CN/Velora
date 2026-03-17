@@ -3,18 +3,25 @@ const builtin = @import("builtin");
 pub const display_name = "Velora";
 pub const command_name = "velora";
 pub const config_dir_name = ".velora";
-pub const binding_filename = "velora.conf";
+pub const sites_filename = "sites.json";
 
-pub const legacy_command_name = "apikey-sync";
-pub const legacy_config_dir_name = ".codex";
-pub const legacy_binding_filename = "apikey-sync.conf";
+pub const subtitle_en = "Multi-Site API Key Manager";
+pub const subtitle_zh = "多站点 API Key 管理器";
+pub const subtitle_ja = "マルチサイト APIキー マネージャー";
 
-pub const subtitle_en = "OpenAI API Key Orchestrator";
-pub const subtitle_zh = "OpenAI API Key 编排器";
-pub const subtitle_ja = "OpenAI APIキー オーケストレーター";
+pub const display_sites_path = "~/.velora/sites.json";
+pub const display_install_bin_path = "~/.velora/bin";
 
-pub const auth_json_filename = "auth.json";
-pub const config_toml_filename = "config.toml";
+pub const codex_config_dir = ".codex";
+pub const codex_config_filename = "config.toml";
+pub const claude_config_dir = ".claude";
+pub const claude_settings_filename = "settings.json";
+pub const opencode_config_dir_parts = &[_][]const u8{ ".config", "opencode" };
+pub const opencode_config_filename = "opencode.json";
+
+pub const github_repo = "MakotoArai-CN/Velora";
+pub const github_releases_url = "https://api.github.com/repos/" ++ github_repo ++ "/releases/latest";
+
 pub const install_bin_dir_name = "bin";
 pub const path_marker = "# velora PATH";
 
@@ -24,8 +31,3 @@ pub fn executableName() []const u8 {
         else => command_name,
     };
 }
-
-pub fn launchAgentName() []const u8 {
-    return "com." ++ command_name ++ ".plist";
-}
-
