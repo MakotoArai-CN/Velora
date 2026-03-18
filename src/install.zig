@@ -3,7 +3,24 @@ const builtin = @import("builtin");
 const app = @import("app.zig");
 const config_mod = @import("config.zig");
 
-pub fn install(allocator: std.mem.Allocator) ![]u8 {
+pub const InstallStatus = enum {
+    installed,
+    already_installed,
+    already_installed_busy,
+};
+
+pub const InstallResult = struct {
+    path: []u8,
+    status: InstallStatus,
+};
+
+pub const UninstallStatus = enum {
+    removed,
+    already_removed,
+    scheduled_cleanup,
+};
+
+pub fn install(allocator: std.mem.Allocator) !InstallResult {
     const source_path = try getSelfExePath(allocator);
     defer allocator.free(source_path);
 
@@ -13,16 +30,27 @@ pub fn install(allocator: std.mem.Allocator) ![]u8 {
     const installed_path = try config_mod.getInstalledExecutablePath(allocator);
     errdefer allocator.free(installed_path);
 
-    if (!std.mem.eql(u8, source_path, installed_path)) {
-        std.fs.deleteFileAbsolute(installed_path) catch {};
-        try std.fs.copyFileAbsolute(source_path, installed_path, .{});
+    var status: InstallStatus = .installed;
+
+    if (std.mem.eql(u8, source_path, installed_path)) {
+        status = .already_installed;
+    } else if (pathExistsAbsolute(installed_path) and try filesEqualAbsolute(source_path, installed_path)) {
+        status = .already_installed;
+    } else {
+        replaceInstalledExecutable(source_path, installed_path) catch |err| {
+            if (builtin.os.tag == .windows and err == error.AccessDenied and pathExistsAbsolute(installed_path)) {
+                status = .already_installed_busy;
+            } else {
+                return err;
+            }
+        };
     }
 
     try ensureCommandOnPath(allocator, bin_dir);
-    return installed_path;
+    return .{ .path = installed_path, .status = status };
 }
 
-pub fn uninstall(allocator: std.mem.Allocator) !void {
+pub fn uninstall(allocator: std.mem.Allocator) !UninstallStatus {
     const bin_dir = config_mod.getInstallBinDir(allocator) catch null;
     defer if (bin_dir) |path| allocator.free(path);
     if (bin_dir) |path| {
@@ -31,30 +59,85 @@ pub fn uninstall(allocator: std.mem.Allocator) !void {
 
     const app_dir = config_mod.getAppDir(allocator) catch null;
     defer if (app_dir) |path| allocator.free(path);
+    if (app_dir == null) return .already_removed;
 
-    if (app_dir) |path| {
+    const path = app_dir.?;
+    if (!pathExistsAbsolute(path)) return .already_removed;
+
+    if (builtin.os.tag == .windows) {
         const installed_path = config_mod.getInstalledExecutablePath(allocator) catch null;
         defer if (installed_path) |exe_path| allocator.free(exe_path);
 
-        if (installed_path) |exe_path| {
-            const self_path = getSelfExePath(allocator) catch null;
-            defer if (self_path) |p| allocator.free(p);
-
-            if (builtin.os.tag == .windows and self_path != null and std.mem.eql(u8, self_path.?, exe_path)) {
-                scheduleWindowsSelfDelete(allocator, exe_path, path) catch {};
-            } else {
-                std.fs.deleteTreeAbsolute(path) catch |err| switch (err) {
-                    error.FileNotFound => {},
-                    else => return err,
-                };
-            }
-        } else {
-            std.fs.deleteTreeAbsolute(path) catch |err| switch (err) {
-                error.FileNotFound => {},
-                else => return err,
-            };
-        }
+        try scheduleWindowsCleanup(allocator, installed_path, path);
+        return .scheduled_cleanup;
     }
+
+    const installed_path = config_mod.getInstalledExecutablePath(allocator) catch null;
+    defer if (installed_path) |exe_path| allocator.free(exe_path);
+
+    const self_path = getSelfExePath(allocator) catch null;
+    defer if (self_path) |exe_path| allocator.free(exe_path);
+
+    if (installed_path) |exe_path| {
+        if (builtin.os.tag == .windows and self_path != null and std.mem.eql(u8, self_path.?, exe_path)) {
+            try scheduleWindowsCleanup(allocator, exe_path, path);
+            return .scheduled_cleanup;
+        }
+
+        std.fs.deleteFileAbsolute(exe_path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            error.AccessDenied => {
+                if (builtin.os.tag == .windows) {
+                    try scheduleWindowsCleanup(allocator, exe_path, path);
+                    return .scheduled_cleanup;
+                }
+                return err;
+            },
+            else => return err,
+        };
+    }
+
+    std.fs.deleteTreeAbsolute(path) catch |err| switch (err) {
+        error.FileNotFound => return .already_removed,
+        else => return err,
+    };
+
+    return .removed;
+}
+
+fn replaceInstalledExecutable(source_path: []const u8, installed_path: []const u8) !void {
+    std.fs.deleteFileAbsolute(installed_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+    try std.fs.copyFileAbsolute(source_path, installed_path, .{});
+}
+
+fn filesEqualAbsolute(a_path: []const u8, b_path: []const u8) !bool {
+    const a_file = try std.fs.openFileAbsolute(a_path, .{});
+    defer a_file.close();
+    const b_file = try std.fs.openFileAbsolute(b_path, .{});
+    defer b_file.close();
+
+    const a_stat = try a_file.stat();
+    const b_stat = try b_file.stat();
+    if (a_stat.size != b_stat.size) return false;
+
+    var a_buf: [8192]u8 = undefined;
+    var b_buf: [8192]u8 = undefined;
+
+    while (true) {
+        const a_read = try a_file.read(&a_buf);
+        const b_read = try b_file.read(&b_buf);
+        if (a_read != b_read) return false;
+        if (a_read == 0) return true;
+        if (!std.mem.eql(u8, a_buf[0..a_read], b_buf[0..b_read])) return false;
+    }
+}
+
+fn pathExistsAbsolute(path: []const u8) bool {
+    std.fs.accessAbsolute(path, .{}) catch return false;
+    return true;
 }
 
 fn getSelfExePath(allocator: std.mem.Allocator) ![]u8 {
@@ -284,11 +367,20 @@ fn run(allocator: std.mem.Allocator, argv: []const []const u8) !void {
     }
 }
 
-fn scheduleWindowsSelfDelete(allocator: std.mem.Allocator, exe_path: []const u8, app_dir: []const u8) !void {
-    const cmd = try std.fmt.allocPrint(allocator, "ping 127.0.0.1 -n 3 > nul & del /f /q \"{s}\" & rmdir /s /q \"{s}\"", .{ exe_path, app_dir });
-    defer allocator.free(cmd);
+fn scheduleWindowsCleanup(allocator: std.mem.Allocator, exe_path: ?[]const u8, app_dir: []const u8) !void {
+    const escaped_exe = try std.mem.replaceOwned(u8, allocator, exe_path orelse "", "'", "''");
+    defer allocator.free(escaped_exe);
+    const escaped_dir = try std.mem.replaceOwned(u8, allocator, app_dir, "'", "''");
+    defer allocator.free(escaped_dir);
 
-    const args = [_][]const u8{ "cmd", "/c", cmd };
+    const script = try std.fmt.allocPrint(
+        allocator,
+        "$exe='{s}'; $dir='{s}'; for ($i=0; $i -lt 40; $i++) {{ if ($exe.Length -gt 0) {{ Remove-Item -LiteralPath $exe -Force -ErrorAction SilentlyContinue }}; Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue; if (-not (Test-Path -LiteralPath $dir)) {{ exit 0 }}; Start-Sleep -Milliseconds 500 }}",
+        .{ escaped_exe, escaped_dir },
+    );
+    defer allocator.free(script);
+
+    const args = [_][]const u8{ "powershell.exe", "-NoProfile", "-WindowStyle", "Hidden", "-Command", script };
     var child = std.process.Child.init(&args, allocator);
     child.stdin_behavior = .Ignore;
     child.stdout_behavior = .Ignore;

@@ -32,10 +32,24 @@ pub const SiteType = enum {
     }
 };
 
+pub fn defaultModelForType(site_type: SiteType) []const u8 {
+    return switch (site_type) {
+        .cc => app.default_model_cc,
+        .cx => app.default_model_cx,
+        .oc => app.default_model_oc,
+    };
+}
+
 pub const Site = struct {
     site_type: SiteType,
     base_url: []const u8,
     api_key: []const u8,
+    model: []const u8 = "", // empty = use default for site_type
+
+    pub fn effectiveModel(self: Site) []const u8 {
+        if (self.model.len > 0) return self.model;
+        return defaultModelForType(self.site_type);
+    }
 };
 
 pub const SiteEntry = struct {
@@ -57,6 +71,7 @@ pub const SitesStore = struct {
             allocator.free(entry.alias);
             allocator.free(entry.site.base_url);
             allocator.free(entry.site.api_key);
+            if (entry.site.model.len > 0) allocator.free(entry.site.model);
         }
         self.count = 0;
         self.initialized = false;
@@ -79,13 +94,16 @@ pub const SitesStore = struct {
                 // Free old strings
                 allocator.free(entry.site.base_url);
                 allocator.free(entry.site.api_key);
+                if (entry.site.model.len > 0) allocator.free(entry.site.model);
                 // Dupe new strings individually (no arena realloc issue)
                 const new_url = try allocator.dupe(u8, site.base_url);
                 const new_key = try allocator.dupe(u8, site.api_key);
+                const new_model = if (site.model.len > 0) try allocator.dupe(u8, site.model) else @as([]const u8, "");
                 entry.site = .{
                     .site_type = site.site_type,
                     .base_url = new_url,
                     .api_key = new_key,
+                    .model = new_model,
                 };
                 return;
             }
@@ -95,12 +113,14 @@ pub const SitesStore = struct {
         const stored_alias = try allocator.dupe(u8, alias);
         const stored_url = try allocator.dupe(u8, site.base_url);
         const stored_key = try allocator.dupe(u8, site.api_key);
+        const stored_model = if (site.model.len > 0) try allocator.dupe(u8, site.model) else @as([]const u8, "");
         self.entries[self.count] = .{
             .alias = stored_alias,
             .site = .{
                 .site_type = site.site_type,
                 .base_url = stored_url,
                 .api_key = stored_key,
+                .model = stored_model,
             },
         };
         self.count += 1;
@@ -187,6 +207,8 @@ pub fn loadSites(allocator: std.mem.Allocator) !SitesStore {
         defer if (base_url) |s| allocator.free(s);
         const api_key = env_mod.extractJsonValue(allocator, entry_body[0 .. entry_inner.len + 1], "api_key") catch null;
         defer if (api_key) |s| allocator.free(s);
+        const model = env_mod.extractJsonValue(allocator, entry_body[0 .. entry_inner.len + 1], "model") catch null;
+        defer if (model) |s| allocator.free(s);
 
         if (site_type_str) |st| {
             if (SiteType.fromString(st)) |stype| {
@@ -194,6 +216,7 @@ pub fn loadSites(allocator: std.mem.Allocator) !SitesStore {
                     .site_type = stype,
                     .base_url = base_url orelse "",
                     .api_key = api_key orelse "",
+                    .model = model orelse "",
                 };
                 store.addOrUpdate(allocator, alias, site) catch break;
             }
@@ -229,6 +252,8 @@ pub fn saveSites(allocator: std.mem.Allocator, store: *const SitesStore) !void {
         try out.appendSlice(allocator, entry.site.base_url);
         try out.appendSlice(allocator, "\",\n      \"api_key\": \"");
         try out.appendSlice(allocator, entry.site.api_key);
+        try out.appendSlice(allocator, "\",\n      \"model\": \"");
+        try out.appendSlice(allocator, entry.site.effectiveModel());
         try out.appendSlice(allocator, "\"\n    }");
     }
 
@@ -298,4 +323,14 @@ test "mask key" {
     var buf: [64]u8 = undefined;
     const masked = maskKey(&buf, "sk-abcdefghijklmnop");
     try std.testing.expectEqualStrings("sk-abc...mnop", masked);
+}
+
+test "effective model uses per-type defaults" {
+    const cx_site = Site{ .site_type = .cx, .base_url = "", .api_key = "" };
+    const cc_site = Site{ .site_type = .cc, .base_url = "", .api_key = "" };
+    const oc_site = Site{ .site_type = .oc, .base_url = "", .api_key = "" };
+
+    try std.testing.expectEqualStrings(app.default_model_cx, cx_site.effectiveModel());
+    try std.testing.expectEqualStrings(app.default_model_cc, cc_site.effectiveModel());
+    try std.testing.expectEqualStrings(app.default_model_oc, oc_site.effectiveModel());
 }

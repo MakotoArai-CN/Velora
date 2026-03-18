@@ -78,8 +78,8 @@ velora
 # 添加站点（交互式）
 velora add <别名>
 
-# 添加站点（直接指定）
-velora add <类型> <别名> <URL> <Key>
+# 添加站点（直接指定，可选自定义模型）
+velora add <类型> <别名> <URL> <Key> [模型]
 
 # 编辑 / 删除站点
 velora edit <别名>
@@ -107,14 +107,23 @@ velora --update
 ```bash
 velora add openai
 velora add cx openai https://api.example.com/v1 sk-xxx
+velora add cc claude https://api.example.com sk-ant claude-opus-4-6
 velora cx use openai
 velora cc use claude
 velora oc use openai
 ```
 
+## 模型配置
+
+- 每个站点都支持自定义 `model`
+- 未手动指定时，会自动使用并写入默认模型：
+- `cc` -> `claude-opus-4-6`
+- `cx` -> `GPT-5.4`
+- `oc` -> `GPT-5.4`
+
 ## 用户数据位置
 
-- `~/.velora/sites.json`：站点配置（类型、URL、API Key）
+- `~/.velora/sites.json`：站点配置（类型、URL、API Key、模型）
 - `~/.velora/bin`：已安装的可执行文件
 
 ## LICENSE

@@ -12,7 +12,7 @@ const install_mod = @import("install.zig");
 const update_mod = @import("update.zig");
 const app = @import("app.zig");
 
-pub const version = "2.0.0";
+pub const version = "2.1.0";
 
 pub fn main() !void {
     var gpa_impl: std.heap.DebugAllocator(.{}) = .init;
@@ -33,7 +33,7 @@ pub fn main() !void {
                 var stderr_buffer: [512]u8 = undefined;
                 var stderr_writer = std.fs.File.stderr().writer(&stderr_buffer);
                 const w = &stderr_writer.interface;
-                w.print("Invalid argument. Use 'velora--help' for usage.\n", .{}) catch {};
+                w.print("Invalid argument. Use 'velora --help' for usage.\n", .{}) catch {};
                 w.flush() catch {};
                 return;
             },
@@ -87,6 +87,7 @@ fn runAdd(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCa
             .site_type = args.site_type.?,
             .base_url = args.base_url.?,
             .api_key = args.api_key.?,
+            .model = args.model orelse sites_mod.defaultModelForType(args.site_type.?),
         };
         try store.addOrUpdate(allocator, args.alias, site);
         try sites_mod.saveSites(allocator, &store);
@@ -118,8 +119,9 @@ fn runAdd(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCa
             const site_type = args.site_type orelse askSiteType(w, caps, lang) orelse ex.site_type;
             const base_url = askBaseUrl(w, caps, lang, ex.base_url);
             const api_key = askApiKey(w, caps, lang, ex.api_key);
+            const model = askModel(w, caps, lang, site_type, if (ex.model.len > 0) ex.model else null);
 
-            const site = sites_mod.Site{ .site_type = site_type, .base_url = base_url, .api_key = api_key };
+            const site = sites_mod.Site{ .site_type = site_type, .base_url = base_url, .api_key = api_key, .model = model };
             try store.addOrUpdate(allocator, args.alias, site);
             try sites_mod.saveSites(allocator, &store);
             try output.printSuccess(w, i18n.tr(lang, "Site updated", "站点已更新", "サイトを更新しました"), caps);
@@ -128,8 +130,9 @@ fn runAdd(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCa
             const site_type = args.site_type orelse askSiteType(w, caps, lang) orelse return;
             const base_url = askBaseUrl(w, caps, lang, null);
             const api_key = askApiKey(w, caps, lang, null);
+            const model = askModel(w, caps, lang, site_type, null);
 
-            const site = sites_mod.Site{ .site_type = site_type, .base_url = base_url, .api_key = api_key };
+            const site = sites_mod.Site{ .site_type = site_type, .base_url = base_url, .api_key = api_key, .model = model };
             try store.addOrUpdate(allocator, args.alias, site);
             try sites_mod.saveSites(allocator, &store);
             try output.printSuccess(w, i18n.tr(lang, "Site reconfigured", "站点已重新配置", "サイトを再設定しました"), caps);
@@ -139,8 +142,9 @@ fn runAdd(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCa
         const site_type = args.site_type orelse askSiteType(w, caps, lang) orelse return;
         const base_url = askBaseUrl(w, caps, lang, null);
         const api_key = askApiKey(w, caps, lang, null);
+        const model = askModel(w, caps, lang, site_type, null);
 
-        const site = sites_mod.Site{ .site_type = site_type, .base_url = base_url, .api_key = api_key };
+        const site = sites_mod.Site{ .site_type = site_type, .base_url = base_url, .api_key = api_key, .model = model };
         try store.addOrUpdate(allocator, args.alias, site);
         try sites_mod.saveSites(allocator, &store);
 
@@ -174,6 +178,7 @@ fn runEdit(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermC
     var masked_buf: [64]u8 = undefined;
     const masked = sites_mod.maskKey(&masked_buf, existing.api_key);
     try output.printKeyValue(w, "  API Key:", masked, caps);
+    try output.printKeyValue(w, "  Model:", existing.effectiveModel(), caps);
     try output.printSeparator(w, caps);
 
     try output.printInfo(w, i18n.tr(lang, "Press Enter to keep current value", "按回车保留当前值", "Enterキーで現在の値を保持"), caps);
@@ -182,8 +187,9 @@ fn runEdit(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermC
     const site_type = askSiteType(w, caps, lang) orelse existing.site_type;
     const base_url = askBaseUrl(w, caps, lang, existing.base_url);
     const api_key = askApiKey(w, caps, lang, existing.api_key);
+    const model = askModel(w, caps, lang, site_type, if (existing.model.len > 0) existing.model else null);
 
-    const site = sites_mod.Site{ .site_type = site_type, .base_url = base_url, .api_key = api_key };
+    const site = sites_mod.Site{ .site_type = site_type, .base_url = base_url, .api_key = api_key, .model = model };
     try store.addOrUpdate(allocator, args.alias, site);
     try sites_mod.saveSites(allocator, &store);
 
@@ -253,6 +259,7 @@ fn runList(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermC
             var masked_buf: [64]u8 = undefined;
             const masked = sites_mod.maskKey(&masked_buf, entry.site.api_key);
             try output.printKeyValue(w, "    API Key:", masked, caps);
+            try output.printKeyValue(w, "    Model:", entry.site.effectiveModel(), caps);
         }
         try output.printSeparator(w, caps);
         try w.flush();
@@ -263,30 +270,14 @@ fn runList(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermC
     try output.printInfo(w, i18n.tr(lang, "Checking connectivity...", "正在检测连通性...", "接続を確認中..."), caps);
     try w.flush();
 
-    const statuses = try check_mod.checkAllSites(allocator, &store);
-    defer if (statuses.len > 0) allocator.free(statuses);
-
-    const total = statuses.len;
-
-    if (total <= 8) {
-        // Single column
-        for (statuses) |status| {
-            try printSiteStatusLine(w, caps, status, 0);
-        }
-    } else {
-        // Two-column layout
-        const left_count = (total + 1) / 2;
-        const col_width: u32 = if (caps.width > 8) (caps.width - 4) / 2 else 40;
-
-        for (0..left_count) |i| {
-            try printSiteStatusLine(w, caps, statuses[i], col_width);
-            const right_idx = i + left_count;
-            if (right_idx < total) {
-                try printSiteStatusLine(w, caps, statuses[right_idx], 0);
-            } else {
-                try w.print("\n", .{});
-            }
-        }
+    for (store.entries[0..store.count]) |entry| {
+        const status = check_mod.SiteStatus{
+            .alias = entry.alias,
+            .site = entry.site,
+            .conn = check_mod.checkConnectivity(allocator, entry.site.base_url),
+        };
+        try printSiteStatusLine(w, caps, status, 0);
+        try w.flush();
     }
 
     try output.printSeparator(w, caps);
@@ -349,13 +340,6 @@ fn printSiteStatusLine(w: *std.Io.Writer, caps: terminal.TermCaps, status: check
 // --- Use ---
 
 fn runUse(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCaps, lang: i18n.Language, args: cli.UseArgs) !void {
-    const header = switch (args.site_type) {
-        .cx => i18n.tr(lang, "Apply to Codex", "应用到 Codex", "Codexに適用"),
-        .cc => i18n.tr(lang, "Apply to Claude Code", "应用到 Claude Code", "Claude Codeに適用"),
-        .oc => i18n.tr(lang, "Apply to OpenCode", "应用到 OpenCode", "OpenCodeに適用"),
-    };
-    try output.printSectionHeader(w, header, caps);
-
     var store = try sites_mod.loadSites(allocator);
     defer store.deinit(allocator);
 
@@ -367,20 +351,30 @@ fn runUse(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCa
         return;
     };
 
-    // Type mismatch warning
-    if (site.site_type != args.site_type) {
+    // Determine target type: explicit arg or auto-detect from site
+    const target_type = args.site_type orelse site.site_type;
+
+    const header = switch (target_type) {
+        .cx => i18n.tr(lang, "Apply to Codex", "应用到 Codex", "Codexに適用"),
+        .cc => i18n.tr(lang, "Apply to Claude Code", "应用到 Claude Code", "Claude Codeに適用"),
+        .oc => i18n.tr(lang, "Apply to OpenCode", "应用到 OpenCode", "OpenCodeに適用"),
+    };
+    try output.printSectionHeader(w, header, caps);
+
+    // Type mismatch warning (only when type was explicitly specified)
+    if (args.site_type != null and site.site_type != target_type) {
         var warn_buf: [256]u8 = undefined;
         const warn_msg = std.fmt.bufPrint(&warn_buf, "{s} (site type: {s}, target: {s})", .{
             i18n.tr(lang, "Type mismatch", "类型不匹配", "タイプ不一致"),
             site.site_type.displayName(),
-            args.site_type.displayName(),
+            target_type.displayName(),
         }) catch "Type mismatch";
         try output.printWarning(w, warn_msg, caps);
         try w.flush();
     }
 
     // Apply
-    switch (args.site_type) {
+    switch (target_type) {
         .cx => try apply_mod.applyToCodex(allocator, w, caps, lang, site),
         .cc => try apply_mod.applyToClaudeCode(allocator, w, caps, lang, site),
         .oc => try apply_mod.applyToOpenCode(allocator, w, caps, lang, site),
@@ -390,7 +384,7 @@ fn runUse(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCa
     try output.printInfo(w, i18n.tr(lang, "Detecting models...", "正在检测模型...", "モデルを検出中..."), caps);
     try w.flush();
 
-    const model_info = check_mod.detectModels(allocator, site.base_url, site.api_key, args.site_type);
+    const model_info = check_mod.detectModels(allocator, site.base_url, site.api_key, target_type);
 
     if (model_info.models_found > 0) {
         var model_buf: [128]u8 = undefined;
@@ -417,30 +411,40 @@ fn runUse(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCa
 
 fn runInstall(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCaps, lang: i18n.Language) !void {
     try output.printSectionHeader(w, i18n.tr(lang, "Install", "安装", "インストール"), caps);
+    try w.flush();
 
-    const installed_path = install_mod.install(allocator) catch |err| {
+    const result = install_mod.install(allocator) catch |err| {
         try output.printError(w, i18n.tr(lang, "Install failed", "安装失败", "インストールに失敗しました"), caps);
         try w.flush();
         return err;
     };
-    defer allocator.free(installed_path);
+    defer allocator.free(result.path);
 
-    try output.printSuccess(w, i18n.tr(lang, "Installed successfully", "安装成功", "インストールしました"), caps);
-    try output.printKeyValue(w, i18n.tr(lang, "Executable:", "可执行文件:", "実行ファイル:"), installed_path, caps);
+    switch (result.status) {
+        .installed => try output.printSuccess(w, i18n.tr(lang, "Installed successfully", "安装成功", "インストールしました"), caps),
+        .already_installed => try output.printInfo(w, i18n.tr(lang, "Already installed", "已经安装", "既にインストールされています"), caps),
+        .already_installed_busy => try output.printWarning(w, i18n.tr(lang, "Already installed (existing binary is in use, kept current install)", "已经安装（现有程序正在使用，保留当前安装）", "既にインストール済みです（既存バイナリ使用中のため現行インストールを維持しました）"), caps),
+    }
+    try output.printKeyValue(w, i18n.tr(lang, "Executable:", "可执行文件:", "実行ファイル:"), result.path, caps);
     try output.printKeyValue(w, i18n.tr(lang, "PATH:", "PATH:", "PATH:"), app.display_install_bin_path, caps);
     try w.flush();
 }
 
 fn runUninstall(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCaps, lang: i18n.Language) !void {
     try output.printSectionHeader(w, i18n.tr(lang, "Uninstall", "卸载", "アンインストール"), caps);
+    try w.flush();
 
-    install_mod.uninstall(allocator) catch |err| {
+    const status = install_mod.uninstall(allocator) catch |err| {
         try output.printError(w, i18n.tr(lang, "Uninstall failed", "卸载失败", "アンインストールに失敗しました"), caps);
         try w.flush();
         return err;
     };
 
-    try output.printSuccess(w, i18n.tr(lang, "Uninstalled successfully", "卸载完成", "アンインストールしました"), caps);
+    switch (status) {
+        .removed => try output.printSuccess(w, i18n.tr(lang, "Uninstalled successfully", "卸载完成", "アンインストールしました"), caps),
+        .already_removed => try output.printInfo(w, i18n.tr(lang, "Already uninstalled", "已经卸载", "既にアンインストールされています"), caps),
+        .scheduled_cleanup => try output.printWarning(w, i18n.tr(lang, "Uninstall scheduled in background. Wait a few seconds before reinstalling.", "已在后台安排卸载，重新安装前请等待几秒。", "バックグラウンドでアンインストールを開始しました。再インストール前に数秒待ってください。"), caps),
+    }
     try w.flush();
 }
 
@@ -535,10 +539,20 @@ fn runUpdate(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.Ter
 
 // --- Interactive helpers ---
 
+// Persistent buffers for interactive input so returned slices remain valid
+// until the next call to the same function.
+var g_readline_buf: [512]u8 = undefined;
+var g_url_input_buf: [512]u8 = undefined;
+var g_key_input_buf: [512]u8 = undefined;
+var g_model_input_buf: [512]u8 = undefined;
+
 fn readLine() []const u8 {
-    var input_buf: [512]u8 = undefined;
-    const input_len = std.fs.File.stdin().read(&input_buf) catch 0;
-    return std.mem.trim(u8, input_buf[0..input_len], " \t\r\n");
+    return readLineInto(&g_readline_buf);
+}
+
+fn readLineInto(buf: *[512]u8) []const u8 {
+    const input_len = std.fs.File.stdin().read(buf) catch 0;
+    return std.mem.trim(u8, buf[0..input_len], " \t\r\n");
 }
 
 fn askSiteType(w: *std.Io.Writer, caps: terminal.TermCaps, lang: i18n.Language) ?sites_mod.SiteType {
@@ -567,7 +581,7 @@ fn askBaseUrl(w: *std.Io.Writer, caps: terminal.TermCaps, _: i18n.Language, curr
     }
     w.flush() catch {};
 
-    const input = readLine();
+    const input = readLineInto(&g_url_input_buf);
     if (input.len == 0) {
         return current orelse "";
     }
@@ -586,9 +600,27 @@ fn askApiKey(w: *std.Io.Writer, caps: terminal.TermCaps, _: i18n.Language, curre
     }
     w.flush() catch {};
 
-    const input = readLine();
+    const input = readLineInto(&g_key_input_buf);
     if (input.len == 0) {
         return current orelse "";
+    }
+    return input;
+}
+
+fn askModel(w: *std.Io.Writer, caps: terminal.TermCaps, lang: i18n.Language, site_type: sites_mod.SiteType, current: ?[]const u8) []const u8 {
+    const default_model = sites_mod.defaultModelForType(site_type);
+    const display = if (current != null and current.?.len > 0) current.? else default_model;
+    var prompt_buf: [256]u8 = undefined;
+    const prompt = std.fmt.bufPrint(&prompt_buf, "{s} [{s}]:", .{
+        i18n.tr(lang, "Model", "模型", "モデル"),
+        display,
+    }) catch "Model:";
+    output.printPrompt(w, prompt, caps) catch {};
+    w.flush() catch {};
+
+    const input = readLineInto(&g_model_input_buf);
+    if (input.len == 0) {
+        return current orelse default_model;
     }
     return input;
 }

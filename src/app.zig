@@ -25,6 +25,11 @@ pub const github_releases_url = "https://api.github.com/repos/" ++ github_repo +
 pub const install_bin_dir_name = "bin";
 pub const path_marker = "# velora PATH";
 
+// Default models per tool type
+pub const default_model_cc = "claude-opus-4-6";
+pub const default_model_cx = "GPT-5.4";
+pub const default_model_oc = "GPT-5.4";
+
 pub fn executableName() []const u8 {
     return switch (builtin.os.tag) {
         .windows => command_name ++ ".exe",

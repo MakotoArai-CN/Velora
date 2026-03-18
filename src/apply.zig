@@ -14,15 +14,17 @@ pub fn applyToCodex(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: termi
     try output.printInfo(w, i18n.tr(lang, "Applying to Codex...", "正在应用到 Codex...", "Codexに適用中..."), caps);
     try w.flush();
 
-    // 1. Update base_url in ~/.codex/config.toml
-    const toml_updated = updateCodexToml(allocator, site.base_url) catch |err| {
+    const model = site.effectiveModel();
+
+    // 1. Update base_url and model in ~/.codex/config.toml
+    const toml_updated = updateCodexToml(allocator, site.base_url, model) catch |err| {
         try output.printWarning(w, i18n.tr(lang, "Failed to update Codex config.toml", "更新 Codex config.toml 失败", "Codex config.toml の更新に失敗しました"), caps);
         try w.flush();
         return err;
     };
 
     if (toml_updated) {
-        try output.printSuccess(w, i18n.tr(lang, "Updated base_url in config.toml", "已更新 config.toml 中的 base_url", "config.toml の base_url を更新しました"), caps);
+        try output.printSuccess(w, i18n.tr(lang, "Updated base_url and model in config.toml", "已更新 config.toml 中的 base_url 和 model", "config.toml の base_url と model を更新しました"), caps);
     }
 
     // 2. Read env_key from config.toml (defaults to OPENAI_API_KEY)
@@ -42,6 +44,7 @@ pub fn applyToCodex(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: termi
     const key_info = std.fmt.bufPrint(&key_info_buf, "{s} = {s}", .{ env_key_name, masked }) catch "?";
     try output.printSuccess(w, key_info, caps);
     try output.printKeyValue(w, "Base URL:", site.base_url, caps);
+    try output.printKeyValue(w, "Model:", model, caps);
     try w.flush();
 }
 
@@ -51,8 +54,10 @@ pub fn applyToClaudeCode(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: 
     try output.printInfo(w, i18n.tr(lang, "Applying to Claude Code...", "正在应用到 Claude Code...", "Claude Codeに適用中..."), caps);
     try w.flush();
 
+    const model = site.effectiveModel();
+
     // 1. Update ~/.claude/settings.json
-    updateClaudeSettings(allocator, site.api_key, site.base_url) catch |err| {
+    updateClaudeSettings(allocator, site.api_key, site.base_url, model) catch |err| {
         try output.printError(w, i18n.tr(lang, "Failed to update Claude Code settings", "更新 Claude Code 设置失败", "Claude Code 設定の更新に失敗しました"), caps);
         try w.flush();
         return err;
@@ -69,6 +74,7 @@ pub fn applyToClaudeCode(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: 
     const info = std.fmt.bufPrint(&info_buf, "ANTHROPIC_AUTH_TOKEN = {s}", .{masked}) catch "?";
     try output.printSuccess(w, info, caps);
     try output.printKeyValue(w, "Base URL:", site.base_url, caps);
+    try output.printKeyValue(w, "Model:", model, caps);
     try w.flush();
 }
 
@@ -80,7 +86,7 @@ fn getCodexTomlPath(allocator: std.mem.Allocator) ![]u8 {
     return try std.fs.path.join(allocator, &.{ home, app.codex_config_dir, app.codex_config_filename });
 }
 
-fn updateCodexToml(allocator: std.mem.Allocator, new_base_url: []const u8) !bool {
+fn updateCodexToml(allocator: std.mem.Allocator, new_base_url: []const u8, new_model: []const u8) !bool {
     const path = try getCodexTomlPath(allocator);
     defer allocator.free(path);
 
@@ -103,6 +109,8 @@ fn updateCodexToml(allocator: std.mem.Allocator, new_base_url: []const u8) !bool
 
     var in_proxy_section = false;
     var base_url_replaced = false;
+    var model_replaced = false;
+    var saw_section = false;
     var line_iter = std.mem.splitScalar(u8, existing.items, '\n');
 
     while (line_iter.next()) |line| {
@@ -110,7 +118,36 @@ fn updateCodexToml(allocator: std.mem.Allocator, new_base_url: []const u8) !bool
 
         // Track TOML sections
         if (trimmed.len > 0 and trimmed[0] == '[') {
+            if (in_proxy_section and !base_url_replaced) {
+                var base_url_buf: [512]u8 = undefined;
+                const base_url_line = std.fmt.bufPrint(&base_url_buf, "base_url = \"{s}\"", .{new_base_url}) catch "";
+                try result.appendSlice(allocator, base_url_line);
+                try result.append(allocator, '\n');
+                base_url_replaced = true;
+            }
+            if (!saw_section and !model_replaced) {
+                var model_buf: [512]u8 = undefined;
+                const model_line = std.fmt.bufPrint(&model_buf, "model = \"{s}\"", .{new_model}) catch "";
+                try result.appendSlice(allocator, model_line);
+                try result.append(allocator, '\n');
+                model_replaced = true;
+            }
+            saw_section = true;
             in_proxy_section = std.mem.indexOf(u8, trimmed, "model_providers.proxy") != null;
+        }
+
+        if (!saw_section) {
+            if (std.mem.indexOf(u8, trimmed, "=")) |eq_pos| {
+                const key = std.mem.trim(u8, trimmed[0..eq_pos], " \t");
+                if (std.mem.eql(u8, key, "model")) {
+                    var line_buf: [512]u8 = undefined;
+                    const new_line = std.fmt.bufPrint(&line_buf, "model = \"{s}\"", .{new_model}) catch line;
+                    try result.appendSlice(allocator, new_line);
+                    if (line_iter.peek() != null) try result.append(allocator, '\n');
+                    model_replaced = true;
+                    continue;
+                }
+            }
         }
 
         if (in_proxy_section and !base_url_replaced) {
@@ -134,6 +171,26 @@ fn updateCodexToml(allocator: std.mem.Allocator, new_base_url: []const u8) !bool
 
         try result.appendSlice(allocator, line);
         if (line_iter.peek() != null) try result.append(allocator, '\n');
+    }
+
+    if (!model_replaced) {
+        if (result.items.len > 0 and result.items[result.items.len - 1] != '\n') {
+            try result.append(allocator, '\n');
+        }
+        var model_buf: [512]u8 = undefined;
+        const model_line = std.fmt.bufPrint(&model_buf, "model = \"{s}\"", .{new_model}) catch "";
+        try result.appendSlice(allocator, model_line);
+        try result.append(allocator, '\n');
+    }
+
+    if (in_proxy_section and !base_url_replaced) {
+        if (result.items.len > 0 and result.items[result.items.len - 1] != '\n') {
+            try result.append(allocator, '\n');
+        }
+        var base_url_buf: [512]u8 = undefined;
+        const base_url_line = std.fmt.bufPrint(&base_url_buf, "base_url = \"{s}\"", .{new_base_url}) catch "";
+        try result.appendSlice(allocator, base_url_line);
+        try result.append(allocator, '\n');
     }
 
     const file = try std.fs.createFileAbsolute(path, .{});
@@ -185,7 +242,7 @@ fn getClaudeSettingsPath(allocator: std.mem.Allocator) ![]u8 {
     return try std.fs.path.join(allocator, &.{ home, app.claude_config_dir, app.claude_settings_filename });
 }
 
-fn updateClaudeSettings(allocator: std.mem.Allocator, api_key: []const u8, base_url: []const u8) !void {
+fn updateClaudeSettings(allocator: std.mem.Allocator, api_key: []const u8, base_url: []const u8, model: []const u8) !void {
     const path = try getClaudeSettingsPath(allocator);
     defer allocator.free(path);
 
@@ -209,7 +266,9 @@ fn updateClaudeSettings(allocator: std.mem.Allocator, api_key: []const u8, base_
         try result.appendSlice(allocator, api_key);
         try result.appendSlice(allocator, "\",\n    \"ANTHROPIC_BASE_URL\": \"");
         try result.appendSlice(allocator, base_url);
-        try result.appendSlice(allocator, "\"\n  }\n}\n");
+        try result.appendSlice(allocator, "\"\n  },\n  \"model\": \"");
+        try result.appendSlice(allocator, model);
+        try result.appendSlice(allocator, "\"\n}\n");
 
         // Ensure directory exists
         const dir_path = std.fs.path.dirname(path) orelse return error.InvalidPath;
@@ -329,9 +388,12 @@ fn updateClaudeSettings(allocator: std.mem.Allocator, api_key: []const u8, base_
         if (line_iter.peek() != null) try result.append(allocator, '\n');
     }
 
+    const updated = try upsertTopLevelJsonStringField(allocator, result.items, "model", model);
+    defer allocator.free(updated);
+
     const file = try std.fs.createFileAbsolute(path, .{});
     defer file.close();
-    try file.writeAll(result.items);
+    try file.writeAll(updated);
 }
 
 // --- OpenCode JSON editing ---
@@ -340,7 +402,9 @@ pub fn applyToOpenCode(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: te
     try output.printInfo(w, i18n.tr(lang, "Applying to OpenCode...", "正在应用到 OpenCode...", "OpenCodeに適用中..."), caps);
     try w.flush();
 
-    updateOpenCodeConfig(allocator, site.api_key, site.base_url) catch |err| {
+    const model = site.effectiveModel();
+
+    updateOpenCodeConfig(allocator, site.api_key, site.base_url, model) catch |err| {
         try output.printError(w, i18n.tr(lang, "Failed to update OpenCode config", "更新 OpenCode 配置失败", "OpenCode 設定の更新に失敗しました"), caps);
         try w.flush();
         return err;
@@ -352,6 +416,7 @@ pub fn applyToOpenCode(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: te
     const info = std.fmt.bufPrint(&info_buf, "apiKey = {s}", .{masked}) catch "?";
     try output.printSuccess(w, info, caps);
     try output.printKeyValue(w, "Base URL:", site.base_url, caps);
+    try output.printKeyValue(w, "Model:", model, caps);
     try w.flush();
 }
 
@@ -361,7 +426,7 @@ fn getOpenCodeConfigPath(allocator: std.mem.Allocator) ![]u8 {
     return try std.fs.path.join(allocator, &.{ home, ".config", "opencode", app.opencode_config_filename });
 }
 
-fn updateOpenCodeConfig(allocator: std.mem.Allocator, api_key: []const u8, base_url: []const u8) !void {
+fn updateOpenCodeConfig(allocator: std.mem.Allocator, api_key: []const u8, base_url: []const u8, model: []const u8) !void {
     const path = try getOpenCodeConfigPath(allocator);
     defer allocator.free(path);
 
@@ -386,7 +451,7 @@ fn updateOpenCodeConfig(allocator: std.mem.Allocator, api_key: []const u8, base_
 
     if (!has_file) {
         // Create new config with openai provider
-        try writeNewOpenCodeConfig(allocator, path, api_key, base_url);
+        try writeNewOpenCodeConfig(allocator, path, api_key, base_url, model);
         return;
     }
 
@@ -482,12 +547,15 @@ fn updateOpenCodeConfig(allocator: std.mem.Allocator, api_key: []const u8, base_
         if (line_iter.peek() != null) try result.append(allocator, '\n');
     }
 
+    const updated = try upsertTopLevelJsonStringField(allocator, result.items, "model", model);
+    defer allocator.free(updated);
+
     const file = try std.fs.createFileAbsolute(path, .{});
     defer file.close();
-    try file.writeAll(result.items);
+    try file.writeAll(updated);
 }
 
-fn writeNewOpenCodeConfig(allocator: std.mem.Allocator, path: []const u8, api_key: []const u8, base_url: []const u8) !void {
+fn writeNewOpenCodeConfig(allocator: std.mem.Allocator, path: []const u8, api_key: []const u8, base_url: []const u8, model: []const u8) !void {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(allocator);
 
@@ -507,6 +575,11 @@ fn writeNewOpenCodeConfig(allocator: std.mem.Allocator, path: []const u8, api_ke
         "      }\n" ++
         "    }\n" ++
         "  },\n" ++
+        "  \"model\": \""
+    );
+    try out.appendSlice(allocator, model);
+    try out.appendSlice(allocator,
+        "\",\n" ++
         "  \"$schema\": \"https://opencode.ai/config.json\"\n" ++
         "}\n"
     );
@@ -514,4 +587,95 @@ fn writeNewOpenCodeConfig(allocator: std.mem.Allocator, path: []const u8, api_ke
     const file = try std.fs.createFileAbsolute(path, .{});
     defer file.close();
     try file.writeAll(out.items);
+}
+
+fn upsertTopLevelJsonStringField(allocator: std.mem.Allocator, content: []const u8, field: []const u8, value: []const u8) ![]u8 {
+    var depth: i32 = 0;
+    var i: usize = 0;
+
+    while (i < content.len) {
+        const ch = content[i];
+        switch (ch) {
+            '{' => {
+                depth += 1;
+                i += 1;
+            },
+            '}' => {
+                depth -= 1;
+                i += 1;
+            },
+            '"' => {
+                const key_end = findJsonStringEnd(content, i + 1) orelse break;
+                if (depth == 1) {
+                    const key = content[i + 1 .. key_end];
+                    var pos = skipJsonWhitespace(content, key_end + 1);
+                    if (pos < content.len and content[pos] == ':') {
+                        pos = skipJsonWhitespace(content, pos + 1);
+                        if (std.mem.eql(u8, key, field) and pos < content.len and content[pos] == '"') {
+                            const value_end = findJsonStringEnd(content, pos + 1) orelse break;
+                            var updated: std.ArrayListUnmanaged(u8) = .empty;
+                            defer updated.deinit(allocator);
+                            try updated.appendSlice(allocator, content[0 .. pos + 1]);
+                            try updated.appendSlice(allocator, value);
+                            try updated.appendSlice(allocator, content[value_end..]);
+                            return updated.toOwnedSlice(allocator);
+                        }
+                    }
+                }
+                i = key_end + 1;
+            },
+            else => i += 1,
+        }
+    }
+
+    const object_start = std.mem.indexOfScalar(u8, content, '{') orelse return try allocator.dupe(u8, content);
+    const insert_pos = skipJsonWhitespace(content, object_start + 1);
+    const has_members = insert_pos < content.len and content[insert_pos] != '}';
+
+    var updated: std.ArrayListUnmanaged(u8) = .empty;
+    defer updated.deinit(allocator);
+
+    try updated.appendSlice(allocator, content[0..insert_pos]);
+    if (has_members) {
+        try updated.appendSlice(allocator, "\n  \"");
+        try updated.appendSlice(allocator, field);
+        try updated.appendSlice(allocator, "\": \"");
+        try updated.appendSlice(allocator, value);
+        try updated.appendSlice(allocator, "\",");
+        if (content[insert_pos] != '\n') {
+            try updated.append(allocator, '\n');
+        }
+    } else {
+        try updated.appendSlice(allocator, "\n  \"");
+        try updated.appendSlice(allocator, field);
+        try updated.appendSlice(allocator, "\": \"");
+        try updated.appendSlice(allocator, value);
+        try updated.appendSlice(allocator, "\"\n");
+    }
+    try updated.appendSlice(allocator, content[insert_pos..]);
+    return updated.toOwnedSlice(allocator);
+}
+
+fn skipJsonWhitespace(content: []const u8, start: usize) usize {
+    var pos = start;
+    while (pos < content.len and std.ascii.isWhitespace(content[pos])) : (pos += 1) {}
+    return pos;
+}
+
+fn findJsonStringEnd(content: []const u8, start: usize) ?usize {
+    var pos = start;
+    var escaped = false;
+    while (pos < content.len) : (pos += 1) {
+        const ch = content[pos];
+        if (escaped) {
+            escaped = false;
+            continue;
+        }
+        if (ch == '\\') {
+            escaped = true;
+            continue;
+        }
+        if (ch == '"') return pos;
+    }
+    return null;
 }

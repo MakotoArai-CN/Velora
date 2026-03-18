@@ -12,6 +12,7 @@ pub const AddArgs = struct {
     site_type: ?SiteType = null,
     base_url: ?[]const u8 = null,
     api_key: ?[]const u8 = null,
+    model: ?[]const u8 = null,
 };
 
 pub const EditArgs = struct {
@@ -27,7 +28,7 @@ pub const ListArgs = struct {
 };
 
 pub const UseArgs = struct {
-    site_type: SiteType,
+    site_type: ?SiteType, // null means auto-detect from stored site
     alias: []const u8,
 };
 
@@ -146,10 +147,18 @@ pub fn parseArgs(_: std.mem.Allocator) ParseError!Config {
     } else if (eql(sub, "oc") or eql(sub, "opencode")) {
         config.command = try parseUse(.oc, rest);
     } else if (eql(sub, "use")) {
-        // velorause cx <alias> or velorause cc <alias>
-        if (rest.len < 2) return error.InvalidArgument;
-        const st = SiteType.fromString(rest[0]) orelse return error.InvalidArgument;
-        config.command = .{ .use = .{ .site_type = st, .alias = rest[1] } };
+        // velora use <alias> (auto-detect) or velora use <type> <alias>
+        if (rest.len < 1) return error.InvalidArgument;
+        if (rest.len >= 2) {
+            if (SiteType.fromString(rest[0])) |st| {
+                config.command = .{ .use = .{ .site_type = st, .alias = rest[1] } };
+            } else {
+                return error.InvalidArgument;
+            }
+        } else {
+            // velora use <alias> - auto-detect type from stored site
+            config.command = .{ .use = .{ .site_type = null, .alias = rest[0] } };
+        }
     } else if (eql(sub, "install") or eql(sub, "--install")) {
         config.command = .install;
     } else if (eql(sub, "uninstall") or eql(sub, "--uninstall") or eql(sub, "--del")) {
@@ -166,7 +175,7 @@ pub fn parseArgs(_: std.mem.Allocator) ParseError!Config {
 fn parseAdd(rest: []const []const u8) ParseError!Command {
     if (rest.len == 0) return error.InvalidArgument;
 
-    // Check if first arg is a type (cx/cc) -> direct mode: velora add<type> <alias> <url> <key>
+    // Check if first arg is a type (cx/cc) -> direct mode: velora add<type> <alias> <url> <key> [model]
     if (SiteType.fromString(rest[0])) |st| {
         if (rest.len >= 4) {
             return .{ .add = .{
@@ -174,6 +183,7 @@ fn parseAdd(rest: []const []const u8) ParseError!Command {
                 .site_type = st,
                 .base_url = rest[2],
                 .api_key = rest[3],
+                .model = if (rest.len >= 5) rest[4] else null,
             } };
         }
         // velora add<type> <alias> -> interactive with type pre-set
@@ -237,11 +247,12 @@ fn printHelp(lang: i18n.Language) void {
         \\
         \\命令:
         \\  add <别名>                         交互式添加站点
-        \\  add <类型> <别名> <URL> <Key>      一次性添加站点 (类型: cx, cc)
+        \\  add <类型> <别名> <URL> <Key> [模型] 一次性添加站点 (类型: cx, cc, oc)
         \\  edit <别名>                        编辑站点配置
         \\  del <别名>                         删除站点
         \\  list                               显示站点列表（含连通性检测）
         \\  list all                           显示详细站点信息
+        \\  use <别名>                         自动应用站点（根据类型）
         \\  cx use <别名>                      应用站点到 Codex
         \\  cc use <别名>                      应用站点到 Claude Code
         \\  oc use <别名>                      应用站点到 OpenCode
@@ -260,6 +271,8 @@ fn printHelp(lang: i18n.Language) void {
         \\示例:
         \\  velora add openai
         \\  velora add cx openai https://api.example.com/v1 sk-xxx
+        \\  velora add cc claude https://api.example.com sk-ant claude-opus-4-6
+        \\  velora use openai
         \\  velora cx use openai
         \\  velora cc use claude
         \\  velora oc use openai
@@ -274,17 +287,20 @@ fn printHelp(lang: i18n.Language) void {
         \\
         \\コマンド:
         \\  add <エイリアス>                       サイトを対話式で追加
-        \\  add <タイプ> <エイリアス> <URL> <Key>  サイトを一括で追加 (タイプ: cx, cc)
+        \\  add <タイプ> <エイリアス> <URL> <Key> [モデル] サイトを一括で追加 (タイプ: cx, cc, oc)
         \\  edit <エイリアス>                      サイトの設定を編集
         \\  del <エイリアス>                       サイトを削除
         \\  list                                  サイト一覧表示（接続確認付き）
         \\  list all                              サイト詳細表示
+        \\  use <エイリアス>                       サイトを自動適用（タイプに基づく）
         \\  cx use <エイリアス>                    サイトをCodexに適用
         \\  cc use <エイリアス>                    サイトをClaude Codeに適用
+        \\  oc use <エイリアス>                    サイトをOpenCodeに適用
         \\
         \\タイプ:
         \\  cx    Codex (OPENAI_API_KEY)
         \\  cc    Claude Code (ANTHROPIC_AUTH_TOKEN)
+        \\  oc    OpenCode (~/.config/opencode/opencode.json)
         \\
         \\オプション:
         \\  -h, --help             ヘルプを表示
@@ -294,6 +310,8 @@ fn printHelp(lang: i18n.Language) void {
         \\例:
         \\  velora add openai
         \\  velora add cx openai https://api.example.com/v1 sk-xxx
+        \\  velora add cc claude https://api.example.com sk-ant claude-opus-4-6
+        \\  velora use openai
         \\  velora cx use openai
         \\  velora cc use claude
         \\  velora list
@@ -307,11 +325,12 @@ fn printHelp(lang: i18n.Language) void {
         \\
         \\Commands:
         \\  add <alias>                        Add a site interactively
-        \\  add <type> <alias> <url> <key>     Add a site directly (type: cx, cc)
+        \\  add <type> <alias> <url> <key> [model] Add a site directly (type: cx, cc, oc)
         \\  edit <alias>                       Edit site configuration
         \\  del <alias>                        Delete a site
         \\  list                               List sites with connectivity check
         \\  list all                           List sites with full details
+        \\  use <alias>                        Apply site config (auto-detect type)
         \\  cx use <alias>                     Apply site config to Codex
         \\  cc use <alias>                     Apply site config to Claude Code
         \\  oc use <alias>                     Apply site config to OpenCode
@@ -330,6 +349,8 @@ fn printHelp(lang: i18n.Language) void {
         \\Examples:
         \\  velora add openai
         \\  velora add cx openai https://api.example.com/v1 sk-xxx
+        \\  velora add cc claude https://api.example.com sk-ant claude-opus-4-6
+        \\  velora use openai
         \\  velora cx use openai
         \\  velora cc use claude
         \\  velora oc use openai
