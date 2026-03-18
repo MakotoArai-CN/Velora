@@ -29,6 +29,9 @@ zig build -Doptimize=ReleaseSmall
 zig build -Doptimize=ReleaseSafe
 # 构建性能版本
 zig build -Doptimize=ReleaseFast
+
+# 测试
+zig test
 ```
 
 ## 一键安装
