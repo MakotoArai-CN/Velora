@@ -129,3 +129,5 @@ velora oc use openai
 ## LICENSE
 
 本项目使用 [AGPL-3.0](LICENSE) 协议，未经允许不得用于商业用途，二次修改请务必保留版权声明。
+
+[![Star History Chart](https://api.star-history.com/svg?repos=MakotoArai-CN/Velora&type=date&legend=top-left)](https://www.star-history.com/#MakotoArai-CN/Velora&type=date&legend=top-left)
