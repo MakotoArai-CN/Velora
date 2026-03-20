@@ -59,6 +59,11 @@ pub const SiteEntry = struct {
 
 pub const MAX_SITES = 64;
 
+pub const Settings = struct {
+    model_check: bool = true, // enable model detection on 'use'
+    list_latency: bool = true, // enable latency check on 'list'
+};
+
 pub const SitesStore = struct {
     entries: [MAX_SITES]SiteEntry = undefined,
     count: usize = 0,
@@ -155,6 +160,130 @@ pub fn getSitesFilePath(allocator: std.mem.Allocator) ![]u8 {
     };
 
     return try std.fs.path.join(allocator, &.{ dir, app.sites_filename });
+}
+
+pub fn loadSettings(allocator: std.mem.Allocator) Settings {
+    var settings: Settings = .{};
+
+    const path = getSitesFilePath(allocator) catch return settings;
+    defer allocator.free(path);
+
+    const file = std.fs.openFileAbsolute(path, .{}) catch return settings;
+    defer file.close();
+
+    var buf: [65536]u8 = undefined;
+    const bytes_read = file.readAll(&buf) catch return settings;
+    const content = buf[0..bytes_read];
+
+    const settings_key = "\"settings\"";
+    const settings_pos = std.mem.indexOf(u8, content, settings_key) orelse return settings;
+    const after = content[settings_pos + settings_key.len ..];
+    const obj_start = std.mem.indexOf(u8, after, "{") orelse return settings;
+    const body = after[obj_start + 1 ..];
+    const inner = findMatchingBrace(body) orelse return settings;
+
+    const mc = env_mod.extractJsonValue(allocator, body[0 .. inner.len + 1], "model_check") catch null;
+    defer if (mc) |s| allocator.free(s);
+    if (mc) |v| {
+        if (std.mem.eql(u8, v, "false")) settings.model_check = false;
+    }
+
+    const ll = env_mod.extractJsonValue(allocator, body[0 .. inner.len + 1], "list_latency") catch null;
+    defer if (ll) |s| allocator.free(s);
+    if (ll) |v| {
+        if (std.mem.eql(u8, v, "false")) settings.list_latency = false;
+    }
+
+    return settings;
+}
+
+pub fn saveSettings(allocator: std.mem.Allocator, settings: Settings) !void {
+    // Load existing file, replace/insert settings block, preserve everything else
+    const path = try getSitesFilePath(allocator);
+    defer allocator.free(path);
+
+    var existing: std.ArrayListUnmanaged(u8) = .empty;
+    defer existing.deinit(allocator);
+
+    const has_file = blk: {
+        const file = std.fs.openFileAbsolute(path, .{}) catch break :blk false;
+        defer file.close();
+        var buf: [65536]u8 = undefined;
+        const bytes_read = file.readAll(&buf) catch break :blk false;
+        existing.appendSlice(allocator, buf[0..bytes_read]) catch break :blk false;
+        break :blk true;
+    };
+
+    if (!has_file or existing.items.len == 0) {
+        // Write new file with just settings
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        defer out.deinit(allocator);
+        try out.appendSlice(allocator, "{\n  \"settings\": {\n    \"model_check\": ");
+        try out.appendSlice(allocator, if (settings.model_check) "true" else "false");
+        try out.appendSlice(allocator, ",\n    \"list_latency\": ");
+        try out.appendSlice(allocator, if (settings.list_latency) "true" else "false");
+        try out.appendSlice(allocator, "\n  },\n  \"sites\": {}\n}\n");
+        const file = try std.fs.createFileAbsolute(path, .{});
+        defer file.close();
+        try file.writeAll(out.items);
+        return;
+    }
+
+    const content = existing.items;
+
+    // Build new settings block text
+    var settings_text_buf: [256]u8 = undefined;
+    const settings_text = std.fmt.bufPrint(&settings_text_buf,
+        \\  "settings": {{
+        \\    "model_check": {s},
+        \\    "list_latency": {s}
+        \\  }}
+    , .{
+        if (settings.model_check) "true" else "false",
+        if (settings.list_latency) "true" else "false",
+    }) catch return;
+
+    // Try to find and replace existing settings block
+    const settings_key = "\"settings\"";
+    if (std.mem.indexOf(u8, content, settings_key)) |sk_pos| {
+        // Find the { after "settings"
+        const after_key = content[sk_pos..];
+        const brace_offset = std.mem.indexOf(u8, after_key, "{") orelse return;
+        const brace_start = sk_pos + brace_offset;
+        // Find matching }
+        const inner_start = brace_start + 1;
+        const inner_body = content[inner_start..];
+        const inner = findMatchingBrace(inner_body) orelse return;
+        const block_end = inner_start + inner.len + 1; // includes closing }
+
+        // Find the start of the "settings" line (backtrack to find indentation)
+        var line_start = sk_pos;
+        while (line_start > 0 and content[line_start - 1] != '\n') : (line_start -= 1) {}
+
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        defer out.deinit(allocator);
+        try out.appendSlice(allocator, content[0..line_start]);
+        try out.appendSlice(allocator, settings_text);
+        try out.appendSlice(allocator, content[block_end..]);
+
+        const file = try std.fs.createFileAbsolute(path, .{});
+        defer file.close();
+        try file.writeAll(out.items);
+    } else {
+        // No settings block yet - insert after opening {
+        const first_brace = std.mem.indexOfScalar(u8, content, '{') orelse return;
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        defer out.deinit(allocator);
+        try out.appendSlice(allocator, content[0 .. first_brace + 1]);
+        try out.appendSlice(allocator, "\n");
+        try out.appendSlice(allocator, settings_text);
+        try out.appendSlice(allocator, ",\n");
+        try out.appendSlice(allocator, content[first_brace + 1 ..]);
+
+        const file = try std.fs.createFileAbsolute(path, .{});
+        defer file.close();
+        try file.writeAll(out.items);
+    }
 }
 
 pub fn loadSites(allocator: std.mem.Allocator) !SitesStore {

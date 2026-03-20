@@ -32,12 +32,23 @@ pub const UseArgs = struct {
     alias: []const u8,
 };
 
+pub const SetArgs = struct {
+    key: []const u8,
+    value: []const u8,
+};
+
+pub const ModelsArgs = struct {
+    alias: []const u8,
+};
+
 pub const Command = union(enum) {
     add: AddArgs,
     edit: EditArgs,
     del: DelArgs,
     list: ListArgs,
     use: UseArgs,
+    set: SetArgs,
+    models: ModelsArgs,
     install,
     uninstall,
     update_check, // --update: check and apply update
@@ -159,6 +170,14 @@ pub fn parseArgs(_: std.mem.Allocator) ParseError!Config {
             // velora use <alias> - auto-detect type from stored site
             config.command = .{ .use = .{ .site_type = null, .alias = rest[0] } };
         }
+    } else if (eql(sub, "set") or eql(sub, "s")) {
+        // velora set <key> <value>  /  velora s mc off
+        if (rest.len < 2) return error.InvalidArgument;
+        config.command = .{ .set = .{ .key = expandSettingKey(rest[0]), .value = rest[1] } };
+    } else if (eql(sub, "models") or eql(sub, "m")) {
+        // velora models <alias>  /  velora m <alias>
+        if (rest.len < 1) return error.InvalidArgument;
+        config.command = .{ .models = .{ .alias = rest[0] } };
     } else if (eql(sub, "install") or eql(sub, "--install")) {
         config.command = .install;
     } else if (eql(sub, "uninstall") or eql(sub, "--uninstall") or eql(sub, "--del")) {
@@ -225,6 +244,12 @@ fn parseLang(s: []const u8) ?i18n.Language {
     return null;
 }
 
+fn expandSettingKey(s: []const u8) []const u8 {
+    if (eql(s, "mc")) return "model_check";
+    if (eql(s, "ll")) return "list_latency";
+    return s;
+}
+
 fn printHelp(lang: i18n.Language) void {
     var stdout_buffer: [8192]u8 = undefined;
     var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
@@ -256,6 +281,12 @@ fn printHelp(lang: i18n.Language) void {
         \\  cx use <别名>                      应用站点到 Codex
         \\  cc use <别名>                      应用站点到 Claude Code
         \\  oc use <别名>                      应用站点到 OpenCode
+        \\  models|m <别名>                    浏览站点支持的全部模型
+        \\  set|s <选项> <on/off>              设置选项开关
+        \\
+        \\设置选项 (缩写):
+        \\  model_check (mc)                   模型检测 (默认: on)
+        \\  list_latency (ll)                  列表延迟检测 (默认: on)
         \\
         \\类型:
         \\  cx    Codex (OPENAI_API_KEY)
@@ -276,6 +307,9 @@ fn printHelp(lang: i18n.Language) void {
         \\  velora cx use openai
         \\  velora cc use claude
         \\  velora oc use openai
+        \\  velora m openai
+        \\  velora s mc off
+        \\  velora s ll off
         \\  velora list
         \\  velora list all
         \\  velora edit openai
@@ -296,6 +330,12 @@ fn printHelp(lang: i18n.Language) void {
         \\  cx use <エイリアス>                    サイトをCodexに適用
         \\  cc use <エイリアス>                    サイトをClaude Codeに適用
         \\  oc use <エイリアス>                    サイトをOpenCodeに適用
+        \\  models|m <エイリアス>                    サイトの全モデルを表示
+        \\  set|s <項目> <on/off>                   設定の切り替え
+        \\
+        \\設定項目 (略称):
+        \\  model_check (mc)                        モデル検出 (デフォルト: on)
+        \\  list_latency (ll)                       リスト遅延チェック (デフォルト: on)
         \\
         \\タイプ:
         \\  cx    Codex (OPENAI_API_KEY)
@@ -314,6 +354,8 @@ fn printHelp(lang: i18n.Language) void {
         \\  velora use openai
         \\  velora cx use openai
         \\  velora cc use claude
+        \\  velora models openai
+        \\  velora set model_check off
         \\  velora list
         \\  velora list all
         \\  velora edit openai
@@ -334,6 +376,12 @@ fn printHelp(lang: i18n.Language) void {
         \\  cx use <alias>                     Apply site config to Codex
         \\  cc use <alias>                     Apply site config to Claude Code
         \\  oc use <alias>                     Apply site config to OpenCode
+        \\  models|m <alias>                     Browse all models for a site
+        \\  set|s <option> <on/off>              Toggle settings
+        \\
+        \\Settings (shorthand):
+        \\  model_check (mc)                     Model detection on use (default: on)
+        \\  list_latency (ll)                    Latency check on list (default: on)
         \\
         \\Types:
         \\  cx    Codex (OPENAI_API_KEY)
@@ -354,6 +402,9 @@ fn printHelp(lang: i18n.Language) void {
         \\  velora cx use openai
         \\  velora cc use claude
         \\  velora oc use openai
+        \\  velora m openai
+        \\  velora s mc off
+        \\  velora s ll off
         \\  velora list
         \\  velora list all
         \\  velora edit openai
