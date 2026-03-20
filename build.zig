@@ -1,5 +1,6 @@
 const std = @import("std");
 const app_name = "velora";
+const version = "1.1.1";
 
 const CrossTarget = struct {
     name: []const u8,
@@ -29,6 +30,12 @@ const cross_targets = [_]CrossTarget{
     .{ .name = "freebsd-aarch64", .cpu_arch = .aarch64, .os_tag = .freebsd },
 };
 
+fn addVersionModule(b: *std.Build, module: *std.Build.Module) void {
+    const options = b.addOptions();
+    options.addOption([]const u8, "version", version);
+    module.addImport("build_options", options.createModule());
+}
+
 pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
@@ -44,6 +51,7 @@ pub fn build(b: *std.Build) void {
             .target = ct_target,
             .optimize = optimize,
         });
+        addVersionModule(b, ct_module);
 
         const ct_exe = b.addExecutable(.{
             .name = b.fmt("{s}-{s}", .{ app_name, ct.name }),
@@ -59,6 +67,7 @@ pub fn build(b: *std.Build) void {
         .target = native_target,
         .optimize = optimize,
     });
+    addVersionModule(b, native_module);
 
     const native_exe = b.addExecutable(.{
         .name = app_name,
@@ -79,6 +88,7 @@ pub fn build(b: *std.Build) void {
         .target = native_target,
         .optimize = optimize,
     });
+    addVersionModule(b, test_module);
 
     const exe_unit_tests = b.addTest(.{
         .name = "velora-test",

@@ -31,7 +31,7 @@ zig build -Doptimize=ReleaseSafe
 zig build -Doptimize=ReleaseFast
 
 # 测试
-zig test
+zig build test
 ```
 
 ## 一键安装
@@ -86,13 +86,21 @@ velora edit <别名>
 velora del <别名>
 
 # 查看站点列表（含连通性检测）
-velora list
+velora list          # 或 velora ls
 velora list all
 
 # 应用站点配置到指定工具
-velora cx use <别名>      # 应用到 Codex
-velora cc use <别名>      # 应用到 Claude Code
-velora oc use <别名>      # 应用到 OpenCode
+velora use <别名>         # 自动检测类型
+velora cx <别名>          # 应用到 Codex
+velora cc <别名>          # 应用到 Claude Code
+velora oc <别名>          # 应用到 OpenCode
+
+# 浏览站点的全部模型
+velora models <别名>      # 或 velora m <别名>
+
+# 设置选项
+velora set model_check off    # 或 velora s mc off  关闭模型检测
+velora set list_latency off   # 或 velora s ll off  关闭延迟检测
 
 # 安装 / 卸载
 velora install
@@ -102,15 +110,33 @@ velora uninstall
 velora --update
 ```
 
+### 命令缩写
+
+| 完整命令 | 缩写 | 说明 |
+|----------|------|------|
+| `set` | `s` | 设置选项 |
+| `models` | `m` | 浏览模型 |
+| `list` | `ls` | 站点列表 |
+| `del` | `rm` | 删除站点 |
+
+### 设置选项缩写
+
+| 完整选项 | 缩写 | 说明 |
+|----------|------|------|
+| `model_check` | `mc` | use 时是否检测模型（默认 on） |
+| `list_latency` | `ll` | list 时是否检测延迟（默认 on） |
+
 ## 用法示例
 
 ```bash
 velora add openai
 velora add cx openai https://api.example.com/v1 sk-xxx
 velora add cc claude https://api.example.com sk-ant claude-opus-4-6
-velora cx use openai
-velora cc use claude
-velora oc use openai
+velora use openai
+velora cx openai
+velora cc claude
+velora m openai          # 浏览 openai 站点的全部模型
+velora s mc off          # 关闭模型检测，use 更快
 ```
 
 ## 模型配置
@@ -124,6 +150,7 @@ velora oc use openai
 ## 用户数据位置
 
 - `~/.velora/sites.json`：站点配置（类型、URL、API Key、模型）
+- `~/.velora/settings.json`：用户设置（model_check、list_latency 等）
 - `~/.velora/bin`：已安装的可执行文件
 
 ## LICENSE

@@ -12,7 +12,8 @@ const install_mod = @import("install.zig");
 const update_mod = @import("update.zig");
 const app = @import("app.zig");
 
-pub const version = "1.1.1";
+const build_options = @import("build_options");
+pub const version = build_options.version;
 
 pub fn main() !void {
     var gpa_impl: std.heap.DebugAllocator(.{}) = .init;
