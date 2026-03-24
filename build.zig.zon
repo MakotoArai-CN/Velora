@@ -1,6 +1,6 @@
 .{
     .name = .velora,
-    .version = "1.1.1",
+    .version = "1.1.2",
     .fingerprint = 0x28ac395e3fecccd4,
     .minimum_zig_version = "0.15.1",
     .dependencies = .{},

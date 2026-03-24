@@ -1,6 +1,6 @@
 const std = @import("std");
 const app_name = "velora";
-const version = "1.1.1";
+const version = "1.1.2";
 
 const CrossTarget = struct {
     name: []const u8,
