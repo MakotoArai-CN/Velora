@@ -27,8 +27,8 @@ pub const path_marker = "# velora PATH";
 
 // Default models per tool type
 pub const default_model_cc = "claude-opus-4-6";
-pub const default_model_cx = "GPT-5.4";
-pub const default_model_oc = "GPT-5.4";
+pub const default_model_cx = "gpt-5.4";
+pub const default_model_oc = "gpt-5.4";
 
 pub fn executableName() []const u8 {
     return switch (builtin.os.tag) {
