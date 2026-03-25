@@ -1,6 +1,21 @@
 const std = @import("std");
 const app_name = "velora";
-const version = "1.1.2";
+const version = parseZonVersion();
+
+fn parseZonVersion() []const u8 {
+    const zon = @embedFile("build.zig.zon");
+    const prefix = ".version = \"";
+    var i: usize = 0;
+    while (i + prefix.len <= zon.len) : (i += 1) {
+        if (std.mem.eql(u8, zon[i..][0..prefix.len], prefix)) {
+            const start = i + prefix.len;
+            var end = start;
+            while (end < zon.len and zon[end] != '"') end += 1;
+            return zon[start..end];
+        }
+    }
+    return "0.0.0";
+}
 
 const CrossTarget = struct {
     name: []const u8,

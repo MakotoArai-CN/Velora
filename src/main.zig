@@ -482,8 +482,19 @@ fn runUse(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCa
             try output.printWarning(w, i18n.tr(lang, "Expected models not found", "未找到预期的模型", "期待するモデルが見つかりません"), caps);
         }
 
-        if (model_info.is_reverse_proxy) {
-            try output.printWarning(w, i18n.tr(lang, "Reverse proxy detected (mixed provider models)", "检测到反向代理（混合提供商模型）", "リバースプロキシを検出（複数プロバイダーのモデル）"), caps);
+        if (model_info.provider_type != .unknown) {
+            var type_buf: [128]u8 = undefined;
+            const type_msg = std.fmt.bufPrint(&type_buf, "{s}: {s}", .{
+                i18n.tr(lang, "Provider type", "\xe7\xab\x99\xe7\x82\xb9\xe7\xb1\xbb\xe5\x9e\x8b", "\xe3\x82\xb5\xe3\x82\xa4\xe3\x83\x88\xe7\xa8\xae\xe5\x88\xa5"),
+                model_info.provider_type.displayName(lang),
+            }) catch "Provider type detected";
+            switch (model_info.provider_type) {
+                .official => try output.printSuccess(w, type_msg, caps),
+                .relay => try output.printInfo(w, type_msg, caps),
+                .reverse_proxy => try output.printWarning(w, type_msg, caps),
+                .reverse_eng => try output.printWarning(w, type_msg, caps),
+                .unknown => {},
+            }
         }
     } else {
         try output.printWarning(w, i18n.tr(lang, "Could not detect models (auth may be required)", "无法检测模型（可能需要认证）", "モデルを検出できません（認証が必要な場合があります）"), caps);
