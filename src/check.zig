@@ -48,34 +48,58 @@ pub fn checkConnectivity(allocator: std.mem.Allocator, base_url: []const u8) Con
 
     const Context = struct {
         allocator: std.mem.Allocator,
-        base_url: []const u8,
+        base_url: []u8,
         result: ConnectivityResult = .{ .reachable = false, .latency_ms = null },
         done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        refs: std.atomic.Value(u32) = std.atomic.Value(u32).init(2),
     };
 
-    var ctx = Context{
-        .allocator = allocator,
-        .base_url = base_url,
-    };
+    const Impl = struct {
+        fn release(c: *Context) void {
+            if (c.refs.fetchSub(1, .acq_rel) == 1) {
+                std.heap.page_allocator.free(c.base_url);
+                std.heap.page_allocator.destroy(c);
+            }
+        }
 
-    const thread = std.Thread.spawn(.{}, struct {
         fn run(c: *Context) void {
             c.result = checkConnectivityInner(c.allocator, c.base_url);
             c.done.store(true, .release);
+            release(c);
         }
-    }.run, .{&ctx}) catch {
+    };
+
+    const owned_base_url = std.heap.page_allocator.dupe(u8, base_url) catch {
+        return checkConnectivityInner(allocator, base_url);
+    };
+    errdefer std.heap.page_allocator.free(owned_base_url);
+
+    const ctx = std.heap.page_allocator.create(Context) catch {
+        std.heap.page_allocator.free(owned_base_url);
+        return checkConnectivityInner(allocator, base_url);
+    };
+    ctx.* = .{
+        .allocator = std.heap.page_allocator,
+        .base_url = owned_base_url,
+    };
+
+    const thread = std.Thread.spawn(.{}, Impl.run, .{ctx}) catch {
+        Impl.release(ctx);
         return checkConnectivityInner(allocator, base_url);
     };
 
     while (std.time.milliTimestamp() - start < timeout_ms) {
         if (ctx.done.load(.acquire)) {
             thread.join();
-            return ctx.result;
+            const result = ctx.result;
+            Impl.release(ctx);
+            return result;
         }
         std.Thread.sleep(50 * std.time.ns_per_ms);
     }
 
     thread.detach();
+    Impl.release(ctx);
     return .{ .reachable = false, .latency_ms = null };
 }
 
@@ -157,38 +181,67 @@ pub fn detectModels(allocator: std.mem.Allocator, base_url: []const u8, api_key:
 
     const Context = struct {
         allocator: std.mem.Allocator,
-        base_url: []const u8,
-        api_key: []const u8,
+        base_url: []u8,
+        api_key: []u8,
         site_type: sites_mod.SiteType,
         result: ModelInfo = .{ .models_found = 0, .has_expected = false, .provider_type = .unknown },
         done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        refs: std.atomic.Value(u32) = std.atomic.Value(u32).init(2),
     };
 
-    var ctx = Context{
-        .allocator = allocator,
-        .base_url = base_url,
-        .api_key = api_key,
-        .site_type = site_type,
-    };
+    const Impl = struct {
+        fn release(c: *Context) void {
+            if (c.refs.fetchSub(1, .acq_rel) == 1) {
+                std.heap.page_allocator.free(c.base_url);
+                std.heap.page_allocator.free(c.api_key);
+                std.heap.page_allocator.destroy(c);
+            }
+        }
 
-    const thread = std.Thread.spawn(.{}, struct {
         fn run(c: *Context) void {
             c.result = detectModelsInner(c.allocator, c.base_url, c.api_key, c.site_type);
             c.done.store(true, .release);
+            release(c);
         }
-    }.run, .{&ctx}) catch {
+    };
+
+    const owned_url = std.heap.page_allocator.dupe(u8, base_url) catch {
+        return detectModelsInner(allocator, base_url, api_key, site_type);
+    };
+    const owned_key = std.heap.page_allocator.dupe(u8, api_key) catch {
+        std.heap.page_allocator.free(owned_url);
+        return detectModelsInner(allocator, base_url, api_key, site_type);
+    };
+
+    const ctx = std.heap.page_allocator.create(Context) catch {
+        std.heap.page_allocator.free(owned_url);
+        std.heap.page_allocator.free(owned_key);
+        return detectModelsInner(allocator, base_url, api_key, site_type);
+    };
+    ctx.* = .{
+        .allocator = std.heap.page_allocator,
+        .base_url = owned_url,
+        .api_key = owned_key,
+        .site_type = site_type,
+    };
+
+    const thread = std.Thread.spawn(.{}, Impl.run, .{ctx}) catch {
+        Impl.release(ctx);
         return detectModelsInner(allocator, base_url, api_key, site_type);
     };
 
     while (std.time.milliTimestamp() - start < timeout_ms) {
         if (ctx.done.load(.acquire)) {
             thread.join();
-            return ctx.result;
+            const result = ctx.result;
+            Impl.release(ctx);
+            return result;
         }
         std.Thread.sleep(50 * std.time.ns_per_ms);
     }
 
     thread.detach();
+    Impl.release(ctx);
     return .{ .models_found = 0, .has_expected = false, .provider_type = .unknown };
 }
 
@@ -393,33 +446,65 @@ pub fn testModelCall(allocator: std.mem.Allocator, base_url: []const u8, api_key
     const model_in_list = checkModelInList(allocator, base_url, api_key, check_model);
 
     // Run in a thread so we can enforce a timeout.
-    // Use page_allocator in the worker to avoid DebugAllocator leak reports when a timed-out thread is detached.
+    // Heap-allocate context so detached threads never touch a dead stack frame.
     const Context = struct {
         allocator: std.mem.Allocator,
-        base_url: []const u8,
-        api_key: []const u8,
-        model: []const u8,
+        base_url: []u8,
+        api_key: []u8,
+        model: []u8,
         site_type: sites_mod.SiteType,
         result: ModelCallResult,
         done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        refs: std.atomic.Value(u32) = std.atomic.Value(u32).init(2),
     };
 
-    var ctx = Context{
+    const Impl = struct {
+        fn release(c: *Context) void {
+            if (c.refs.fetchSub(1, .acq_rel) == 1) {
+                std.heap.page_allocator.free(c.base_url);
+                std.heap.page_allocator.free(c.api_key);
+                std.heap.page_allocator.free(c.model);
+                std.heap.page_allocator.destroy(c);
+            }
+        }
+
+        fn run(c: *Context) void {
+            c.result = testModelCallAttempts(c.allocator, c.base_url, c.api_key, c.model, c.site_type, c.result.model_in_list);
+            c.done.store(true, .release);
+            release(c);
+        }
+    };
+
+    const owned_url = std.heap.page_allocator.dupe(u8, base_url) catch {
+        return testModelCallAttempts(allocator, base_url, api_key, model, site_type, model_in_list);
+    };
+    const owned_key = std.heap.page_allocator.dupe(u8, api_key) catch {
+        std.heap.page_allocator.free(owned_url);
+        return testModelCallAttempts(allocator, base_url, api_key, model, site_type, model_in_list);
+    };
+    const owned_model = std.heap.page_allocator.dupe(u8, model) catch {
+        std.heap.page_allocator.free(owned_url);
+        std.heap.page_allocator.free(owned_key);
+        return testModelCallAttempts(allocator, base_url, api_key, model, site_type, model_in_list);
+    };
+
+    const ctx = std.heap.page_allocator.create(Context) catch {
+        std.heap.page_allocator.free(owned_url);
+        std.heap.page_allocator.free(owned_key);
+        std.heap.page_allocator.free(owned_model);
+        return testModelCallAttempts(allocator, base_url, api_key, model, site_type, model_in_list);
+    };
+    ctx.* = .{
         .allocator = std.heap.page_allocator,
-        .base_url = base_url,
-        .api_key = api_key,
-        .model = model,
+        .base_url = owned_url,
+        .api_key = owned_key,
+        .model = owned_model,
         .site_type = site_type,
         .result = .{ .success = false, .error_msg = "Timeout", .model_in_list = model_in_list },
     };
 
-    const thread = std.Thread.spawn(.{}, struct {
-        fn run(c: *Context) void {
-            c.result = testModelCallAttempts(c.allocator, c.base_url, c.api_key, c.model, c.site_type, c.result.model_in_list);
-            c.done.store(true, .release);
-        }
-    }.run, .{&ctx}) catch {
-        // If thread spawn fails, run inline (no timeout protection)
+    const thread = std.Thread.spawn(.{}, Impl.run, .{ctx}) catch {
+        Impl.release(ctx);
         return testModelCallAttempts(allocator, base_url, api_key, model, site_type, model_in_list);
     };
 
@@ -427,13 +512,16 @@ pub fn testModelCall(allocator: std.mem.Allocator, base_url: []const u8, api_key
     while (std.time.milliTimestamp() - start < timeout_ms) {
         if (ctx.done.load(.acquire)) {
             thread.join();
-            return ctx.result;
+            const result = ctx.result;
+            Impl.release(ctx);
+            return result;
         }
         std.Thread.sleep(50 * std.time.ns_per_ms);
     }
 
     // Timeout reached - detach thread and return timeout result
     thread.detach();
+    Impl.release(ctx);
     const elapsed = @as(u64, @intCast(std.time.milliTimestamp() - start));
     return .{
         .success = false,
@@ -509,9 +597,27 @@ fn runAttemptWithTimeout(attempt_fn: AttemptFn, allocator: std.mem.Allocator, ba
         model: []const u8,
         result: CallAttemptResult = .{ .success = false, .error_msg = "Request timeout" },
         done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        refs: std.atomic.Value(u32) = std.atomic.Value(u32).init(2),
     };
 
-    var ctx = Context{
+    const Impl = struct {
+        fn release(c: *Context) void {
+            if (c.refs.fetchSub(1, .acq_rel) == 1) {
+                std.heap.page_allocator.destroy(c);
+            }
+        }
+
+        fn run(c: *Context) void {
+            c.result = c.attempt_fn(c.allocator, c.base_url, c.api_key, c.model);
+            c.done.store(true, .release);
+            release(c);
+        }
+    };
+
+    const ctx = std.heap.page_allocator.create(Context) catch {
+        return attempt_fn(std.heap.page_allocator, base_url, api_key, model);
+    };
+    ctx.* = .{
         .attempt_fn = attempt_fn,
         .allocator = std.heap.page_allocator,
         .base_url = base_url,
@@ -519,22 +625,23 @@ fn runAttemptWithTimeout(attempt_fn: AttemptFn, allocator: std.mem.Allocator, ba
         .model = model,
     };
 
-    const thread = std.Thread.spawn(.{}, struct {
-        fn run(c: *Context) void {
-            c.result = c.attempt_fn(c.allocator, c.base_url, c.api_key, c.model);
-            c.done.store(true, .release);
-        }
-    }.run, .{&ctx}) catch return attempt_fn(std.heap.page_allocator, base_url, api_key, model);
+    const thread = std.Thread.spawn(.{}, Impl.run, .{ctx}) catch {
+        Impl.release(ctx);
+        return attempt_fn(std.heap.page_allocator, base_url, api_key, model);
+    };
 
     while (std.time.milliTimestamp() - start < timeout_ms) {
         if (ctx.done.load(.acquire)) {
             thread.join();
-            return ctx.result;
+            const result = ctx.result;
+            Impl.release(ctx);
+            return result;
         }
         std.Thread.sleep(50 * std.time.ns_per_ms);
     }
 
     thread.detach();
+    Impl.release(ctx);
     return .{ .success = false, .error_msg = "Request timeout" };
 }
 
