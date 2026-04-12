@@ -10,11 +10,11 @@ const i18n = @import("i18n.zig");
 
 /// Apply a site's configuration to Codex.
 /// Updates ~/.codex/config.toml base_url and sets the OPENAI_API_KEY env var.
-pub fn applyToCodex(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCaps, lang: i18n.Language, site: sites_mod.Site) !void {
+pub fn applyToCodex(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCaps, lang: i18n.Language, site: sites_mod.Site, tool_model: []const u8) !void {
     try output.printInfo(w, i18n.tr(lang, "Applying to Codex...", "正在应用到 Codex...", "Codexに適用中..."), caps);
     try w.flush();
 
-    const model = site.effectiveModel();
+    const model = tool_model;
 
     // 1. Update base_url and model in ~/.codex/config.toml
     const toml_updated = updateCodexToml(allocator, site.base_url, model) catch |err| {
@@ -28,11 +28,12 @@ pub fn applyToCodex(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: termi
     }
 
     // 2. Read env_key from config.toml (defaults to OPENAI_API_KEY)
-    const env_key_name = readCodexEnvKeyName(allocator) catch "OPENAI_API_KEY";
-    defer if (!std.mem.eql(u8, env_key_name, "OPENAI_API_KEY")) allocator.free(@constCast(env_key_name));
+    const default_env_key: EnvKeyResult = .{ .key = "OPENAI_API_KEY", .owned = false };
+    const env_key = readCodexEnvKeyName(allocator) catch default_env_key;
+    defer if (env_key.owned) allocator.free(@constCast(env_key.key));
 
     // 3. Set the environment variable
-    env_mod.writeEnvVar(allocator, env_key_name, site.api_key) catch |err| {
+    env_mod.writeEnvVar(allocator, env_key.key, site.api_key) catch |err| {
         try output.printError(w, i18n.tr(lang, "Failed to set environment variable", "设置环境变量失败", "環境変数の設定に失敗しました"), caps);
         try w.flush();
         return err;
@@ -41,7 +42,7 @@ pub fn applyToCodex(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: termi
     var key_info_buf: [128]u8 = undefined;
     var masked_buf: [64]u8 = undefined;
     const masked = sites_mod.maskKey(&masked_buf, site.api_key);
-    const key_info = std.fmt.bufPrint(&key_info_buf, "{s} = {s}", .{ env_key_name, masked }) catch "?";
+    const key_info = std.fmt.bufPrint(&key_info_buf, "{s} = {s}", .{ env_key.key, masked }) catch "?";
     try output.printSuccess(w, key_info, caps);
     try output.printKeyValue(w, "Base URL:", site.base_url, caps);
     try output.printKeyValue(w, "Model:", model, caps);
@@ -50,11 +51,11 @@ pub fn applyToCodex(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: termi
 
 /// Apply a site's configuration to Claude Code.
 /// Updates ~/.claude/settings.json env block AND sets env vars.
-pub fn applyToClaudeCode(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCaps, lang: i18n.Language, site: sites_mod.Site) !void {
+pub fn applyToClaudeCode(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCaps, lang: i18n.Language, site: sites_mod.Site, tool_model: []const u8) !void {
     try output.printInfo(w, i18n.tr(lang, "Applying to Claude Code...", "正在应用到 Claude Code...", "Claude Codeに適用中..."), caps);
     try w.flush();
 
-    const model = site.effectiveModel();
+    const model = tool_model;
 
     // 1. Update ~/.claude/settings.json
     updateClaudeSettings(allocator, site.api_key, site.base_url, model) catch |err| {
@@ -200,15 +201,20 @@ fn updateCodexToml(allocator: std.mem.Allocator, new_base_url: []const u8, new_m
     return true;
 }
 
-fn readCodexEnvKeyName(allocator: std.mem.Allocator) ![]const u8 {
+const EnvKeyResult = struct {
+    key: []const u8,
+    owned: bool,
+};
+
+fn readCodexEnvKeyName(allocator: std.mem.Allocator) !EnvKeyResult {
     const path = try getCodexTomlPath(allocator);
     defer allocator.free(path);
 
-    const file = std.fs.openFileAbsolute(path, .{}) catch return "OPENAI_API_KEY";
+    const file = std.fs.openFileAbsolute(path, .{}) catch return .{ .key = "OPENAI_API_KEY", .owned = false };
     defer file.close();
 
     var buf: [65536]u8 = undefined;
-    const bytes_read = file.readAll(&buf) catch return "OPENAI_API_KEY";
+    const bytes_read = file.readAll(&buf) catch return .{ .key = "OPENAI_API_KEY", .owned = false };
     const content = buf[0..bytes_read];
 
     var in_proxy = false;
@@ -225,13 +231,13 @@ fn readCodexEnvKeyName(allocator: std.mem.Allocator) ![]const u8 {
                     const val = std.mem.trim(u8, trimmed[eq_pos + 1 ..], " \t");
                     const unquoted = env_mod.stripQuotes(val);
                     if (unquoted.len > 0) {
-                        return try allocator.dupe(u8, unquoted);
+                        return .{ .key = try allocator.dupe(u8, unquoted), .owned = true };
                     }
                 }
             }
         }
     }
-    return "OPENAI_API_KEY";
+    return .{ .key = "OPENAI_API_KEY", .owned = false };
 }
 
 // --- Claude Code JSON editing ---
@@ -398,11 +404,11 @@ fn updateClaudeSettings(allocator: std.mem.Allocator, api_key: []const u8, base_
 
 // --- OpenCode JSON editing ---
 
-pub fn applyToOpenCode(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCaps, lang: i18n.Language, site: sites_mod.Site) !void {
+pub fn applyToOpenCode(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCaps, lang: i18n.Language, site: sites_mod.Site, tool_model: []const u8) !void {
     try output.printInfo(w, i18n.tr(lang, "Applying to OpenCode...", "正在应用到 OpenCode...", "OpenCodeに適用中..."), caps);
     try w.flush();
 
-    const model = site.effectiveModel();
+    const model = tool_model;
 
     updateOpenCodeConfig(allocator, site.api_key, site.base_url, model) catch |err| {
         try output.printError(w, i18n.tr(lang, "Failed to update OpenCode config", "更新 OpenCode 配置失败", "OpenCode 設定の更新に失敗しました"), caps);
@@ -664,18 +670,383 @@ fn skipJsonWhitespace(content: []const u8, start: usize) usize {
 
 fn findJsonStringEnd(content: []const u8, start: usize) ?usize {
     var pos = start;
-    var escaped = false;
+    var esc = false;
     while (pos < content.len) : (pos += 1) {
         const ch = content[pos];
-        if (escaped) {
-            escaped = false;
+        if (esc) {
+            esc = false;
             continue;
         }
         if (ch == '\\') {
-            escaped = true;
+            esc = true;
             continue;
         }
         if (ch == '"') return pos;
     }
     return null;
+}
+
+// --- Nanobot JSON editing ---
+
+/// Apply a site's configuration to Nanobot.
+/// Updates ~/.nanobot/config.json providers.openai and agents.defaults.model fields.
+pub fn applyToNanobot(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCaps, lang: i18n.Language, site: sites_mod.Site, tool_model: []const u8) !void {
+    try output.printInfo(w, i18n.tr(lang, "Applying to Nanobot...", "正在应用到 Nanobot...", "Nanobotに適用中..."), caps);
+    try w.flush();
+
+    const model = tool_model;
+
+    updateNanobotConfig(allocator, site.api_key, site.base_url, model) catch |err| {
+        try output.printError(w, i18n.tr(lang, "Failed to update Nanobot config", "更新 Nanobot 配置失败", "Nanobot 設定の更新に失敗しました"), caps);
+        try w.flush();
+        return err;
+    };
+
+    var masked_buf: [64]u8 = undefined;
+    const masked = sites_mod.maskKey(&masked_buf, site.api_key);
+    var info_buf: [128]u8 = undefined;
+    const info = std.fmt.bufPrint(&info_buf, "providers.openai.apiKey = {s}", .{masked}) catch "?";
+    try output.printSuccess(w, info, caps);
+    try output.printKeyValue(w, "Base URL:", site.base_url, caps);
+    try output.printKeyValue(w, "Model:", model, caps);
+    try w.flush();
+}
+
+fn getNanobotConfigPath(allocator: std.mem.Allocator) ![]u8 {
+    const home = config_mod.getHomeDir(allocator) orelse return error.NoHomeDir;
+    defer allocator.free(home);
+    return try std.fs.path.join(allocator, &.{ home, app.nanobot_config_dir, app.nanobot_config_filename });
+}
+
+fn updateNanobotConfig(allocator: std.mem.Allocator, api_key: []const u8, base_url: []const u8, model: []const u8) !void {
+    const path = try getNanobotConfigPath(allocator);
+    defer allocator.free(path);
+
+    // Ensure directory exists
+    const dir_path = std.fs.path.dirname(path) orelse return error.InvalidPath;
+    std.fs.makeDirAbsolute(dir_path) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+
+    var existing: std.ArrayListUnmanaged(u8) = .empty;
+    defer existing.deinit(allocator);
+
+    const has_file = blk: {
+        const file = std.fs.openFileAbsolute(path, .{}) catch break :blk false;
+        defer file.close();
+        var buf: [131072]u8 = undefined;
+        const bytes_read = file.readAll(&buf) catch break :blk false;
+        existing.appendSlice(allocator, buf[0..bytes_read]) catch break :blk false;
+        break :blk true;
+    };
+
+    if (!has_file) {
+        // Create minimal nanobot config
+        try writeNewNanobotConfig(allocator, path, api_key, base_url, model);
+        return;
+    }
+
+    // Update existing config: replace providers.openai fields and agents.defaults.model
+    const content = existing.items;
+    var result: std.ArrayListUnmanaged(u8) = .empty;
+    defer result.deinit(allocator);
+
+    var line_iter = std.mem.splitScalar(u8, content, '\n');
+    while (line_iter.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+
+        // Replace apiKey in openai provider block
+        if (std.mem.indexOf(u8, trimmed, "\"apiKey\"") != null and std.mem.indexOf(u8, trimmed, ":") != null) {
+            // Check context - we're updating openai provider's apiKey
+            // Simple heuristic: replace apiKey lines that are within providers context
+            const trailing_comma = trimmed.len > 0 and trimmed[trimmed.len - 1] == ',';
+            var indent_count: usize = 0;
+            for (line) |ch| {
+                if (ch == ' ') {
+                    indent_count += 1;
+                } else break;
+            }
+            // Only replace at provider indentation depth (typically 4+ spaces)
+            if (indent_count >= 4) {
+                var line_buf: [512]u8 = undefined;
+                var indent_buf: [32]u8 = undefined;
+                const indent = indent_buf[0..@min(indent_count, 32)];
+                @memset(indent, ' ');
+                const new_line = std.fmt.bufPrint(&line_buf, "{s}\"apiKey\": \"{s}\"{s}", .{
+                    indent,
+                    api_key,
+                    if (trailing_comma) "," else "",
+                }) catch line;
+                try result.appendSlice(allocator, new_line);
+                if (line_iter.peek() != null) try result.append(allocator, '\n');
+                continue;
+            }
+        }
+
+        // Replace apiBase in openai provider block
+        if (std.mem.indexOf(u8, trimmed, "\"apiBase\"") != null and std.mem.indexOf(u8, trimmed, ":") != null) {
+            var indent_count: usize = 0;
+            for (line) |ch| {
+                if (ch == ' ') {
+                    indent_count += 1;
+                } else break;
+            }
+            if (indent_count >= 4) {
+                const trailing_comma = trimmed.len > 0 and trimmed[trimmed.len - 1] == ',';
+                var line_buf: [512]u8 = undefined;
+                var indent_buf: [32]u8 = undefined;
+                const indent = indent_buf[0..@min(indent_count, 32)];
+                @memset(indent, ' ');
+                const new_line = std.fmt.bufPrint(&line_buf, "{s}\"apiBase\": \"{s}\"{s}", .{
+                    indent,
+                    base_url,
+                    if (trailing_comma) "," else "",
+                }) catch line;
+                try result.appendSlice(allocator, new_line);
+                if (line_iter.peek() != null) try result.append(allocator, '\n');
+                continue;
+            }
+        }
+
+        // Replace agents.defaults.model
+        if (std.mem.indexOf(u8, trimmed, "\"model\"") != null and std.mem.indexOf(u8, trimmed, ":") != null) {
+            // Check if it's the model under agents.defaults (typically indentation 6)
+            var indent_count: usize = 0;
+            for (line) |ch| {
+                if (ch == ' ') {
+                    indent_count += 1;
+                } else break;
+            }
+            if (indent_count >= 6 and indent_count <= 8) {
+                const trailing_comma = trimmed.len > 0 and trimmed[trimmed.len - 1] == ',';
+                var line_buf: [512]u8 = undefined;
+                var indent_buf: [32]u8 = undefined;
+                const indent = indent_buf[0..@min(indent_count, 32)];
+                @memset(indent, ' ');
+                // Nanobot model format: "openai/<model>" or just the model name
+                var model_val_buf: [256]u8 = undefined;
+                const model_val = if (std.mem.indexOf(u8, model, "/") != null)
+                    model
+                else
+                    std.fmt.bufPrint(&model_val_buf, "openai/{s}", .{model}) catch model;
+                const new_line = std.fmt.bufPrint(&line_buf, "{s}\"model\": \"{s}\"{s}", .{
+                    indent,
+                    model_val,
+                    if (trailing_comma) "," else "",
+                }) catch line;
+                try result.appendSlice(allocator, new_line);
+                if (line_iter.peek() != null) try result.append(allocator, '\n');
+                continue;
+            }
+        }
+
+        try result.appendSlice(allocator, line);
+        if (line_iter.peek() != null) try result.append(allocator, '\n');
+    }
+
+    const file = try std.fs.createFileAbsolute(path, .{});
+    defer file.close();
+    try file.writeAll(result.items);
+}
+
+fn writeNewNanobotConfig(allocator: std.mem.Allocator, path: []const u8, api_key: []const u8, base_url: []const u8, model: []const u8) !void {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+
+    // Build model value with openai/ prefix if needed
+    var model_val_buf: [256]u8 = undefined;
+    const model_val = if (std.mem.indexOf(u8, model, "/") != null)
+        model
+    else
+        std.fmt.bufPrint(&model_val_buf, "openai/{s}", .{model}) catch model;
+
+    try out.appendSlice(allocator, "{\n  \"agents\": {\n    \"defaults\": {\n      \"model\": \"");
+    try out.appendSlice(allocator, model_val);
+    try out.appendSlice(allocator, "\",\n      \"provider\": \"auto\"\n    }\n  },\n  \"providers\": {\n    \"openai\": {\n      \"apiKey\": \"");
+    try out.appendSlice(allocator, api_key);
+    try out.appendSlice(allocator, "\",\n      \"apiBase\": \"");
+    try out.appendSlice(allocator, base_url);
+    try out.appendSlice(allocator, "\",\n      \"extraHeaders\": null\n    }\n  }\n}\n");
+
+    const file = try std.fs.createFileAbsolute(path, .{});
+    defer file.close();
+    try file.writeAll(out.items);
+}
+
+// --- OpenClaw JSON editing ---
+
+/// Apply a site's configuration to OpenClaw.
+/// Updates ~/.openclaw/openclaw.json models.providers and agents.defaults.model.primary fields.
+pub fn applyToOpenClaw(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCaps, lang: i18n.Language, site: sites_mod.Site, tool_model: []const u8) !void {
+    try output.printInfo(w, i18n.tr(lang, "Applying to OpenClaw...", "正在应用到 OpenClaw...", "OpenClawに適用中..."), caps);
+    try w.flush();
+
+    const model = tool_model;
+
+    updateOpenClawConfig(allocator, site.api_key, site.base_url, model) catch |err| {
+        try output.printError(w, i18n.tr(lang, "Failed to update OpenClaw config", "更新 OpenClaw 配置失败", "OpenClaw 設定の更新に失敗しました"), caps);
+        try w.flush();
+        return err;
+    };
+
+    var masked_buf: [64]u8 = undefined;
+    const masked = sites_mod.maskKey(&masked_buf, site.api_key);
+    var info_buf: [128]u8 = undefined;
+    const info = std.fmt.bufPrint(&info_buf, "models.providers.velora.apiKey = {s}", .{masked}) catch "?";
+    try output.printSuccess(w, info, caps);
+    try output.printKeyValue(w, "Base URL:", site.base_url, caps);
+    try output.printKeyValue(w, "Model:", model, caps);
+    try w.flush();
+}
+
+fn getOpenClawConfigPath(allocator: std.mem.Allocator) ![]u8 {
+    const home = config_mod.getHomeDir(allocator) orelse return error.NoHomeDir;
+    defer allocator.free(home);
+    return try std.fs.path.join(allocator, &.{ home, app.openclaw_config_dir, app.openclaw_config_filename });
+}
+
+fn updateOpenClawConfig(allocator: std.mem.Allocator, api_key: []const u8, base_url: []const u8, model: []const u8) !void {
+    const path = try getOpenClawConfigPath(allocator);
+    defer allocator.free(path);
+
+    // Ensure directory exists
+    const dir_path = std.fs.path.dirname(path) orelse return error.InvalidPath;
+    std.fs.makeDirAbsolute(dir_path) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+
+    var existing: std.ArrayListUnmanaged(u8) = .empty;
+    defer existing.deinit(allocator);
+
+    const has_file = blk: {
+        const file = std.fs.openFileAbsolute(path, .{}) catch break :blk false;
+        defer file.close();
+        var buf: [131072]u8 = undefined;
+        const bytes_read = file.readAll(&buf) catch break :blk false;
+        existing.appendSlice(allocator, buf[0..bytes_read]) catch break :blk false;
+        break :blk true;
+    };
+
+    if (!has_file) {
+        try writeNewOpenClawConfig(allocator, path, api_key, base_url, model);
+        return;
+    }
+
+    // For OpenClaw, rewrite the whole file with updated provider and model
+    // This is simpler than line-by-line editing for the nested JSON5 structure
+    const content = existing.items;
+
+    // Try to update "primary" field under agents.defaults.model
+    var result: std.ArrayListUnmanaged(u8) = .empty;
+    defer result.deinit(allocator);
+
+    // For existing files, do line-by-line replacement of known fields
+    var line_iter = std.mem.splitScalar(u8, content, '\n');
+    var in_velora_provider = false;
+    while (line_iter.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+
+        // Track if we're inside a "velora" provider block
+        if (std.mem.indexOf(u8, trimmed, "\"velora\"") != null and std.mem.indexOf(u8, trimmed, "{") != null) {
+            in_velora_provider = true;
+        }
+
+        if (in_velora_provider) {
+            if (std.mem.indexOf(u8, trimmed, "\"apiKey\"") != null) {
+                const trailing_comma = trimmed.len > 0 and trimmed[trimmed.len - 1] == ',';
+                try result.appendSlice(allocator, "        \"apiKey\": \"");
+                try result.appendSlice(allocator, api_key);
+                try result.append(allocator, '"');
+                if (trailing_comma) try result.append(allocator, ',');
+                if (line_iter.peek() != null) try result.append(allocator, '\n');
+                continue;
+            }
+            if (std.mem.indexOf(u8, trimmed, "\"baseUrl\"") != null) {
+                const trailing_comma = trimmed.len > 0 and trimmed[trimmed.len - 1] == ',';
+                try result.appendSlice(allocator, "        \"baseUrl\": \"");
+                try result.appendSlice(allocator, base_url);
+                try result.append(allocator, '"');
+                if (trailing_comma) try result.append(allocator, ',');
+                if (line_iter.peek() != null) try result.append(allocator, '\n');
+                continue;
+            }
+            // End of velora provider block
+            if (std.mem.eql(u8, trimmed, "}") or std.mem.eql(u8, trimmed, "},")) {
+                in_velora_provider = false;
+            }
+        }
+
+        // Replace "primary" field under agents.defaults.model
+        if (std.mem.indexOf(u8, trimmed, "\"primary\"") != null and std.mem.indexOf(u8, trimmed, ":") != null) {
+            const trailing_comma = trimmed.len > 0 and trimmed[trimmed.len - 1] == ',';
+            var indent_count: usize = 0;
+            for (line) |ch| {
+                if (ch == ' ') indent_count += 1 else break;
+            }
+            var indent_buf: [32]u8 = undefined;
+            const indent = indent_buf[0..@min(indent_count, 32)];
+            @memset(indent, ' ');
+            var model_val_buf: [256]u8 = undefined;
+            const model_val = std.fmt.bufPrint(&model_val_buf, "velora/{s}", .{model}) catch model;
+            var line_buf: [512]u8 = undefined;
+            const new_line = std.fmt.bufPrint(&line_buf, "{s}\"primary\": \"{s}\"{s}", .{
+                indent, model_val, if (trailing_comma) "," else "",
+            }) catch line;
+            try result.appendSlice(allocator, new_line);
+            if (line_iter.peek() != null) try result.append(allocator, '\n');
+            continue;
+        }
+
+        try result.appendSlice(allocator, line);
+        if (line_iter.peek() != null) try result.append(allocator, '\n');
+    }
+
+    const file = try std.fs.createFileAbsolute(path, .{});
+    defer file.close();
+    try file.writeAll(result.items);
+}
+
+fn writeNewOpenClawConfig(allocator: std.mem.Allocator, path: []const u8, api_key: []const u8, base_url: []const u8, model: []const u8) !void {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+
+    var model_val_buf: [256]u8 = undefined;
+    const model_val = std.fmt.bufPrint(&model_val_buf, "velora/{s}", .{model}) catch model;
+
+    try out.appendSlice(allocator,
+        "{\n" ++
+        "  \"models\": {\n" ++
+        "    \"providers\": {\n" ++
+        "      \"velora\": {\n"
+    );
+    var url_buf: [512]u8 = undefined;
+    const url_line = std.fmt.bufPrint(&url_buf, "        \"baseUrl\": \"{s}\",\n", .{base_url}) catch "";
+    try out.appendSlice(allocator, url_line);
+    var key_buf: [512]u8 = undefined;
+    const key_line = std.fmt.bufPrint(&key_buf, "        \"apiKey\": \"{s}\",\n", .{api_key}) catch "";
+    try out.appendSlice(allocator, key_line);
+    try out.appendSlice(allocator,
+        "        \"api\": \"openai-completions\"\n" ++
+        "      }\n" ++
+        "    }\n" ++
+        "  },\n" ++
+        "  \"agents\": {\n" ++
+        "    \"defaults\": {\n" ++
+        "      \"model\": {\n" ++
+        "        \"primary\": \""
+    );
+    try out.appendSlice(allocator, model_val);
+    try out.appendSlice(allocator,
+        "\"\n" ++
+        "      }\n" ++
+        "    }\n" ++
+        "  }\n" ++
+        "}\n"
+    );
+
+    const file = try std.fs.createFileAbsolute(path, .{});
+    defer file.close();
+    try file.writeAll(out.items);
 }

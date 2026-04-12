@@ -54,6 +54,13 @@ fn addVersionModule(b: *std.Build, module: *std.Build.Module) void {
 pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
+    // On Windows hosts, letting the default install graph fan out many LLVM
+    // cross-compiles in parallel can trigger OOM / `error: Unexpected` failures.
+    // Serialize the compile graph explicitly instead of relying on build-runner
+    // memory accounting, which can itself hit assertions on Zig 0.15.2.
+    var previous_compile_step: ?*std.Build.Step = null;
+    var previous_install_step: ?*std.Build.Step = null;
+
     for (cross_targets) |ct| {
         const ct_target = b.resolveTargetQuery(.{
             .cpu_arch = ct.cpu_arch,
@@ -72,7 +79,17 @@ pub fn build(b: *std.Build) void {
             .name = b.fmt("{s}-{s}", .{ app_name, ct.name }),
             .root_module = ct_module,
         });
-        b.installArtifact(ct_exe);
+        if (previous_compile_step) |prev| {
+            ct_exe.step.dependOn(prev);
+        }
+        previous_compile_step = &ct_exe.step;
+
+        const ct_install = b.addInstallArtifact(ct_exe, .{});
+        if (previous_install_step) |prev| {
+            ct_install.step.dependOn(prev);
+        }
+        b.getInstallStep().dependOn(&ct_install.step);
+        previous_install_step = &ct_install.step;
     }
 
     const native_target = b.standardTargetOptions(.{});
@@ -88,7 +105,15 @@ pub fn build(b: *std.Build) void {
         .name = app_name,
         .root_module = native_module,
     });
-    b.installArtifact(native_exe);
+    if (previous_compile_step) |prev| {
+        native_exe.step.dependOn(prev);
+    }
+
+    const native_install = b.addInstallArtifact(native_exe, .{});
+    if (previous_install_step) |prev| {
+        native_install.step.dependOn(prev);
+    }
+    b.getInstallStep().dependOn(&native_install.step);
 
     const run_cmd = b.addRunArtifact(native_exe);
     run_cmd.step.dependOn(b.getInstallStep());
@@ -109,6 +134,7 @@ pub fn build(b: *std.Build) void {
         .name = "velora-test",
         .root_module = test_module,
     });
+    exe_unit_tests.step.dependOn(&native_exe.step);
 
     const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
     const test_step = b.step("test", "Run unit tests");

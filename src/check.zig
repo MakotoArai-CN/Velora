@@ -1,5 +1,8 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const sites_mod = @import("sites.zig");
+const config_mod = @import("config.zig");
+const app = @import("app.zig");
 
 pub const ConnectivityResult = struct {
     reachable: bool,
@@ -276,8 +279,8 @@ fn detectModelsInner(allocator: std.mem.Allocator, base_url: []const u8, api_key
                     has_gpt = true;
                 }
             },
-            .oc => {
-                // OpenCode supports both openai and anthropic providers
+            .oc, .nb, .ow => {
+                // OpenCode/Nanobot/OpenClaw support both openai and anthropic providers
                 if (std.mem.indexOf(u8, model_id, "gpt-5") != null or
                     std.mem.indexOf(u8, model_id, "claude") != null)
                 {
@@ -386,34 +389,38 @@ pub const ModelCallResult = struct {
 pub fn testModelCall(allocator: std.mem.Allocator, base_url: []const u8, api_key: []const u8, model: []const u8, site_type: sites_mod.SiteType) ModelCallResult {
     const timeout_ms: i64 = 15000; // 15 second total timeout
     const start = std.time.milliTimestamp();
+    const check_model = normalizeModelForApiCheck(model);
+    const model_in_list = checkModelInList(allocator, base_url, api_key, check_model);
 
-    // Run in a thread so we can enforce a timeout
+    // Run in a thread so we can enforce a timeout.
+    // Use page_allocator in the worker to avoid DebugAllocator leak reports when a timed-out thread is detached.
     const Context = struct {
         allocator: std.mem.Allocator,
         base_url: []const u8,
         api_key: []const u8,
         model: []const u8,
         site_type: sites_mod.SiteType,
-        result: ModelCallResult = .{ .success = false, .error_msg = "Timeout" },
+        result: ModelCallResult,
         done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     };
 
     var ctx = Context{
-        .allocator = allocator,
+        .allocator = std.heap.page_allocator,
         .base_url = base_url,
         .api_key = api_key,
         .model = model,
         .site_type = site_type,
+        .result = .{ .success = false, .error_msg = "Timeout", .model_in_list = model_in_list },
     };
 
     const thread = std.Thread.spawn(.{}, struct {
         fn run(c: *Context) void {
-            c.result = testModelCallInner(c.allocator, c.base_url, c.api_key, c.model, c.site_type);
+            c.result = testModelCallAttempts(c.allocator, c.base_url, c.api_key, c.model, c.site_type, c.result.model_in_list);
             c.done.store(true, .release);
         }
     }.run, .{&ctx}) catch {
         // If thread spawn fails, run inline (no timeout protection)
-        return testModelCallInner(allocator, base_url, api_key, model, site_type);
+        return testModelCallAttempts(allocator, base_url, api_key, model, site_type, model_in_list);
     };
 
     // Poll until done or timeout
@@ -432,32 +439,36 @@ pub fn testModelCall(allocator: std.mem.Allocator, base_url: []const u8, api_key
         .success = false,
         .error_msg = "Request timeout (15s)",
         .latency_ms = elapsed,
-        .model_in_list = false,
+        .model_in_list = model_in_list,
     };
 }
 
 /// Inner implementation without timeout (runs in thread).
-fn testModelCallInner(allocator: std.mem.Allocator, base_url: []const u8, api_key: []const u8, model: []const u8, site_type: sites_mod.SiteType) ModelCallResult {
+fn testModelCallAttempts(allocator: std.mem.Allocator, base_url: []const u8, api_key: []const u8, model: []const u8, site_type: sites_mod.SiteType, model_in_list: bool) ModelCallResult {
     const start = std.time.milliTimestamp();
-
-    // Step 1: Check if model is in the model list
-    const model_in_list = checkModelInList(allocator, base_url, api_key, model);
-
-    // Step 2: Try calling the model with multiple API formats
-    const attempts: [3]*const fn (std.mem.Allocator, []const u8, []const u8, []const u8) CallAttemptResult = switch (site_type) {
-        .cx => .{ &tryResponsesCall, &tryOpenAICall, &tryAnthropicCall },
-        .cc => .{ &tryAnthropicCall, &tryOpenAICall, &tryResponsesCall },
-        .oc => .{ &tryOpenAICall, &tryResponsesCall, &tryAnthropicCall },
-    };
+    const call_model = normalizeModelForApiCheck(model);
+    const attempts = callAttemptOrder(site_type, call_model);
 
     var first_error: ?[]const u8 = null;
     for (attempts) |attempt_fn| {
-        const r = attempt_fn(allocator, base_url, api_key, model);
+        const r = runAttemptWithTimeout(attempt_fn, allocator, base_url, api_key, call_model, 4500);
         if (r.success) {
             const elapsed = @as(u64, @intCast(std.time.milliTimestamp() - start));
             return .{ .success = true, .latency_ms = elapsed, .model_in_list = model_in_list };
         }
         if (first_error == null) first_error = r.error_msg;
+    }
+
+    if (!std.mem.eql(u8, call_model, model)) {
+        const original_attempts = callAttemptOrder(site_type, model);
+        for (original_attempts) |attempt_fn| {
+            const r = runAttemptWithTimeout(attempt_fn, allocator, base_url, api_key, model, 3000);
+            if (r.success) {
+                const elapsed = @as(u64, @intCast(std.time.milliTimestamp() - start));
+                return .{ .success = true, .latency_ms = elapsed, .model_in_list = model_in_list };
+            }
+            if (first_error == null) first_error = r.error_msg;
+        }
     }
 
     const elapsed = @as(u64, @intCast(std.time.milliTimestamp() - start));
@@ -469,10 +480,76 @@ fn testModelCallInner(allocator: std.mem.Allocator, base_url: []const u8, api_ke
     };
 }
 
+const AttemptFn = *const fn (std.mem.Allocator, []const u8, []const u8, []const u8) CallAttemptResult;
+
+fn callAttemptOrder(site_type: sites_mod.SiteType, model: []const u8) [3]AttemptFn {
+    return switch (classifyModelFamily(model)) {
+        .openai => switch (site_type) {
+            .cx => .{ &tryResponsesCall, &tryOpenAICall, &tryAnthropicCall },
+            .cc, .oc, .nb, .ow => .{ &tryOpenAICall, &tryResponsesCall, &tryAnthropicCall },
+        },
+        .claude => .{ &tryAnthropicCall, &tryOpenAICall, &tryResponsesCall },
+        .unknown => switch (site_type) {
+            .cx => .{ &tryResponsesCall, &tryOpenAICall, &tryAnthropicCall },
+            .cc => .{ &tryAnthropicCall, &tryOpenAICall, &tryResponsesCall },
+            .oc, .nb, .ow => .{ &tryOpenAICall, &tryResponsesCall, &tryAnthropicCall },
+        },
+    };
+}
+
+fn runAttemptWithTimeout(attempt_fn: AttemptFn, allocator: std.mem.Allocator, base_url: []const u8, api_key: []const u8, model: []const u8, timeout_ms: i64) CallAttemptResult {
+    _ = allocator;
+    const start = std.time.milliTimestamp();
+
+    const Context = struct {
+        attempt_fn: AttemptFn,
+        allocator: std.mem.Allocator,
+        base_url: []const u8,
+        api_key: []const u8,
+        model: []const u8,
+        result: CallAttemptResult = .{ .success = false, .error_msg = "Request timeout" },
+        done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    };
+
+    var ctx = Context{
+        .attempt_fn = attempt_fn,
+        .allocator = std.heap.page_allocator,
+        .base_url = base_url,
+        .api_key = api_key,
+        .model = model,
+    };
+
+    const thread = std.Thread.spawn(.{}, struct {
+        fn run(c: *Context) void {
+            c.result = c.attempt_fn(c.allocator, c.base_url, c.api_key, c.model);
+            c.done.store(true, .release);
+        }
+    }.run, .{&ctx}) catch return attempt_fn(std.heap.page_allocator, base_url, api_key, model);
+
+    while (std.time.milliTimestamp() - start < timeout_ms) {
+        if (ctx.done.load(.acquire)) {
+            thread.join();
+            return ctx.result;
+        }
+        std.Thread.sleep(50 * std.time.ns_per_ms);
+    }
+
+    thread.detach();
+    return .{ .success = false, .error_msg = "Request timeout" };
+}
+
+fn normalizeModelForApiCheck(model: []const u8) []const u8 {
+    if (std.mem.lastIndexOfScalar(u8, model, '[')) |open| {
+        if (open > 0 and model[model.len - 1] == ']') {
+            return model[0..open];
+        }
+    }
+    return model;
+}
+
 /// Check if a specific model exists in the /v1/models endpoint.
-/// Sends both Bearer and x-api-key auth headers for compatibility with
-/// OpenAI-compatible and Anthropic-compatible endpoints.
 fn checkModelInList(allocator: std.mem.Allocator, base_url: []const u8, api_key: []const u8, model: []const u8) bool {
+    const check_model = normalizeModelForApiCheck(model);
     var url_buf: [1024]u8 = undefined;
     const url = buildUrl(&url_buf, base_url, "/models") orelse return false;
 
@@ -494,10 +571,8 @@ fn checkModelInList(allocator: std.mem.Allocator, base_url: []const u8, api_key:
     const result = client.fetch(.{
         .location = .{ .url = url },
         .method = .GET,
-        .headers = .{
-            .user_agent = .{ .override = "VA/2.0" },
-            .accept_encoding = .{ .override = "identity" },
-        },
+        .keep_alive = false,
+        .headers = defaultFetchHeaders(),
         .extra_headers = &extra_headers,
         .response_writer = &response_writer.writer,
     }) catch return false;
@@ -506,7 +581,6 @@ fn checkModelInList(allocator: std.mem.Allocator, base_url: []const u8, api_key:
 
     const body = response_writer.written();
 
-    // Scan for exact model id match
     var search_pos: usize = 0;
     while (std.mem.indexOf(u8, body[search_pos..], "\"id\"")) |id_pos| {
         const abs_pos = search_pos + id_pos;
@@ -518,12 +592,32 @@ fn checkModelInList(allocator: std.mem.Allocator, base_url: []const u8, api_key:
         const q2 = std.mem.indexOf(u8, val_start, "\"") orelse break;
         const model_id = val_start[0..q2];
 
-        if (std.mem.eql(u8, model_id, model)) return true;
+        if (std.mem.eql(u8, model_id, check_model)) return true;
 
         search_pos = abs_pos + 4 + colon + 1 + q1 + 1 + q2 + 1;
         if (search_pos >= body.len) break;
     }
     return false;
+}
+
+fn defaultFetchHeaders() std.http.Client.Request.Headers {
+    return .{
+        .user_agent = .{ .override = "VA/2.0" },
+        .accept_encoding = .{ .override = "identity" },
+        .connection = .{ .override = "close" },
+    };
+}
+
+fn normalizeTimeoutError(msg: ?[]const u8) ?[]const u8 {
+    if (msg) |m| {
+        if (std.mem.eql(u8, m, "Request timeout")) return "Request timeout";
+        return m;
+    }
+    return null;
+}
+
+fn normalizeAttemptError(r: CallAttemptResult) CallAttemptResult {
+    return .{ .success = r.success, .error_msg = normalizeTimeoutError(r.error_msg) };
 }
 
 const CallAttemptResult = struct {
@@ -547,6 +641,7 @@ fn tryResponsesCall(allocator: std.mem.Allocator, base_url: []const u8, api_key:
     const extra_headers = [_]std.http.Header{
         .{ .name = "authorization", .value = auth_header },
         .{ .name = "content-type", .value = "application/json" },
+        .{ .name = "connection", .value = "close" },
     };
 
     return doPost(allocator, url, &extra_headers, body);
@@ -568,6 +663,7 @@ fn tryOpenAICall(allocator: std.mem.Allocator, base_url: []const u8, api_key: []
     const extra_headers = [_]std.http.Header{
         .{ .name = "authorization", .value = auth_header },
         .{ .name = "content-type", .value = "application/json" },
+        .{ .name = "connection", .value = "close" },
     };
 
     return doPost(allocator, url, &extra_headers, body);
@@ -610,6 +706,7 @@ fn doAnthropicPost(allocator: std.mem.Allocator, url: []const u8, api_key: []con
         .{ .name = "authorization", .value = bearer },
         .{ .name = "anthropic-version", .value = "2023-06-01" },
         .{ .name = "content-type", .value = "application/json" },
+        .{ .name = "connection", .value = "close" },
     };
 
     return doPost(allocator, url, &extra_headers, body);
@@ -625,10 +722,8 @@ fn doPost(allocator: std.mem.Allocator, url: []const u8, extra_headers: []const 
     const result = client.fetch(.{
         .location = .{ .url = url },
         .method = .POST,
-        .headers = .{
-            .user_agent = .{ .override = "VA/2.0" },
-            .accept_encoding = .{ .override = "identity" },
-        },
+        .keep_alive = false,
+        .headers = defaultFetchHeaders(),
         .extra_headers = extra_headers,
         .payload = body,
         .response_writer = &response_writer.writer,
@@ -654,6 +749,11 @@ fn doPost(allocator: std.mem.Allocator, url: []const u8, extra_headers: []const 
     }
 
     if (resp_body.len > 0) {
+        if (std.mem.indexOf(u8, resp_body, "error code: 1010") != null or
+            std.mem.indexOf(u8, resp_body, "error code: 1020") != null)
+        {
+            return .{ .success = false, .error_msg = httpStatusMessage(code) };
+        }
         if (extractErrorMessage(resp_body)) |msg| {
             // These error messages indicate model is accessible
             if (std.mem.indexOf(u8, msg, "rate") != null or
@@ -740,10 +840,8 @@ pub fn fetchModelList(allocator: std.mem.Allocator, base_url: []const u8, api_ke
     const result = client.fetch(.{
         .location = .{ .url = url },
         .method = .GET,
-        .headers = .{
-            .user_agent = .{ .override = "VA/2.0" },
-            .accept_encoding = .{ .override = "identity" },
-        },
+        .keep_alive = false,
+        .headers = defaultFetchHeaders(),
         .extra_headers = &extra_headers,
         .response_writer = &response_writer.writer,
     }) catch return error.ConnectionFailed;
@@ -777,4 +875,399 @@ pub fn fetchModelList(allocator: std.mem.Allocator, base_url: []const u8, api_ke
     }
 
     return list.toOwnedSlice(allocator);
+}
+
+
+pub const ModelFamily = enum {
+    openai,
+    claude,
+    unknown,
+};
+
+pub const ProbeSupport = struct {
+    tool_type: sites_mod.SiteType,
+    supported: bool,
+    recommended_model: ?[]const u8 = null,
+    call_ok: bool = false,
+};
+
+pub const AddProbeResult = struct {
+    normalized_base_url: []const u8,
+    provider_type: ProviderType,
+    model_count: u32,
+    supports_gpt: bool,
+    supports_claude: bool,
+    recommended_cx: ?[]const u8 = null,
+    recommended_cc: ?[]const u8 = null,
+    recommended_oc: ?[]const u8 = null,
+    recommended_nb: ?[]const u8 = null,
+    recommended_ow: ?[]const u8 = null,
+};
+
+pub fn normalizeBaseUrlForProbe(allocator: std.mem.Allocator, base_url: []const u8) ![]u8 {
+    const trimmed = std.mem.trimRight(u8, base_url, "/");
+    if (trimmed.len == 0) return allocator.dupe(u8, base_url);
+    if (std.mem.endsWith(u8, trimmed, "/v1") or
+        std.mem.endsWith(u8, trimmed, "/v1/messages") or
+        std.mem.endsWith(u8, trimmed, "/v1/models") or
+        std.mem.endsWith(u8, trimmed, "/v1/chat/completions") or
+        std.mem.endsWith(u8, trimmed, "/v1/responses"))
+    {
+        return allocator.dupe(u8, trimmed);
+    }
+    if (std.mem.indexOf(u8, trimmed, "/v") != null) {
+        if (std.mem.lastIndexOfScalar(u8, trimmed, '/')) |slash| {
+            const tail = trimmed[slash..];
+            if (std.mem.startsWith(u8, tail, "/v") and tail.len >= 3 and std.ascii.isDigit(tail[2])) {
+                return allocator.dupe(u8, trimmed);
+            }
+        }
+    }
+    var buf: [1024]u8 = undefined;
+    const normalized = std.fmt.bufPrint(&buf, "{s}/v1", .{trimmed}) catch return allocator.dupe(u8, trimmed);
+    return allocator.dupe(u8, normalized);
+}
+
+pub fn probeAddEndpoint(allocator: std.mem.Allocator, base_url: []const u8, api_key: []const u8) !AddProbeResult {
+    const normalized = try normalizeBaseUrlForProbe(allocator, base_url);
+    errdefer allocator.free(normalized);
+
+    const models = fetchModelList(allocator, normalized, api_key) catch try allocator.alloc([]const u8, 0);
+    defer {
+        for (models) |m| allocator.free(m);
+        allocator.free(models);
+    }
+
+    var supports_gpt = false;
+    var supports_claude = false;
+    for (models) |m| {
+        switch (classifyModelFamily(m)) {
+            .openai => supports_gpt = true,
+            .claude => supports_claude = true,
+            .unknown => {},
+        }
+    }
+
+    const cx_model = pickBestCompatibleModel(models, .cx);
+    const cc_model = blk: {
+        if (modelExistsInList(models, "claude-opus-4-6")) break :blk "claude-opus-4-6";
+        break :blk pickBestCompatibleModel(models, .cc);
+    };
+    const oc_model = pickBestCompatibleModel(models, .oc);
+    const nb_model = pickBestCompatibleModel(models, .nb);
+    const ow_model = pickBestCompatibleModel(models, .ow);
+
+    return .{
+        .normalized_base_url = normalized,
+        .provider_type = classifyProvider(classifyDomain(normalized), supports_gpt, supports_claude, @intCast(models.len)),
+        .model_count = @intCast(models.len),
+        .supports_gpt = supports_gpt,
+        .supports_claude = supports_claude,
+        .recommended_cx = if (cx_model) |m| try allocator.dupe(u8, m) else null,
+        .recommended_cc = if (cc_model) |m| try allocator.dupe(u8, m) else null,
+        .recommended_oc = if (oc_model) |m| try allocator.dupe(u8, m) else null,
+        .recommended_nb = if (nb_model) |m| try allocator.dupe(u8, m) else null,
+        .recommended_ow = if (ow_model) |m| try allocator.dupe(u8, m) else null,
+    };
+}
+
+pub fn freeAddProbeResult(allocator: std.mem.Allocator, result: *AddProbeResult) void {
+    allocator.free(result.normalized_base_url);
+    if (result.recommended_cx) |m| allocator.free(m);
+    if (result.recommended_cc) |m| allocator.free(m);
+    if (result.recommended_oc) |m| allocator.free(m);
+    if (result.recommended_nb) |m| allocator.free(m);
+    if (result.recommended_ow) |m| allocator.free(m);
+}
+
+pub fn recommendedModelForProbe(result: AddProbeResult, tool_type: sites_mod.SiteType) ?[]const u8 {
+    return switch (tool_type) {
+        .cx => result.recommended_cx,
+        .cc => result.recommended_cc,
+        .oc => result.recommended_oc,
+        .nb => result.recommended_nb,
+        .ow => result.recommended_ow,
+    };
+}
+
+pub fn probeSupportsTool(result: AddProbeResult, tool_type: sites_mod.SiteType) bool {
+    return recommendedModelForProbe(result, tool_type) != null;
+}
+
+pub fn testRecommendedModelCall(allocator: std.mem.Allocator, result: AddProbeResult, api_key: []const u8, tool_type: sites_mod.SiteType) bool {
+    const model = recommendedModelForProbe(result, tool_type) orelse return false;
+    const call = testModelCall(allocator, result.normalized_base_url, api_key, model, tool_type);
+    return call.success;
+}
+
+pub fn makeProbeSupport(allocator: std.mem.Allocator, result: AddProbeResult, api_key: []const u8, tool_type: sites_mod.SiteType) ProbeSupport {
+    const recommended = recommendedModelForProbe(result, tool_type);
+    return .{
+        .tool_type = tool_type,
+        .supported = recommended != null,
+        .recommended_model = recommended,
+        .call_ok = if (recommended != null) testRecommendedModelCall(allocator, result, api_key, tool_type) else false,
+    };
+}
+
+pub fn inferDefaultToolsFromProbe(result: AddProbeResult, buf: *[5]sites_mod.SiteType) []const sites_mod.SiteType {
+    var count: usize = 0;
+    inline for ([_]sites_mod.SiteType{ .cx, .cc, .oc, .nb, .ow }) |tool| {
+        if (probeSupportsTool(result, tool)) {
+            buf[count] = tool;
+            count += 1;
+        }
+    }
+    return buf[0..count];
+}
+
+pub fn recommendedPrimaryType(result: AddProbeResult) sites_mod.SiteType {
+    if (result.recommended_cc != null) return .cc;
+    if (result.recommended_cx != null) return .cx;
+    if (result.recommended_oc != null) return .oc;
+    if (result.recommended_nb != null) return .nb;
+    if (result.recommended_ow != null) return .ow;
+    return .cx;
+}
+
+pub fn normalizeBaseUrlDisplayChanged(original: []const u8, normalized: []const u8) bool {
+    return !std.mem.eql(u8, std.mem.trimRight(u8, original, "/"), normalized);
+}
+
+pub fn defaultProbeModel(tool_type: sites_mod.SiteType) []const u8 {
+    return sites_mod.defaultModelForType(tool_type);
+}
+
+pub fn probeSummaryHasSupport(result: AddProbeResult) bool {
+    return result.recommended_cx != null or result.recommended_cc != null or result.recommended_oc != null or result.recommended_nb != null or result.recommended_ow != null;
+}
+
+pub fn probeModelCount(result: AddProbeResult) u32 {
+    return result.model_count;
+}
+
+pub fn probeProviderType(result: AddProbeResult) ProviderType {
+    return result.provider_type;
+}
+
+pub fn probeSupportsClaude(result: AddProbeResult) bool {
+    return result.supports_claude;
+}
+
+pub fn probeSupportsGpt(result: AddProbeResult) bool {
+    return result.supports_gpt;
+}
+
+pub fn probeRecommendedTools(result: AddProbeResult, buf: *[5]sites_mod.SiteType) []const sites_mod.SiteType {
+    return inferDefaultToolsFromProbe(result, buf);
+}
+
+pub fn probeSuggestedSiteType(result: AddProbeResult) sites_mod.SiteType {
+    return recommendedPrimaryType(result);
+}
+
+pub fn probeNormalizedBaseUrl(result: AddProbeResult) []const u8 {
+    return result.normalized_base_url;
+}
+
+pub fn probeRecommendedModel(result: AddProbeResult, tool_type: sites_mod.SiteType) ?[]const u8 {
+    return recommendedModelForProbe(result, tool_type);
+}
+
+pub fn probeHasTool(result: AddProbeResult, tool_type: sites_mod.SiteType) bool {
+    return probeSupportsTool(result, tool_type);
+}
+
+pub fn probeToolSupport(allocator: std.mem.Allocator, result: AddProbeResult, api_key: []const u8, tool_type: sites_mod.SiteType) ProbeSupport {
+    return makeProbeSupport(allocator, result, api_key, tool_type);
+}
+
+pub fn probeDefaultTools(result: AddProbeResult, buf: *[5]sites_mod.SiteType) []const sites_mod.SiteType {
+    return inferDefaultToolsFromProbe(result, buf);
+}
+
+pub fn probePrimaryType(result: AddProbeResult) sites_mod.SiteType {
+    return recommendedPrimaryType(result);
+}
+
+pub fn normalizedAddBaseUrl(allocator: std.mem.Allocator, base_url: []const u8) ![]u8 {
+    return normalizeBaseUrlForProbe(allocator, base_url);
+}
+
+pub fn classifyModelFamily(model: []const u8) ModelFamily {
+    const normalized = normalizeModelForApiCheck(model);
+    if (std.mem.startsWith(u8, normalized, "claude-")) return .claude;
+    if (std.mem.startsWith(u8, normalized, "gpt") or
+        std.mem.startsWith(u8, normalized, "o1") or
+        std.mem.startsWith(u8, normalized, "o3") or
+        std.mem.startsWith(u8, normalized, "o4"))
+    {
+        return .openai;
+    }
+    return .unknown;
+}
+
+pub fn isModelCompatibleForTool(target_type: sites_mod.SiteType, model: []const u8) bool {
+    return supportsModelFamily(target_type, classifyModelFamily(model));
+}
+
+pub fn modelExistsInList(models: []const []const u8, model: []const u8) bool {
+    const normalized = normalizeModelForApiCheck(model);
+    for (models) |candidate| {
+        if (std.mem.eql(u8, normalizeModelForApiCheck(candidate), normalized)) return true;
+    }
+    return false;
+}
+
+pub fn pickBestCompatibleModel(models: []const []const u8, target_type: sites_mod.SiteType) ?[]const u8 {
+    var best: ?[]const u8 = null;
+    var best_score: i64 = std.math.minInt(i64);
+
+    for (models) |candidate| {
+        if (!isModelCompatibleForTool(target_type, candidate)) continue;
+        const score = modelRank(target_type, candidate);
+        if (score > best_score) {
+            best_score = score;
+            best = candidate;
+        }
+    }
+
+    return best;
+}
+
+fn supportsModelFamily(target_type: sites_mod.SiteType, family: ModelFamily) bool {
+    return switch (target_type) {
+        .cx, .nb, .ow => family == .openai,
+        .cc => family == .claude,
+        .oc => family == .openai or family == .claude,
+    };
+}
+
+fn modelRank(target_type: sites_mod.SiteType, model: []const u8) i64 {
+    const normalized = normalizeModelForApiCheck(model);
+    const family = classifyModelFamily(normalized);
+    if (!supportsModelFamily(target_type, family)) return std.math.minInt(i64);
+
+    var score: i64 = modelVersionScore(normalized);
+
+    switch (family) {
+        .openai => {
+            if (std.mem.indexOf(u8, normalized, "mini") == null) score += 1_000_000;
+            if (std.mem.indexOf(u8, normalized, "codex") == null) score += 500_000;
+        },
+        .claude => {
+            if (target_type == .cc) {
+                if (std.mem.startsWith(u8, normalized, "claude-opus")) score += 30_000_000;
+                if (std.mem.startsWith(u8, normalized, "claude-sonnet")) score += 20_000_000;
+                if (std.mem.startsWith(u8, normalized, "claude-haiku")) score += 10_000_000;
+            } else {
+                if (std.mem.startsWith(u8, normalized, "claude-opus")) score += 3_000_000;
+                if (std.mem.startsWith(u8, normalized, "claude-sonnet")) score += 2_000_000;
+                if (std.mem.startsWith(u8, normalized, "claude-haiku")) score += 1_000_000;
+            }
+        },
+        .unknown => {},
+    }
+
+    return score;
+}
+
+fn modelVersionScore(model: []const u8) i64 {
+    var score: i64 = 0;
+    var factor: i64 = 1_000_000;
+    var i: usize = 0;
+
+    while (i < model.len and factor > 0) {
+        if (!std.ascii.isDigit(model[i])) {
+            i += 1;
+            continue;
+        }
+
+        var value: i64 = 0;
+        while (i < model.len and std.ascii.isDigit(model[i])) : (i += 1) {
+            value = value * 10 + @as(i64, model[i] - '0');
+        }
+
+        score += value * factor;
+        factor = @divTrunc(factor, 100);
+    }
+
+    return score;
+}
+
+test "model family classification" {
+    try std.testing.expectEqual(ModelFamily.openai, classifyModelFamily("gpt-5.4"));
+    try std.testing.expectEqual(ModelFamily.openai, classifyModelFamily("o3"));
+    try std.testing.expectEqual(ModelFamily.claude, classifyModelFamily("claude-opus-4-6[1m]"));
+    try std.testing.expectEqual(ModelFamily.unknown, classifyModelFamily("gemini-2.5-pro"));
+}
+
+test "pick best compatible model" {
+    const cc_best = pickBestCompatibleModel(&.{ "claude-haiku-4-5-20251001", "claude-opus-4-6", "gpt-5.4" }, .cc);
+    try std.testing.expect(cc_best != null);
+    try std.testing.expectEqualStrings("claude-opus-4-6", cc_best.?);
+
+    const nb_best = pickBestCompatibleModel(&.{ "gpt-5.4-mini", "gpt-5.4", "claude-sonnet-4-6" }, .nb);
+    try std.testing.expect(nb_best != null);
+    try std.testing.expectEqualStrings("gpt-5.4", nb_best.?);
+}
+
+/// Check if a CLI tool is available.
+/// PATH executable OR existing config file counts as installed/available.
+pub fn isToolInstalled(tool_type: sites_mod.SiteType) bool {
+    const names: []const []const u8 = switch (tool_type) {
+        .cx => &.{ "codex", "cx" },
+        .cc => &.{ "claude" },
+        .oc => &.{ "opencode" },
+        .nb => &.{ "nanobot" },
+        .ow => &.{ "openclaw" },
+    };
+    for (names) |name| {
+        if (findExecutableInPath(name)) return true;
+    }
+    return hasToolConfigFile(tool_type);
+}
+
+fn findExecutableInPath(exe_name: []const u8) bool {
+    const path_sep: u8 = if (builtin.os.tag == .windows) ';' else ':';
+    const path_env = std.process.getEnvVarOwned(std.heap.page_allocator, "PATH") catch return false;
+    defer std.heap.page_allocator.free(path_env);
+
+    var iter = std.mem.splitScalar(u8, path_env, path_sep);
+    while (iter.next()) |dir| {
+        if (dir.len == 0) continue;
+        var full_buf: [1024]u8 = undefined;
+
+        if (builtin.os.tag == .windows) {
+            // Check .exe and .cmd suffixes on Windows
+            const suffixes = [_][]const u8{ ".exe", ".cmd", "" };
+            for (suffixes) |suffix| {
+                const full = std.fmt.bufPrint(&full_buf, "{s}\\{s}{s}", .{ dir, exe_name, suffix }) catch continue;
+                std.fs.accessAbsolute(full, .{}) catch continue;
+                return true;
+            }
+        } else {
+            const full = std.fmt.bufPrint(&full_buf, "{s}/{s}", .{ dir, exe_name }) catch continue;
+            std.fs.accessAbsolute(full, .{}) catch continue;
+            return true;
+        }
+    }
+    return false;
+}
+
+fn hasToolConfigFile(tool_type: sites_mod.SiteType) bool {
+    const home = config_mod.getHomeDir(std.heap.page_allocator) orelse return false;
+    defer std.heap.page_allocator.free(home);
+
+    const path = switch (tool_type) {
+        .cx => std.fs.path.join(std.heap.page_allocator, &.{ home, app.codex_config_dir, app.codex_config_filename }) catch return false,
+        .cc => std.fs.path.join(std.heap.page_allocator, &.{ home, app.claude_config_dir, app.claude_settings_filename }) catch return false,
+        .oc => std.fs.path.join(std.heap.page_allocator, &.{ home, app.opencode_config_dir_parts[0], app.opencode_config_dir_parts[1], app.opencode_config_filename }) catch return false,
+        .nb => std.fs.path.join(std.heap.page_allocator, &.{ home, app.nanobot_config_dir, app.nanobot_config_filename }) catch return false,
+        .ow => std.fs.path.join(std.heap.page_allocator, &.{ home, app.openclaw_config_dir, app.openclaw_config_filename }) catch return false,
+    };
+    defer std.heap.page_allocator.free(path);
+
+    std.fs.accessAbsolute(path, .{}) catch return false;
+    return true;
 }

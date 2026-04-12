@@ -86,14 +86,26 @@ fn runAdd(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCa
 
     // Direct mode: all fields provided via CLI
     if (args.site_type != null and args.base_url != null and args.api_key != null) {
+        const normalized_base_url = try check_mod.normalizedAddBaseUrl(allocator, args.base_url.?);
+        defer allocator.free(normalized_base_url);
         const site = sites_mod.Site{
             .site_type = args.site_type.?,
-            .base_url = args.base_url.?,
+            .base_url = normalized_base_url,
             .api_key = args.api_key.?,
             .model = args.model orelse sites_mod.defaultModelForType(args.site_type.?),
+            .default_tools_mask = sites_mod.toolMask(args.site_type.?),
         };
         try store.addOrUpdate(allocator, args.alias, site);
         try sites_mod.saveSites(allocator, &store);
+
+        if (check_mod.normalizeBaseUrlDisplayChanged(args.base_url.?, normalized_base_url)) {
+            var norm_buf: [512]u8 = undefined;
+            const norm_msg = std.fmt.bufPrint(&norm_buf, "{s}: {s}", .{
+                i18n.tr(lang, "Normalized Base URL", "已规范化 Base URL", "Base URL を正規化しました"),
+                normalized_base_url,
+            }) catch normalized_base_url;
+            try output.printInfo(w, norm_msg, caps);
+        }
 
         var msg_buf: [128]u8 = undefined;
         const msg = std.fmt.bufPrint(&msg_buf, "Site '{s}' added ({s})", .{ args.alias, site.site_type.displayName() }) catch "Site added";
@@ -101,6 +113,44 @@ fn runAdd(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCa
         try w.flush();
         return;
     }
+
+    if (existing == null and args.site_type == null) {
+        const raw_base_url = askBaseUrl(w, caps, lang, null);
+        const api_key = askApiKey(w, caps, lang, null);
+        var probe = try check_mod.probeAddEndpoint(allocator, raw_base_url, api_key);
+        defer check_mod.freeAddProbeResult(allocator, &probe);
+
+        if (check_mod.normalizeBaseUrlDisplayChanged(raw_base_url, probe.normalized_base_url)) {
+            var norm_buf: [512]u8 = undefined;
+            const norm_msg = std.fmt.bufPrint(&norm_buf, "{s}: {s}", .{
+                i18n.tr(lang, "Normalized Base URL", "已规范化 Base URL", "Base URL を正規化しました"),
+                probe.normalized_base_url,
+            }) catch probe.normalized_base_url;
+            try output.printInfo(w, norm_msg, caps);
+        }
+
+        try printProbeSummary(w, caps, lang, probe);
+        var selected_buf: [5]sites_mod.SiteType = undefined;
+        const selected_tools = askDefaultTools(w, caps, lang, probe, &selected_buf);
+
+        var site = sites_mod.Site{
+            .site_type = check_mod.probeSuggestedSiteType(probe),
+            .base_url = probe.normalized_base_url,
+            .api_key = api_key,
+        };
+        applyProbeDefaults(&site, probe, selected_tools);
+        try store.addOrUpdate(allocator, args.alias, site);
+        try sites_mod.saveSites(allocator, &store);
+
+        var tools_buf: [128]u8 = undefined;
+        const tools_text = sites_mod.defaultToolsSummary(site, &tools_buf);
+        var msg_buf: [192]u8 = undefined;
+        const msg = std.fmt.bufPrint(&msg_buf, "Site '{s}' added ({s}) [{s}]", .{ args.alias, site.site_type.displayName(), tools_text }) catch "Site added";
+        try output.printSuccess(w, msg, caps);
+        try w.flush();
+        return;
+    }
+
 
     // Interactive mode
     if (existing) |ex| {
@@ -151,18 +201,70 @@ fn runAdd(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCa
         }
     } else {
         // New site
-        const site_type = args.site_type orelse askSiteType(w, caps, lang) orelse return;
-        const base_url = askBaseUrl(w, caps, lang, null);
-        const api_key = askApiKey(w, caps, lang, null);
-        const model = askModel(w, caps, lang, site_type, null);
+        if (args.site_type) |explicit_type| {
+            const raw_base_url = askBaseUrl(w, caps, lang, null);
+            const normalized_base_url = try check_mod.normalizedAddBaseUrl(allocator, raw_base_url);
+            defer allocator.free(normalized_base_url);
+            if (check_mod.normalizeBaseUrlDisplayChanged(raw_base_url, normalized_base_url)) {
+                var norm_buf: [512]u8 = undefined;
+                const norm_msg = std.fmt.bufPrint(&norm_buf, "{s}: {s}", .{
+                    i18n.tr(lang, "Normalized Base URL", "已规范化 Base URL", "Base URL を正規化しました"),
+                    normalized_base_url,
+                }) catch normalized_base_url;
+                try output.printInfo(w, norm_msg, caps);
+            }
+            const api_key = askApiKey(w, caps, lang, null);
+            const model = askModel(w, caps, lang, explicit_type, args.model);
 
-        const site = sites_mod.Site{ .site_type = site_type, .base_url = base_url, .api_key = api_key, .model = model };
-        try store.addOrUpdate(allocator, args.alias, site);
-        try sites_mod.saveSites(allocator, &store);
+            var site = sites_mod.Site{
+                .site_type = explicit_type,
+                .base_url = normalized_base_url,
+                .api_key = api_key,
+                .model = model,
+            };
+            sites_mod.setLegacyDefaults(&site);
+            try store.addOrUpdate(allocator, args.alias, site);
+            try sites_mod.saveSites(allocator, &store);
 
-        var msg_buf: [128]u8 = undefined;
-        const msg = std.fmt.bufPrint(&msg_buf, "Site '{s}' added ({s})", .{ args.alias, site.site_type.displayName() }) catch "Site added";
-        try output.printSuccess(w, msg, caps);
+            var msg_buf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrint(&msg_buf, "Site '{s}' added ({s})", .{ args.alias, site.site_type.displayName() }) catch "Site added";
+            try output.printSuccess(w, msg, caps);
+        } else {
+            const raw_base_url = askBaseUrl(w, caps, lang, null);
+            const normalized_base_url = try check_mod.normalizedAddBaseUrl(allocator, raw_base_url);
+            defer allocator.free(normalized_base_url);
+            if (check_mod.normalizeBaseUrlDisplayChanged(raw_base_url, normalized_base_url)) {
+                var norm_buf: [512]u8 = undefined;
+                const norm_msg = std.fmt.bufPrint(&norm_buf, "{s}: {s}", .{
+                    i18n.tr(lang, "Normalized Base URL", "已规范化 Base URL", "Base URL を正規化しました"),
+                    normalized_base_url,
+                }) catch normalized_base_url;
+                try output.printInfo(w, norm_msg, caps);
+                try w.flush();
+            }
+            const api_key = askApiKey(w, caps, lang, null);
+            var probe = try check_mod.probeAddEndpoint(allocator, normalized_base_url, api_key);
+            defer check_mod.freeAddProbeResult(allocator, &probe);
+            try printProbeSummary(w, caps, lang, probe);
+
+            var selected_buf: [5]sites_mod.SiteType = undefined;
+            const selected_tools = askDefaultTools(w, caps, lang, probe, &selected_buf);
+
+            var site = sites_mod.Site{
+                .site_type = check_mod.probeSuggestedSiteType(probe),
+                .base_url = probe.normalized_base_url,
+                .api_key = api_key,
+            };
+            applyProbeDefaults(&site, probe, selected_tools);
+            try store.addOrUpdate(allocator, args.alias, site);
+            try sites_mod.saveSites(allocator, &store);
+
+            var tools_buf: [128]u8 = undefined;
+            const tools_text = sites_mod.defaultToolsSummary(site, &tools_buf);
+            var msg_buf: [192]u8 = undefined;
+            const msg = std.fmt.bufPrint(&msg_buf, "Site '{s}' added ({s}) [{s}]", .{ args.alias, site.site_type.displayName(), tools_text }) catch "Site added";
+            try output.printSuccess(w, msg, caps);
+        }
     }
     try w.flush();
 }
@@ -176,9 +278,28 @@ fn runEdit(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermC
     defer store.deinit(allocator);
 
     const existing = store.getSite(args.alias) orelse {
-        var err_buf: [128]u8 = undefined;
-        const err_msg = std.fmt.bufPrint(&err_buf, "Site '{s}' not found", .{args.alias}) catch "Site not found";
-        try output.printError(w, err_msg, caps);
+        // Fuzzy match suggestion
+        if (findClosestAlias(&store, args.alias)) |suggestion| {
+            var suggest_buf: [256]u8 = undefined;
+            const suggest_msg = std.fmt.bufPrint(&suggest_buf, "{s} '{s}' {s}. {s} '{s}'? [Y/n]", .{
+                i18n.tr(lang, "Site", "站点", "サイト"),
+                args.alias,
+                i18n.tr(lang, "not found", "未找到", "が見つかりません"),
+                i18n.tr(lang, "Did you mean", "你是否想输入", "もしかして"),
+                suggestion,
+            }) catch "Site not found";
+            try output.printWarning(w, suggest_msg, caps);
+            try w.flush();
+            const answer = readLine();
+            if (answer.len == 0 or answer[0] == 'y' or answer[0] == 'Y') {
+                const corrected_args = cli.EditArgs{ .alias = suggestion };
+                return runEdit(allocator, w, caps, lang, corrected_args);
+            }
+        } else {
+            var err_buf: [128]u8 = undefined;
+            const err_msg = std.fmt.bufPrint(&err_buf, "Site '{s}' not found", .{args.alias}) catch "Site not found";
+            try output.printError(w, err_msg, caps);
+        }
         try w.flush();
         return;
     };
@@ -228,9 +349,28 @@ fn runDel(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCa
     defer store.deinit(allocator);
 
     if (store.getSite(args.alias) == null) {
-        var err_buf: [128]u8 = undefined;
-        const err_msg = std.fmt.bufPrint(&err_buf, "Site '{s}' not found", .{args.alias}) catch "Site not found";
-        try output.printError(w, err_msg, caps);
+        // Fuzzy match suggestion
+        if (findClosestAlias(&store, args.alias)) |suggestion| {
+            var suggest_buf: [256]u8 = undefined;
+            const suggest_msg = std.fmt.bufPrint(&suggest_buf, "{s} '{s}' {s}. {s} '{s}'? [Y/n]", .{
+                i18n.tr(lang, "Site", "站点", "サイト"),
+                args.alias,
+                i18n.tr(lang, "not found", "未找到", "が見つかりません"),
+                i18n.tr(lang, "Did you mean", "你是否想输入", "もしかして"),
+                suggestion,
+            }) catch "Site not found";
+            try output.printWarning(w, suggest_msg, caps);
+            try w.flush();
+            const answer = readLine();
+            if (answer.len == 0 or answer[0] == 'y' or answer[0] == 'Y') {
+                const corrected_args = cli.DelArgs{ .alias = suggestion };
+                return runDel(allocator, w, caps, lang, corrected_args);
+            }
+        } else {
+            var err_buf: [128]u8 = undefined;
+            const err_msg = std.fmt.bufPrint(&err_buf, "Site '{s}' not found", .{args.alias}) catch "Site not found";
+            try output.printError(w, err_msg, caps);
+        }
         try w.flush();
         return;
     }
@@ -245,7 +385,7 @@ fn runDel(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCa
 
     const answer = readLine();
     if (answer.len > 0 and (answer[0] == 'y' or answer[0] == 'Y')) {
-        _ = store.remove(args.alias);
+        _ = store.remove(allocator, args.alias);
         try sites_mod.saveSites(allocator, &store);
         try output.printSuccess(w, i18n.tr(lang, "Site deleted", "站点已删除", "サイトを削除しました"), caps);
     } else {
@@ -268,14 +408,23 @@ fn runList(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermC
         return;
     }
 
+    const settings = sites_mod.loadSettings(allocator);
+
     if (args.show_all) {
-        // Detailed view - single column, show base_url + masked api_key
+        // Detailed view - single column, show base_url + masked api_key + archived status
         for (0..store.count) |i| {
             const entry = store.entries[i];
             try w.print("\n", .{});
 
             var alias_buf: [128]u8 = undefined;
-            const alias_display = std.fmt.bufPrint(&alias_buf, "{s} ({s})", .{ entry.alias, entry.site.site_type.displayName() }) catch entry.alias;
+            const alias_display = if (entry.site.archived)
+                std.fmt.bufPrint(&alias_buf, "{s} ({s}) [{s}]", .{
+                    entry.alias,
+                    entry.site.site_type.displayName(),
+                    i18n.tr(lang, "archived", "已归档", "アーカイブ済"),
+                }) catch entry.alias
+            else
+                std.fmt.bufPrint(&alias_buf, "{s} ({s})", .{ entry.alias, entry.site.site_type.displayName() }) catch entry.alias;
             try output.printInfo(w, alias_display, caps);
             try output.printKeyValue(w, "    Base URL:", entry.site.base_url, caps);
             var masked_buf: [64]u8 = undefined;
@@ -288,18 +437,49 @@ fn runList(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermC
         return;
     }
 
-    // Progressive list: show all sites first with "testing..." then update each with latency
-    const settings = sites_mod.loadSettings(allocator);
-    const count = store.count;
+    // Build list of indices to check
+    var check_indices: [64]usize = undefined;
+    var check_count: usize = 0;
+
+    if (args.global_check) {
+        // -g: check ALL sites including archived
+        for (0..store.count) |i| {
+            check_indices[check_count] = i;
+            check_count += 1;
+        }
+    } else {
+        // Normal: only non-archived sites
+        for (0..store.count) |i| {
+            if (!store.entries[i].site.archived) {
+                check_indices[check_count] = i;
+                check_count += 1;
+            }
+        }
+    }
+
+    if (check_count == 0) {
+        try output.printInfo(w, i18n.tr(lang, "No active sites. Use 'velora list -g' to check archived sites.", "无活跃站点。使用 'velora list -g' 检查已归档站点", "アクティブなサイトがありません。'velora list -g' でアーカイブ済みサイトを確認"), caps);
+        try w.flush();
+        return;
+    }
 
     if (!settings.list_latency) {
         // No latency check - just show sites statically
-        for (store.entries[0..count]) |entry| {
+        for (0..check_count) |ci| {
+            const entry = store.entries[check_indices[ci]];
+            var archived_tag_buf: [32]u8 = undefined;
+            const archived_tag = if (entry.site.archived)
+                std.fmt.bufPrint(&archived_tag_buf, " [{s}]", .{
+                    i18n.tr(lang, "archived", "已归档", "アーカイブ済"),
+                }) catch " [archived]"
+            else
+                "";
             var line_buf: [256]u8 = undefined;
-            const line = std.fmt.bufPrint(&line_buf, "  {s}{s} ({s}){s}", .{
+            const line = std.fmt.bufPrint(&line_buf, "  {s}{s} ({s}){s}{s}", .{
                 if (caps.color) output.Color.miku_white else "",
                 entry.alias,
                 entry.site.site_type.displayName(),
+                archived_tag,
                 if (caps.color) output.Color.reset else "",
             }) catch "";
             try w.print("{s}\n", .{line});
@@ -310,23 +490,24 @@ fn runList(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermC
     }
 
     // Phase 1: Print all sites with pending status
-    for (store.entries[0..count]) |entry| {
+    for (0..check_count) |ci| {
+        const entry = store.entries[check_indices[ci]];
         try printSitePendingLine(w, caps, entry.alias, entry.site.site_type);
     }
     try w.flush();
 
     // Phase 2: Test each site and update the line in place
-    for (0..count) |i| {
-        const entry = store.entries[i];
+    var store_changed = false;
+    for (0..check_count) |ci| {
+        const idx = check_indices[ci];
+        const entry = store.entries[idx];
         const conn = check_mod.checkConnectivity(allocator, entry.site.base_url);
 
-        // Move cursor up to the line we need to update: (count - i) lines up
-        const lines_up = count - i;
+        const lines_up = check_count - ci;
         var esc_buf: [32]u8 = undefined;
         const esc = std.fmt.bufPrint(&esc_buf, "\x1b[{d}A\r\x1b[2K", .{lines_up}) catch "";
         try w.print("{s}", .{esc});
 
-        // Print updated line
         const status = check_mod.SiteStatus{
             .alias = entry.alias,
             .site = entry.site,
@@ -334,13 +515,35 @@ fn runList(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermC
         };
         try printSiteStatusLine(w, caps, status, 0);
 
-        // Move cursor back down to the bottom
-        if (lines_up > 1) {
-            var down_buf: [32]u8 = undefined;
-            const down = std.fmt.bufPrint(&down_buf, "\x1b[{d}B", .{lines_up - 1}) catch "";
-            try w.print("{s}", .{down});
-        }
+        var down_buf: [32]u8 = undefined;
+        const down = std.fmt.bufPrint(&down_buf, "\x1b[{d}B", .{lines_up}) catch "";
+        try w.print("{s}", .{down});
         try w.flush();
+
+        // Smart archival logic (only when auto_archive is enabled)
+        if (settings.auto_archive) {
+            if (!conn.reachable and !entry.site.archived) {
+                // Auto-archive unreachable site
+                store.entries[idx].site.archived = true;
+                store_changed = true;
+            } else if (conn.reachable and entry.site.archived) {
+                // Auto-unarchive reachable archived site
+                store.entries[idx].site.archived = false;
+                store_changed = true;
+            }
+        } else if (args.global_check) {
+            // In -g mode without auto_archive, still auto-unarchive reachable archived sites
+            if (conn.reachable and entry.site.archived) {
+                store.entries[idx].site.archived = false;
+                store_changed = true;
+            }
+        }
+    }
+
+    try w.flush();
+
+    if (store_changed) {
+        sites_mod.saveSites(allocator, &store) catch {};
     }
 
     try output.printSeparator(w, caps);
@@ -423,22 +626,64 @@ fn runUse(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCa
     defer store.deinit(allocator);
 
     const site = store.getSite(args.alias) orelse {
-        var err_buf: [128]u8 = undefined;
-        const err_msg = std.fmt.bufPrint(&err_buf, "Site '{s}' not found", .{args.alias}) catch "Site not found";
-        try output.printError(w, err_msg, caps);
+        // Fuzzy match suggestion
+        if (findClosestAlias(&store, args.alias)) |suggestion| {
+            var suggest_buf: [256]u8 = undefined;
+            const suggest_msg = std.fmt.bufPrint(&suggest_buf, "{s} '{s}' {s}. {s} '{s}'? [Y/n]", .{
+                i18n.tr(lang, "Site", "站点", "サイト"),
+                args.alias,
+                i18n.tr(lang, "not found", "未找到", "が見つかりません"),
+                i18n.tr(lang, "Did you mean", "你是否想输入", "もしかして"),
+                suggestion,
+            }) catch "Site not found";
+            try output.printWarning(w, suggest_msg, caps);
+            try w.flush();
+            const answer = readLine();
+            if (answer.len == 0 or answer[0] == 'y' or answer[0] == 'Y') {
+                const corrected_args = cli.UseArgs{ .site_type = args.site_type, .alias = suggestion, .model = args.model };
+                return runUse(allocator, w, caps, lang, corrected_args);
+            }
+        } else {
+            var err_buf: [128]u8 = undefined;
+            const err_msg = std.fmt.bufPrint(&err_buf, "Site '{s}' not found", .{args.alias}) catch "Site not found";
+            try output.printError(w, err_msg, caps);
+        }
         try w.flush();
         return;
     };
 
-    // Determine target type: explicit arg or auto-detect from site
-    const target_type = args.site_type orelse site.site_type;
+    if (args.site_type == null and sites_mod.defaultToolCount(site) > 1) {
+        var targets_buf: [5]sites_mod.SiteType = undefined;
+        const targets = sites_mod.availableDefaultTools(site, &targets_buf);
+        for (targets) |tool| {
+            const explicit_args = cli.UseArgs{ .site_type = tool, .alias = args.alias, .model = args.model };
+            try runUse(allocator, w, caps, lang, explicit_args);
+        }
+        return;
+    }
+
+    // Determine target type: explicit arg or stored default preference
+    const target_type = args.site_type orelse sites_mod.implicitTargetTool(site);
 
     const header = switch (target_type) {
         .cx => i18n.tr(lang, "Apply to Codex", "应用到 Codex", "Codexに適用"),
         .cc => i18n.tr(lang, "Apply to Claude Code", "应用到 Claude Code", "Claude Codeに適用"),
         .oc => i18n.tr(lang, "Apply to OpenCode", "应用到 OpenCode", "OpenCodeに適用"),
+        .nb => i18n.tr(lang, "Apply to Nanobot", "应用到 Nanobot", "Nanobotに適用"),
+        .ow => i18n.tr(lang, "Apply to OpenClaw", "应用到 OpenClaw", "OpenClawに適用"),
     };
     try output.printSectionHeader(w, header, caps);
+
+    // CLI tool detection warning
+    if (!check_mod.isToolInstalled(target_type)) {
+        var tool_warn_buf: [256]u8 = undefined;
+        const tool_warn = std.fmt.bufPrint(&tool_warn_buf, "{s} ({s})", .{
+            i18n.tr(lang, "Target tool not detected in PATH", "目标工具未在 PATH 中检测到", "対象ツールがPATHに見つかりません"),
+            target_type.displayName(),
+        }) catch "Tool not found";
+        try output.printWarning(w, tool_warn, caps);
+        try w.flush();
+    }
 
     // Type mismatch warning (only when type was explicitly specified)
     if (args.site_type != null and site.site_type != target_type) {
@@ -452,15 +697,96 @@ fn runUse(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCa
         try w.flush();
     }
 
-    // Apply
-    switch (target_type) {
-        .cx => try apply_mod.applyToCodex(allocator, w, caps, lang, site),
-        .cc => try apply_mod.applyToClaudeCode(allocator, w, caps, lang, site),
-        .oc => try apply_mod.applyToOpenCode(allocator, w, caps, lang, site),
+    // Auto-unarchive if site is archived
+    if (site.archived) {
+        _ = sites_mod.updateArchived(&store, args.alias, false);
+        try sites_mod.saveSites(allocator, &store);
+        try output.printInfo(w, i18n.tr(lang, "Site unarchived", "站点已取消归档", "サイトのアーカイブを解除しました"), caps);
+        try w.flush();
     }
 
-    // Model detection (if enabled)
     const settings = sites_mod.loadSettings(allocator);
+    const mismatch = args.site_type != null and site.site_type != target_type;
+
+    var fetched_models: ?[][]const u8 = null;
+    defer if (fetched_models) |models| {
+        for (models) |item| allocator.free(item);
+        allocator.free(models);
+    };
+
+    if (mismatch and (settings.auto_pick_compatible_model or args.model != null)) {
+        fetched_models = check_mod.fetchModelList(allocator, site.base_url, site.api_key) catch null;
+    }
+
+    var tool_model = site.effectiveModelForTool(target_type);
+    var persist_override = false;
+
+    if (args.model) |requested_model| {
+        const family_ok = check_mod.isModelCompatibleForTool(target_type, requested_model);
+
+        if (family_ok) {
+            tool_model = requested_model;
+            persist_override = true;
+        } else {
+            var warn_buf: [256]u8 = undefined;
+            const warn_msg = std.fmt.bufPrint(&warn_buf, "{s} '{s}' ({s})", .{
+                i18n.tr(lang, "Requested model is not compatible for target tool, keeping current behavior", "指定模型与目标工具不兼容，保持当前行为", "指定モデルは対象ツールと互換性がないため、現在の動作を維持します"),
+                requested_model,
+                if (!family_ok)
+                    i18n.tr(lang, "family mismatch", "模型系列不匹配", "モデル系列が不一致")
+                else
+                    i18n.tr(lang, "not found in model list", "未在模型列表中找到", "モデル一覧に見つかりません"),
+            }) catch "Requested model incompatible";
+            try output.printWarning(w, warn_msg, caps);
+            try w.flush();
+        }
+    } else if (mismatch and settings.auto_pick_compatible_model and site.modelOverrideForTool(target_type).len == 0) {
+        if (fetched_models) |models| {
+            if (check_mod.pickBestCompatibleModel(models, target_type)) |picked| {
+                tool_model = picked;
+                persist_override = true;
+                var info_buf: [256]u8 = undefined;
+                const info_msg = std.fmt.bufPrint(&info_buf, "{s}: {s}", .{
+                    i18n.tr(lang, "Auto-selected compatible model", "已自动选择兼容模型", "互換モデルを自動選択しました"),
+                    picked,
+                }) catch "Auto-selected compatible model";
+                try output.printInfo(w, info_msg, caps);
+                try w.flush();
+            } else {
+                try output.printWarning(w, i18n.tr(lang, "No compatible model found for target tool, keeping current behavior", "未找到适用于目标工具的兼容模型，保持当前行为", "対象ツール向けの互換モデルが見つからないため、現在の動作を維持します"), caps);
+                try w.flush();
+            }
+        } else {
+            try output.printWarning(w, i18n.tr(lang, "Could not fetch model list for compatibility check, keeping current behavior", "无法获取模型列表进行兼容性检查，保持当前行为", "互換性確認用のモデル一覧を取得できないため、現在の動作を維持します"), caps);
+            try w.flush();
+        }
+    }
+
+    if (persist_override) {
+        _ = try sites_mod.setToolModelOverride(&store, allocator, args.alias, target_type, tool_model);
+        try sites_mod.saveSites(allocator, &store);
+    }
+
+    const site_entry = sites_mod.findEntryConst(&store, args.alias) orelse return;
+    const apply_site = site_entry.site;
+
+    // Apply
+    switch (target_type) {
+        .cx => try apply_mod.applyToCodex(allocator, w, caps, lang, apply_site, tool_model),
+        .cc => try apply_mod.applyToClaudeCode(allocator, w, caps, lang, apply_site, tool_model),
+        .oc => try apply_mod.applyToOpenCode(allocator, w, caps, lang, apply_site, tool_model),
+        .nb => try apply_mod.applyToNanobot(allocator, w, caps, lang, apply_site, tool_model),
+        .ow => try apply_mod.applyToOpenClaw(allocator, w, caps, lang, apply_site, tool_model),
+    }
+
+    if (sites_mod.findEntry(&store, args.alias)) |entry| {
+        sites_mod.updateLastUsed(&entry.site, target_type);
+        try sites_mod.saveSites(allocator, &store);
+    }
+
+    const updated_site = (sites_mod.findEntryConst(&store, args.alias) orelse site_entry).site;
+
+    // Model detection (if enabled)
     if (!settings.model_check) {
         try output.printSeparator(w, caps);
         try w.flush();
@@ -470,7 +796,7 @@ fn runUse(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCa
     try output.printInfo(w, i18n.tr(lang, "Detecting models...", "正在检测模型...", "モデルを検出中..."), caps);
     try w.flush();
 
-    const model_info = check_mod.detectModels(allocator, site.base_url, site.api_key, target_type);
+    const model_info = check_mod.detectModels(allocator, updated_site.base_url, updated_site.api_key, target_type);
 
     if (model_info.models_found > 0) {
         var model_buf: [128]u8 = undefined;
@@ -501,11 +827,11 @@ fn runUse(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCa
     }
 
     // Model call test
-    const model = site.effectiveModel();
+    const model = tool_model;
     try output.printInfo(w, i18n.tr(lang, "Testing model call...", "正在测试模型调用...", "モデル呼び出しをテスト中..."), caps);
     try w.flush();
 
-    const call_result = check_mod.testModelCall(allocator, site.base_url, site.api_key, model, target_type);
+    const call_result = check_mod.testModelCall(allocator, updated_site.base_url, updated_site.api_key, model, target_type);
 
     // Report model list presence
     if (call_result.model_in_list) {
@@ -580,9 +906,13 @@ fn runSet(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCa
         settings.model_check = bool_val;
     } else if (std.mem.eql(u8, key, "list_latency")) {
         settings.list_latency = bool_val;
+    } else if (std.mem.eql(u8, key, "auto_archive")) {
+        settings.auto_archive = bool_val;
+    } else if (std.mem.eql(u8, key, "auto_pick_compatible_model")) {
+        settings.auto_pick_compatible_model = bool_val;
     } else {
         var err_buf: [256]u8 = undefined;
-        const err_msg = std.fmt.bufPrint(&err_buf, "{s}: '{s}'. {s}: model_check, list_latency", .{
+        const err_msg = std.fmt.bufPrint(&err_buf, "{s}: '{s}'. {s}: model_check, list_latency, auto_archive, auto_pick_compatible_model", .{
             i18n.tr(lang, "Unknown setting", "未知设置项", "不明な設定"),
             key,
             i18n.tr(lang, "Available", "可用", "利用可能"),
@@ -604,6 +934,8 @@ fn runSet(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCa
     // Show all current settings
     try output.printKeyValue(w, "  model_check:", if (settings.model_check) "on" else "off", caps);
     try output.printKeyValue(w, "  list_latency:", if (settings.list_latency) "on" else "off", caps);
+    try output.printKeyValue(w, "  auto_archive:", if (settings.auto_archive) "on" else "off", caps);
+    try output.printKeyValue(w, "  auto_pick_compatible_model:", if (settings.auto_pick_compatible_model) "on" else "off", caps);
     try w.flush();
 }
 
@@ -614,9 +946,28 @@ fn runModels(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.Ter
     defer store.deinit(allocator);
 
     const site = store.getSite(args.alias) orelse {
-        var err_buf: [128]u8 = undefined;
-        const err_msg = std.fmt.bufPrint(&err_buf, "Site '{s}' not found", .{args.alias}) catch "Site not found";
-        try output.printError(w, err_msg, caps);
+        // Fuzzy match suggestion
+        if (findClosestAlias(&store, args.alias)) |suggestion| {
+            var suggest_buf: [256]u8 = undefined;
+            const suggest_msg = std.fmt.bufPrint(&suggest_buf, "{s} '{s}' {s}. {s} '{s}'? [Y/n]", .{
+                i18n.tr(lang, "Site", "站点", "サイト"),
+                args.alias,
+                i18n.tr(lang, "not found", "未找到", "が見つかりません"),
+                i18n.tr(lang, "Did you mean", "你是否想输入", "もしかして"),
+                suggestion,
+            }) catch "Site not found";
+            try output.printWarning(w, suggest_msg, caps);
+            try w.flush();
+            const answer = readLine();
+            if (answer.len == 0 or answer[0] == 'y' or answer[0] == 'Y') {
+                const corrected_args = cli.ModelsArgs{ .alias = suggestion };
+                return runModels(allocator, w, caps, lang, corrected_args);
+            }
+        } else {
+            var err_buf: [128]u8 = undefined;
+            const err_msg = std.fmt.bufPrint(&err_buf, "Site '{s}' not found", .{args.alias}) catch "Site not found";
+            try output.printError(w, err_msg, caps);
+        }
         try w.flush();
         return;
     };
@@ -832,8 +1183,19 @@ fn readLine() []const u8 {
 }
 
 fn readLineInto(buf: *[512]u8) []const u8 {
-    const input_len = std.fs.File.stdin().read(buf) catch 0;
-    return std.mem.trim(u8, buf[0..input_len], " \t\r\n");
+    var stdin = std.fs.File.stdin();
+    var len: usize = 0;
+    while (len < buf.len) {
+        var byte_buf: [1]u8 = undefined;
+        const n = stdin.read(&byte_buf) catch 0;
+        if (n == 0) break;
+        const ch = byte_buf[0];
+        if (ch == '\n') break;
+        if (ch == '\r') continue;
+        buf[len] = ch;
+        len += 1;
+    }
+    return std.mem.trim(u8, buf[0..len], " \t");
 }
 
 fn askSiteType(w: *std.Io.Writer, caps: terminal.TermCaps, lang: i18n.Language) ?sites_mod.SiteType {
@@ -841,7 +1203,9 @@ fn askSiteType(w: *std.Io.Writer, caps: terminal.TermCaps, lang: i18n.Language) 
     output.printMenuItem(w, 1, "Codex (cx)", caps) catch {};
     output.printMenuItem(w, 2, "Claude Code (cc)", caps) catch {};
     output.printMenuItem(w, 3, "OpenCode (oc)", caps) catch {};
-    output.printPrompt(w, i18n.tr(lang, "[1/2/3]:", "[1/2/3]:", "[1/2/3]:"), caps) catch {};
+    output.printMenuItem(w, 4, "Nanobot (nb)", caps) catch {};
+    output.printMenuItem(w, 5, "OpenClaw (ow)", caps) catch {};
+    output.printPrompt(w, i18n.tr(lang, "[1/2/3/4/5]:", "[1/2/3/4/5]:", "[1/2/3/4/5]:"), caps) catch {};
     w.flush() catch {};
 
     const input = readLine();
@@ -849,6 +1213,8 @@ fn askSiteType(w: *std.Io.Writer, caps: terminal.TermCaps, lang: i18n.Language) 
     if (std.mem.eql(u8, input, "1") or std.mem.eql(u8, input, "cx")) return .cx;
     if (std.mem.eql(u8, input, "2") or std.mem.eql(u8, input, "cc")) return .cc;
     if (std.mem.eql(u8, input, "3") or std.mem.eql(u8, input, "oc")) return .oc;
+    if (std.mem.eql(u8, input, "4") or std.mem.eql(u8, input, "nb")) return .nb;
+    if (std.mem.eql(u8, input, "5") or std.mem.eql(u8, input, "ow")) return .ow;
     return null;
 }
 
@@ -906,7 +1272,151 @@ fn askModel(w: *std.Io.Writer, caps: terminal.TermCaps, lang: i18n.Language, sit
     return input;
 }
 
+fn printProbeSummary(w: *std.Io.Writer, caps: terminal.TermCaps, lang: i18n.Language, probe: check_mod.AddProbeResult) !void {
+    try output.printInfo(w, i18n.tr(lang, "Probe summary:", "探测结果:", "プローブ結果:"), caps);
+    var url_buf: [512]u8 = undefined;
+    const url_msg = std.fmt.bufPrint(&url_buf, "  Base URL: {s}", .{probe.normalized_base_url}) catch probe.normalized_base_url;
+    try output.printInfo(w, url_msg, caps);
+    var models_buf: [128]u8 = undefined;
+    const models_msg = std.fmt.bufPrint(&models_buf, "  Models: {d}", .{probe.model_count}) catch "Models";
+    try output.printInfo(w, models_msg, caps);
+    var provider_buf: [128]u8 = undefined;
+    const provider_msg = std.fmt.bufPrint(&provider_buf, "  {s}: {s}", .{
+        i18n.tr(lang, "Provider", "站点类型", "プロバイダー"),
+        probe.provider_type.displayName(lang),
+    }) catch "Provider";
+    try output.printInfo(w, provider_msg, caps);
+
+    inline for ([_]sites_mod.SiteType{ .cx, .cc, .oc, .nb, .ow }) |tool| {
+        if (check_mod.probeHasTool(probe, tool)) {
+            var tool_buf: [256]u8 = undefined;
+            const model = check_mod.probeRecommendedModel(probe, tool) orelse sites_mod.defaultModelForType(tool);
+            const tool_msg = std.fmt.bufPrint(&tool_buf, "  {s}: {s}", .{ tool.displayName(), model }) catch tool.displayName();
+            try output.printSuccess(w, tool_msg, caps);
+        }
+    }
+    try w.flush();
+}
+
+fn askDefaultTools(w: *std.Io.Writer, caps: terminal.TermCaps, lang: i18n.Language, probe: check_mod.AddProbeResult, buf: *[5]sites_mod.SiteType) []const sites_mod.SiteType {
+    const recommended = check_mod.probeRecommendedTools(probe, buf);
+    output.printInfo(w, i18n.tr(lang, "Choose default tools (comma separated numbers, Enter = recommended):", "选择默认工具（逗号分隔数字，回车=推荐）:", "デフォルトツールを選択してください（カンマ区切り、Enter=推奨）:"), caps) catch {};
+    var idx: u8 = 1;
+    inline for ([_]sites_mod.SiteType{ .cx, .cc, .oc, .nb, .ow }) |tool| {
+        if (check_mod.probeHasTool(probe, tool)) {
+            output.printMenuItem(w, idx, tool.displayName(), caps) catch {};
+        }
+        idx += 1;
+    }
+    output.printPrompt(w, i18n.tr(lang, "Selection:", "选择:", "選択:"), caps) catch {};
+    w.flush() catch {};
+
+    const input = readLine();
+    if (input.len == 0) return recommended;
+
+    var count: usize = 0;
+    var iter = std.mem.splitScalar(u8, input, ',');
+    while (iter.next()) |part| {
+        const trimmed = std.mem.trim(u8, part, " \t");
+        if (trimmed.len == 0) continue;
+        const n = std.fmt.parseInt(u8, trimmed, 10) catch continue;
+        const tool = switch (n) {
+            1 => sites_mod.SiteType.cx,
+            2 => sites_mod.SiteType.cc,
+            3 => sites_mod.SiteType.oc,
+            4 => sites_mod.SiteType.nb,
+            5 => sites_mod.SiteType.ow,
+            else => continue,
+        };
+        if (!check_mod.probeHasTool(probe, tool)) continue;
+        var exists = false;
+        for (buf[0..count]) |t| {
+            if (t == tool) exists = true;
+        }
+        if (!exists) {
+            buf[count] = tool;
+            count += 1;
+        }
+    }
+    if (count == 0) return recommended;
+    return buf[0..count];
+}
+
+fn applyProbeDefaults(site: *sites_mod.Site, probe: check_mod.AddProbeResult, selected_tools: []const sites_mod.SiteType) void {
+    sites_mod.setDefaultTools(site, selected_tools);
+    site.site_type = if (selected_tools.len > 0) selected_tools[0] else check_mod.probeSuggestedSiteType(probe);
+    site.model = check_mod.probeRecommendedModel(probe, site.site_type) orelse sites_mod.defaultModelForType(site.site_type);
+    inline for ([_]sites_mod.SiteType{ .cx, .cc, .oc, .nb, .ow }) |tool| {
+        const model = check_mod.probeRecommendedModel(probe, tool) orelse "";
+        switch (tool) {
+            .cx => site.models_cx = model,
+            .cc => site.models_cc = model,
+            .oc => site.models_oc = model,
+            .nb => site.models_nb = model,
+            .ow => site.models_ow = model,
+        }
+    }
+    sites_mod.ensureSelectionState(site);
+}
+
 test {
     _ = @import("sites.zig");
     _ = @import("config.zig");
+}
+
+// --- Fuzzy matching ---
+
+fn editDistance(a: []const u8, b: []const u8) usize {
+    const max_len = 64;
+    if (a.len > max_len or b.len > max_len) return @max(a.len, b.len);
+    if (a.len == 0) return b.len;
+    if (b.len == 0) return a.len;
+
+    var prev: [max_len + 1]usize = undefined;
+    var curr: [max_len + 1]usize = undefined;
+
+    for (0..b.len + 1) |j| {
+        prev[j] = j;
+    }
+
+    for (0..a.len) |i| {
+        curr[0] = i + 1;
+        for (0..b.len) |j| {
+            const cost: usize = if (a[i] == b[j]) 0 else 1;
+            curr[j + 1] = @min(@min(curr[j] + 1, prev[j + 1] + 1), prev[j] + cost);
+        }
+        @memcpy(prev[0 .. b.len + 1], curr[0 .. b.len + 1]);
+    }
+
+    return prev[b.len];
+}
+
+fn findClosestAlias(store: *const sites_mod.SitesStore, input: []const u8) ?[]const u8 {
+    if (input.len == 0) return null;
+
+    const threshold = @max(1, input.len / 3);
+    var best_dist: usize = threshold + 1;
+    var best_alias: ?[]const u8 = null;
+
+    for (0..store.count) |i| {
+        const alias = store.entries[i].alias;
+        const dist = editDistance(input, alias);
+        if (dist < best_dist) {
+            best_dist = dist;
+            best_alias = alias;
+        }
+    }
+
+    return best_alias;
+}
+
+test "edit distance" {
+    const testing = std.testing;
+    try testing.expectEqual(@as(usize, 0), editDistance("abc", "abc"));
+    try testing.expectEqual(@as(usize, 1), editDistance("abc", "ab"));
+    try testing.expectEqual(@as(usize, 1), editDistance("abc", "abx"));
+    try testing.expectEqual(@as(usize, 3), editDistance("abc", "xyz"));
+    try testing.expectEqual(@as(usize, 1), editDistance("anyrouter", "anyouter"));
+    try testing.expectEqual(@as(usize, 3), editDistance("", "abc"));
+    try testing.expectEqual(@as(usize, 3), editDistance("abc", ""));
 }

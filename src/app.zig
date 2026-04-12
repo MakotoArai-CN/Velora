@@ -19,6 +19,14 @@ pub const claude_settings_filename = "settings.json";
 pub const opencode_config_dir_parts = &[_][]const u8{ ".config", "opencode" };
 pub const opencode_config_filename = "opencode.json";
 
+// Nanobot config
+pub const nanobot_config_dir = ".nanobot";
+pub const nanobot_config_filename = "config.json";
+
+// OpenClaw config
+pub const openclaw_config_dir = ".openclaw";
+pub const openclaw_config_filename = "openclaw.json";
+
 pub const github_repo = "MakotoArai-CN/Velora";
 pub const github_releases_url = "https://api.github.com/repos/" ++ github_repo ++ "/releases/latest";
 
@@ -29,6 +37,8 @@ pub const path_marker = "# velora PATH";
 pub const default_model_cc = "claude-opus-4-6";
 pub const default_model_cx = "gpt-5.4";
 pub const default_model_oc = "gpt-5.4";
+pub const default_model_nb = "gpt-5.4";
+pub const default_model_ow = "gpt-5.4";
 
 pub fn executableName() []const u8 {
     return switch (builtin.os.tag) {
