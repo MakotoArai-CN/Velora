@@ -17,6 +17,8 @@
 | `cx` | OpenAI Codex | `~/.codex/config.toml`（`base_url` + `OPENAI_API_KEY`） |
 | `cc` | Claude Code | `~/.claude/settings.json`（`ANTHROPIC_AUTH_TOKEN`） |
 | `oc` | OpenCode | `~/.config/opencode/opencode.json` |
+| `nb` | Nanobot | `~/.nanobot/config.json` |
+| `ow` | OpenClaw | `~/.openclaw/openclaw.json` |
 
 ## 构建
 
@@ -175,8 +177,7 @@ velora s ap off                              # 关闭类型不匹配时的自动
 
 ## 用户数据位置
 
-- `~/.velora/sites.json`：站点配置（类型、URL、API Key、主模型、按工具模型覆盖、归档状态）
-- `~/.velora/settings.json`：用户设置（model_check、list_latency、auto_archive、auto_pick_compatible_model 等）
+- `~/.velora/sites.json`：站点配置（类型、URL、API Key、主模型、按工具模型覆盖、归档状态、多工具默认设置）
 - `~/.velora/bin`：已安装的可执行文件
 
 ## LICENSE
