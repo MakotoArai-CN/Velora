@@ -71,6 +71,30 @@ pub const SiteSelectionMode = enum {
     }
 };
 
+pub const SortMode = enum {
+    time, // insertion order (default)
+    alpha, // alphabetical by alias name
+    tool, // group by site_type (cx, cc, oc, nb, ow)
+    model, // group by model family (openai, claude, unknown)
+
+    pub fn toString(self: SortMode) []const u8 {
+        return switch (self) {
+            .time => "time",
+            .alpha => "alpha",
+            .tool => "tool",
+            .model => "model",
+        };
+    }
+
+    pub fn fromString(s: []const u8) ?SortMode {
+        if (std.mem.eql(u8, s, "time")) return .time;
+        if (std.mem.eql(u8, s, "alpha")) return .alpha;
+        if (std.mem.eql(u8, s, "tool")) return .tool;
+        if (std.mem.eql(u8, s, "model")) return .model;
+        return null;
+    }
+};
+
 pub const Site = struct {
     site_type: SiteType,
     base_url: []const u8,
@@ -290,6 +314,7 @@ pub const Settings = struct {
     list_latency: bool = true, // enable latency check on 'list'
     auto_archive: bool = false, // enable auto-archive of unreachable sites
     auto_pick_compatible_model: bool = true, // auto-pick compatible model on target mismatch
+    list_sort: SortMode = .time, // default sort mode for 'list'
 };
 
 pub const SitesStore = struct {
@@ -487,6 +512,12 @@ pub fn loadSettings(allocator: std.mem.Allocator) Settings {
         if (std.mem.eql(u8, v, "false")) settings.auto_pick_compatible_model = false;
     }
 
+    const ls = env_mod.extractJsonValue(allocator, body[0 .. inner.len + 1], "list_sort") catch null;
+    defer if (ls) |s| allocator.free(s);
+    if (ls) |v| {
+        if (SortMode.fromString(v)) |mode| settings.list_sort = mode;
+    }
+
     return settings;
 }
 
@@ -519,7 +550,9 @@ pub fn saveSettings(allocator: std.mem.Allocator, settings: Settings) !void {
         try out.appendSlice(allocator, if (settings.auto_archive) "true" else "false");
         try out.appendSlice(allocator, ",\n    \"auto_pick_compatible_model\": ");
         try out.appendSlice(allocator, if (settings.auto_pick_compatible_model) "true" else "false");
-        try out.appendSlice(allocator, "\n  },\n  \"sites\": {}\n}\n");
+        try out.appendSlice(allocator, ",\n    \"list_sort\": \"");
+        try out.appendSlice(allocator, settings.list_sort.toString());
+        try out.appendSlice(allocator, "\"\n  },\n  \"sites\": {}\n}\n");
         const file = try std.fs.createFileAbsolute(path, .{});
         defer file.close();
         try file.writeAll(out.items);
@@ -529,19 +562,21 @@ pub fn saveSettings(allocator: std.mem.Allocator, settings: Settings) !void {
     const content = existing.items;
 
     // Build new settings block text
-    var settings_text_buf: [512]u8 = undefined;
+    var settings_text_buf: [640]u8 = undefined;
     const settings_text = std.fmt.bufPrint(&settings_text_buf,
         \\  "settings": {{
         \\    "model_check": {s},
         \\    "list_latency": {s},
         \\    "auto_archive": {s},
-        \\    "auto_pick_compatible_model": {s}
+        \\    "auto_pick_compatible_model": {s},
+        \\    "list_sort": "{s}"
         \\  }}
     , .{
         if (settings.model_check) "true" else "false",
         if (settings.list_latency) "true" else "false",
         if (settings.auto_archive) "true" else "false",
         if (settings.auto_pick_compatible_model) "true" else "false",
+        settings.list_sort.toString(),
     }) catch return;
 
     // Try to find and replace existing settings block
@@ -587,6 +622,81 @@ pub fn saveSettings(allocator: std.mem.Allocator, settings: Settings) !void {
     }
 }
 
+/// Helper: unescape a heap-allocated JSON string value in place.
+/// Since unescaping always produces output <= input length, this is safe.
+/// Returns the new (possibly shorter) slice into the same allocation.
+fn unescapeInPlace(s: []u8) []const u8 {
+    var pos: usize = 0;
+    var i: usize = 0;
+    while (i < s.len) {
+        if (s[i] == '\\' and i + 1 < s.len) {
+            const next = s[i + 1];
+            switch (next) {
+                '\\' => {
+                    s[pos] = '\\';
+                    pos += 1;
+                    i += 2;
+                },
+                '"' => {
+                    s[pos] = '"';
+                    pos += 1;
+                    i += 2;
+                },
+                'n' => {
+                    s[pos] = '\n';
+                    pos += 1;
+                    i += 2;
+                },
+                'r' => {
+                    s[pos] = '\r';
+                    pos += 1;
+                    i += 2;
+                },
+                't' => {
+                    s[pos] = '\t';
+                    pos += 1;
+                    i += 2;
+                },
+                'b' => {
+                    s[pos] = 0x08;
+                    pos += 1;
+                    i += 2;
+                },
+                'f' => {
+                    s[pos] = 0x0C;
+                    pos += 1;
+                    i += 2;
+                },
+                '/' => {
+                    s[pos] = '/';
+                    pos += 1;
+                    i += 2;
+                },
+                else => {
+                    s[pos] = s[i];
+                    pos += 1;
+                    i += 1;
+                },
+            }
+        } else {
+            s[pos] = s[i];
+            pos += 1;
+            i += 1;
+        }
+    }
+    return s[0..pos];
+}
+
+/// Unescape extracted JSON value (heap-allocated). Returns the original ptr
+/// with potentially shorter length. Caller must still free with original alloc size.
+fn unescapeExtracted(val: ?[]u8) ?[]const u8 {
+    if (val) |v| {
+        if (std.mem.indexOf(u8, v, "\\") == null) return v; // fast path: no escapes
+        return unescapeInPlace(v);
+    }
+    return null;
+}
+
 pub fn loadSites(allocator: std.mem.Allocator) !SitesStore {
     var store: SitesStore = .{};
     errdefer store.deinit(allocator);
@@ -621,11 +731,26 @@ pub fn loadSites(allocator: std.mem.Allocator) !SitesStore {
         // Find next quoted key (alias name)
         const q1 = std.mem.indexOf(u8, sites_inner[pos..], "\"") orelse break;
         const alias_start = pos + q1 + 1;
-        const q2 = std.mem.indexOf(u8, sites_inner[alias_start..], "\"") orelse break;
-        const alias = sites_inner[alias_start..][0..q2];
+        // Find closing quote, handling escaped quotes
+        var alias_end: usize = 0;
+        {
+            var ai: usize = 0;
+            while (ai < sites_inner[alias_start..].len) : (ai += 1) {
+                if (sites_inner[alias_start + ai] == '\\' and ai + 1 < sites_inner[alias_start..].len) {
+                    ai += 1;
+                    continue;
+                }
+                if (sites_inner[alias_start + ai] == '"') break;
+            }
+            alias_end = ai;
+        }
+        const raw_alias = sites_inner[alias_start..][0..alias_end];
+        // Unescape alias into stack buffer
+        var alias_unescape_buf: [256]u8 = undefined;
+        const alias = unescapeJsonString(&alias_unescape_buf, raw_alias);
 
         // Find the opening brace of this entry
-        const after_alias = sites_inner[alias_start + q2 + 1 ..];
+        const after_alias = sites_inner[alias_start + alias_end + 1 ..];
         const entry_brace = std.mem.indexOf(u8, after_alias, "{") orelse break;
         const entry_body = after_alias[entry_brace + 1 ..];
         const entry_inner = findMatchingBrace(entry_body) orelse break;
@@ -689,20 +814,40 @@ pub fn loadSites(allocator: std.mem.Allocator) !SitesStore {
                     if (m_ow.len > 0) allocator.free(m_ow);
                 }
 
+                // Unescape user-data fields (base_url, api_key, model) that may contain JSON escapes
+                var ue_url_buf: [1024]u8 = undefined;
+                var ue_key_buf: [1024]u8 = undefined;
+                var ue_model_buf: [512]u8 = undefined;
+                const ue_url: []const u8 = if (base_url) |v| unescapeJsonString(&ue_url_buf, v) else "";
+                const ue_key: []const u8 = if (api_key) |v| unescapeJsonString(&ue_key_buf, v) else "";
+                const ue_model: []const u8 = if (model) |v| unescapeJsonString(&ue_model_buf, v) else "";
+
+                // Unescape per-tool model overrides
+                var ue_mcx_buf: [256]u8 = undefined;
+                var ue_mcc_buf: [256]u8 = undefined;
+                var ue_moc_buf: [256]u8 = undefined;
+                var ue_mnb_buf: [256]u8 = undefined;
+                var ue_mow_buf: [256]u8 = undefined;
+                const ue_mcx: []const u8 = if (m_cx.len > 0) unescapeJsonString(&ue_mcx_buf, m_cx) else "";
+                const ue_mcc: []const u8 = if (m_cc.len > 0) unescapeJsonString(&ue_mcc_buf, m_cc) else "";
+                const ue_moc: []const u8 = if (m_oc.len > 0) unescapeJsonString(&ue_moc_buf, m_oc) else "";
+                const ue_mnb: []const u8 = if (m_nb.len > 0) unescapeJsonString(&ue_mnb_buf, m_nb) else "";
+                const ue_mow: []const u8 = if (m_ow.len > 0) unescapeJsonString(&ue_mow_buf, m_ow) else "";
+
                 var site = Site{
                     .site_type = stype,
-                    .base_url = base_url orelse "",
-                    .api_key = api_key orelse "",
-                    .model = model orelse "",
+                    .base_url = ue_url,
+                    .api_key = ue_key,
+                    .model = ue_model,
                     .archived = is_archived,
                     .default_tools_mask = default_tools_mask,
                     .selection_mode = selection_mode,
                     .last_used_tool = last_used_tool,
-                    .models_cx = m_cx,
-                    .models_cc = m_cc,
-                    .models_oc = m_oc,
-                    .models_nb = m_nb,
-                    .models_ow = m_ow,
+                    .models_cx = ue_mcx,
+                    .models_cc = ue_mcc,
+                    .models_oc = ue_moc,
+                    .models_nb = ue_mnb,
+                    .models_ow = ue_mow,
                 };
                 ensureSelectionState(&site);
                 store.addOrUpdate(allocator, alias, site) catch break;
@@ -768,15 +913,15 @@ pub fn saveSites(allocator: std.mem.Allocator, store: *const SitesStore) !void {
             try out.append(allocator, ',');
         }
         try out.appendSlice(allocator, "\n    \"");
-        try out.appendSlice(allocator, entry.alias);
+        try appendEscaped(&out, allocator, entry.alias);
         try out.appendSlice(allocator, "\": {\n      \"type\": \"");
         try out.appendSlice(allocator, entry.site.site_type.toString());
         try out.appendSlice(allocator, "\",\n      \"base_url\": \"");
-        try out.appendSlice(allocator, entry.site.base_url);
+        try appendEscaped(&out, allocator, entry.site.base_url);
         try out.appendSlice(allocator, "\",\n      \"api_key\": \"");
-        try out.appendSlice(allocator, entry.site.api_key);
+        try appendEscaped(&out, allocator, entry.site.api_key);
         try out.appendSlice(allocator, "\",\n      \"model\": \"");
-        try out.appendSlice(allocator, entry.site.effectiveModel());
+        try appendEscaped(&out, allocator, entry.site.effectiveModel());
         try out.append(allocator, '"');
 
         // Write archived flag if true
@@ -813,35 +958,35 @@ pub fn saveSites(allocator: std.mem.Allocator, store: *const SitesStore) !void {
             if (entry.site.models_cx.len > 0) {
                 if (!first) try out.append(allocator, ',');
                 try out.appendSlice(allocator, "\n        \"cx\": \"");
-                try out.appendSlice(allocator, entry.site.models_cx);
+                try appendEscaped(&out, allocator, entry.site.models_cx);
                 try out.append(allocator, '"');
                 first = false;
             }
             if (entry.site.models_cc.len > 0) {
                 if (!first) try out.append(allocator, ',');
                 try out.appendSlice(allocator, "\n        \"cc\": \"");
-                try out.appendSlice(allocator, entry.site.models_cc);
+                try appendEscaped(&out, allocator, entry.site.models_cc);
                 try out.append(allocator, '"');
                 first = false;
             }
             if (entry.site.models_oc.len > 0) {
                 if (!first) try out.append(allocator, ',');
                 try out.appendSlice(allocator, "\n        \"oc\": \"");
-                try out.appendSlice(allocator, entry.site.models_oc);
+                try appendEscaped(&out, allocator, entry.site.models_oc);
                 try out.append(allocator, '"');
                 first = false;
             }
             if (entry.site.models_nb.len > 0) {
                 if (!first) try out.append(allocator, ',');
                 try out.appendSlice(allocator, "\n        \"nb\": \"");
-                try out.appendSlice(allocator, entry.site.models_nb);
+                try appendEscaped(&out, allocator, entry.site.models_nb);
                 try out.append(allocator, '"');
                 first = false;
             }
             if (entry.site.models_ow.len > 0) {
                 if (!first) try out.append(allocator, ',');
                 try out.appendSlice(allocator, "\n        \"ow\": \"");
-                try out.appendSlice(allocator, entry.site.models_ow);
+                try appendEscaped(&out, allocator, entry.site.models_ow);
                 try out.append(allocator, '"');
                 first = false;
             }
@@ -894,6 +1039,154 @@ fn findMatchingBrace(content: []const u8) ?[]const u8 {
         }
     }
     return null;
+}
+
+/// Escape a string for safe embedding inside a JSON string value.
+/// Handles: \ → \\, " → \", control chars (newline, tab, etc.) → \n, \t, etc.
+/// Returns a slice of `buf` containing the escaped string.
+pub fn escapeJsonString(buf: []u8, input: []const u8) []const u8 {
+    var pos: usize = 0;
+    for (input) |ch| {
+        switch (ch) {
+            '\\' => {
+                if (pos + 2 > buf.len) break;
+                buf[pos] = '\\';
+                buf[pos + 1] = '\\';
+                pos += 2;
+            },
+            '"' => {
+                if (pos + 2 > buf.len) break;
+                buf[pos] = '\\';
+                buf[pos + 1] = '"';
+                pos += 2;
+            },
+            '\n' => {
+                if (pos + 2 > buf.len) break;
+                buf[pos] = '\\';
+                buf[pos + 1] = 'n';
+                pos += 2;
+            },
+            '\r' => {
+                if (pos + 2 > buf.len) break;
+                buf[pos] = '\\';
+                buf[pos + 1] = 'r';
+                pos += 2;
+            },
+            '\t' => {
+                if (pos + 2 > buf.len) break;
+                buf[pos] = '\\';
+                buf[pos + 1] = 't';
+                pos += 2;
+            },
+            0x08 => { // backspace
+                if (pos + 2 > buf.len) break;
+                buf[pos] = '\\';
+                buf[pos + 1] = 'b';
+                pos += 2;
+            },
+            0x0C => { // form feed
+                if (pos + 2 > buf.len) break;
+                buf[pos] = '\\';
+                buf[pos + 1] = 'f';
+                pos += 2;
+            },
+            else => {
+                if (pos + 1 > buf.len) break;
+                buf[pos] = ch;
+                pos += 1;
+            },
+        }
+    }
+    return buf[0..pos];
+}
+
+/// Unescape a JSON string value: \\ → \, \" → ", \n → newline, etc.
+/// Returns a slice of `buf` containing the unescaped string.
+pub fn unescapeJsonString(buf: []u8, input: []const u8) []const u8 {
+    var pos: usize = 0;
+    var i: usize = 0;
+    while (i < input.len) {
+        if (pos >= buf.len) break;
+        if (input[i] == '\\' and i + 1 < input.len) {
+            const next = input[i + 1];
+            switch (next) {
+                '\\' => {
+                    buf[pos] = '\\';
+                    pos += 1;
+                    i += 2;
+                },
+                '"' => {
+                    buf[pos] = '"';
+                    pos += 1;
+                    i += 2;
+                },
+                'n' => {
+                    buf[pos] = '\n';
+                    pos += 1;
+                    i += 2;
+                },
+                'r' => {
+                    buf[pos] = '\r';
+                    pos += 1;
+                    i += 2;
+                },
+                't' => {
+                    buf[pos] = '\t';
+                    pos += 1;
+                    i += 2;
+                },
+                'b' => {
+                    buf[pos] = 0x08;
+                    pos += 1;
+                    i += 2;
+                },
+                'f' => {
+                    buf[pos] = 0x0C;
+                    pos += 1;
+                    i += 2;
+                },
+                '/' => {
+                    buf[pos] = '/';
+                    pos += 1;
+                    i += 2;
+                },
+                else => {
+                    // Unknown escape: keep as-is
+                    buf[pos] = input[i];
+                    pos += 1;
+                    i += 1;
+                },
+            }
+        } else {
+            buf[pos] = input[i];
+            pos += 1;
+            i += 1;
+        }
+    }
+    return buf[0..pos];
+}
+
+/// Check if a string contains characters that need JSON escaping.
+pub fn needsJsonEscape(input: []const u8) bool {
+    for (input) |ch| {
+        switch (ch) {
+            '\\', '"', '\n', '\r', '\t', 0x08, 0x0C => return true,
+            else => {},
+        }
+    }
+    return false;
+}
+
+/// Helper: escape and append a JSON string value to an output list.
+/// Uses a stack buffer for escaping, falls back to raw if buffer too small.
+fn appendEscaped(out: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, input: []const u8) !void {
+    if (!needsJsonEscape(input)) {
+        try out.appendSlice(allocator, input);
+        return;
+    }
+    var esc_buf: [2048]u8 = undefined;
+    const escaped = escapeJsonString(&esc_buf, input);
+    try out.appendSlice(allocator, escaped);
 }
 
 pub fn maskKey(buf: []u8, key: []const u8) []const u8 {
@@ -976,4 +1269,45 @@ test "remove frees entry and shifts remaining sites" {
     try std.testing.expectEqual(@as(usize, 1), store.count);
     try std.testing.expect(store.getSite("smartprobe") == null);
     try std.testing.expect(store.getSite("smartprobe2") != null);
+}
+
+test "escapeJsonString escapes backslash and quote" {
+    var buf: [256]u8 = undefined;
+    const result = escapeJsonString(&buf, "hello\\world\"test");
+    try std.testing.expectEqualStrings("hello\\\\world\\\"test", result);
+}
+
+test "escapeJsonString escapes control characters" {
+    var buf: [256]u8 = undefined;
+    const result = escapeJsonString(&buf, "line1\nline2\ttab");
+    try std.testing.expectEqualStrings("line1\\nline2\\ttab", result);
+}
+
+test "escapeJsonString passthrough clean string" {
+    var buf: [256]u8 = undefined;
+    const result = escapeJsonString(&buf, "sk-abc123");
+    try std.testing.expectEqualStrings("sk-abc123", result);
+}
+
+test "unescapeJsonString round-trip" {
+    var esc_buf: [256]u8 = undefined;
+    var unesc_buf: [256]u8 = undefined;
+    const original = "key\\with\"quotes\nand\tnewlines";
+    const escaped = escapeJsonString(&esc_buf, original);
+    const unescaped = unescapeJsonString(&unesc_buf, escaped);
+    try std.testing.expectEqualStrings(original, unescaped);
+}
+
+test "unescapeJsonString clean string unchanged" {
+    var buf: [256]u8 = undefined;
+    const result = unescapeJsonString(&buf, "hello world");
+    try std.testing.expectEqualStrings("hello world", result);
+}
+
+test "needsJsonEscape detects special chars" {
+    try std.testing.expect(needsJsonEscape("has\\backslash"));
+    try std.testing.expect(needsJsonEscape("has\"quote"));
+    try std.testing.expect(needsJsonEscape("has\nnewline"));
+    try std.testing.expect(!needsJsonEscape("clean-string"));
+    try std.testing.expect(!needsJsonEscape("sk-abc123"));
 }

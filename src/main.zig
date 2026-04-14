@@ -410,10 +410,24 @@ fn runList(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermC
 
     const settings = sites_mod.loadSettings(allocator);
 
+    // Build list of indices (used for both -a and normal views)
+    var all_indices: [64]usize = undefined;
+    var all_count: usize = 0;
+    for (0..store.count) |i| {
+        all_indices[all_count] = i;
+        all_count += 1;
+    }
+
+    // Determine sort mode early so it applies to -a view too
+    const sort_mode = args.sort_mode orelse settings.list_sort;
+    if (sort_mode != .time and all_count > 1) {
+        sortIndices(all_indices[0..all_count], &store, sort_mode);
+    }
+
     if (args.show_all) {
         // Detailed view - single column, show base_url + masked api_key + archived status
-        for (0..store.count) |i| {
-            const entry = store.entries[i];
+        for (0..all_count) |ci| {
+            const entry = store.entries[all_indices[ci]];
             try w.print("\n", .{});
 
             var alias_buf: [128]u8 = undefined;
@@ -437,21 +451,22 @@ fn runList(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermC
         return;
     }
 
-    // Build list of indices to check
+    // Build list of indices to check (filtered for non-archived unless -g)
     var check_indices: [64]usize = undefined;
     var check_count: usize = 0;
 
     if (args.global_check) {
-        // -g: check ALL sites including archived
-        for (0..store.count) |i| {
-            check_indices[check_count] = i;
+        // -g: check ALL sites including archived (already sorted)
+        for (0..all_count) |ci| {
+            check_indices[check_count] = all_indices[ci];
             check_count += 1;
         }
     } else {
-        // Normal: only non-archived sites
-        for (0..store.count) |i| {
-            if (!store.entries[i].site.archived) {
-                check_indices[check_count] = i;
+        // Normal: only non-archived sites (already sorted)
+        for (0..all_count) |ci| {
+            const idx = all_indices[ci];
+            if (!store.entries[idx].site.archived) {
+                check_indices[check_count] = idx;
                 check_count += 1;
             }
         }
@@ -548,6 +563,44 @@ fn runList(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermC
 
     try output.printSeparator(w, caps);
     try w.flush();
+}
+
+/// Sort site indices using insertion sort (stable, O(n²) but n ≤ 64).
+fn sortIndices(indices: []usize, store: *const sites_mod.SitesStore, mode: sites_mod.SortMode) void {
+    if (indices.len <= 1) return;
+    var i: usize = 1;
+    while (i < indices.len) : (i += 1) {
+        const key = indices[i];
+        var j: usize = i;
+        while (j > 0 and compareEntries(store, indices[j - 1], key, mode) == .gt) {
+            indices[j] = indices[j - 1];
+            j -= 1;
+        }
+        indices[j] = key;
+    }
+}
+
+fn compareEntries(store: *const sites_mod.SitesStore, a_idx: usize, b_idx: usize, mode: sites_mod.SortMode) std.math.Order {
+    const ea = store.entries[a_idx];
+    const eb = store.entries[b_idx];
+    return switch (mode) {
+        .time => .eq, // preserve original insertion order
+        .alpha => std.mem.order(u8, ea.alias, eb.alias),
+        .tool => blk: {
+            const ta = @intFromEnum(ea.site.site_type);
+            const tb = @intFromEnum(eb.site.site_type);
+            if (ta != tb) break :blk std.math.order(ta, tb);
+            // Within same tool type, sub-sort by alias
+            break :blk std.mem.order(u8, ea.alias, eb.alias);
+        },
+        .model => blk: {
+            const fa = @intFromEnum(check_mod.classifyModelFamily(ea.site.effectiveModel()));
+            const fb = @intFromEnum(check_mod.classifyModelFamily(eb.site.effectiveModel()));
+            if (fa != fb) break :blk std.math.order(fa, fb);
+            // Within same model family, sub-sort by alias
+            break :blk std.mem.order(u8, ea.alias, eb.alias);
+        },
+    };
 }
 
 fn printSitePendingLine(w: *std.Io.Writer, caps: terminal.TermCaps, alias: []const u8, site_type: sites_mod.SiteType) !void {
@@ -891,51 +944,68 @@ fn runSet(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCa
     const key = args.key;
     const value = args.value;
 
-    // Parse boolean value
-    const bool_val = if (std.mem.eql(u8, value, "on") or std.mem.eql(u8, value, "true") or std.mem.eql(u8, value, "1"))
-        true
-    else if (std.mem.eql(u8, value, "off") or std.mem.eql(u8, value, "false") or std.mem.eql(u8, value, "0"))
-        false
-    else {
-        try output.printError(w, i18n.tr(lang, "Invalid value. Use on/off, true/false, or 1/0", "无效值，请使用 on/off、true/false 或 1/0", "無効な値です。on/off、true/false、1/0 を使用してください"), caps);
-        try w.flush();
-        return;
-    };
+    // Handle list_sort separately (string value, not boolean)
+    if (std.mem.eql(u8, key, "list_sort")) {
+        if (sites_mod.SortMode.fromString(value)) |mode| {
+            settings.list_sort = mode;
+            try sites_mod.saveSettings(allocator, settings);
 
-    if (std.mem.eql(u8, key, "model_check")) {
-        settings.model_check = bool_val;
-    } else if (std.mem.eql(u8, key, "list_latency")) {
-        settings.list_latency = bool_val;
-    } else if (std.mem.eql(u8, key, "auto_archive")) {
-        settings.auto_archive = bool_val;
-    } else if (std.mem.eql(u8, key, "auto_pick_compatible_model")) {
-        settings.auto_pick_compatible_model = bool_val;
+            var msg_buf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrint(&msg_buf, "{s} = {s}", .{ key, mode.toString() }) catch "Updated";
+            try output.printSuccess(w, msg, caps);
+        } else {
+            try output.printError(w, i18n.tr(lang, "Invalid sort mode. Use: time, alpha, tool, model", "无效排序模式，请使用: time, alpha, tool, model", "無効なソートモードです。time, alpha, tool, model を使用してください"), caps);
+            try w.flush();
+            return;
+        }
     } else {
-        var err_buf: [256]u8 = undefined;
-        const err_msg = std.fmt.bufPrint(&err_buf, "{s}: '{s}'. {s}: model_check, list_latency, auto_archive, auto_pick_compatible_model", .{
-            i18n.tr(lang, "Unknown setting", "未知设置项", "不明な設定"),
+        // Parse boolean value for other settings
+        const bool_val = if (std.mem.eql(u8, value, "on") or std.mem.eql(u8, value, "true") or std.mem.eql(u8, value, "1"))
+            true
+        else if (std.mem.eql(u8, value, "off") or std.mem.eql(u8, value, "false") or std.mem.eql(u8, value, "0"))
+            false
+        else {
+            try output.printError(w, i18n.tr(lang, "Invalid value. Use on/off, true/false, or 1/0", "无效值，请使用 on/off、true/false 或 1/0", "無効な値です。on/off、true/false、1/0 を使用してください"), caps);
+            try w.flush();
+            return;
+        };
+
+        if (std.mem.eql(u8, key, "model_check")) {
+            settings.model_check = bool_val;
+        } else if (std.mem.eql(u8, key, "list_latency")) {
+            settings.list_latency = bool_val;
+        } else if (std.mem.eql(u8, key, "auto_archive")) {
+            settings.auto_archive = bool_val;
+        } else if (std.mem.eql(u8, key, "auto_pick_compatible_model")) {
+            settings.auto_pick_compatible_model = bool_val;
+        } else {
+            var err_buf: [256]u8 = undefined;
+            const err_msg = std.fmt.bufPrint(&err_buf, "{s}: '{s}'. {s}: model_check, list_latency, auto_archive, auto_pick_compatible_model, list_sort", .{
+                i18n.tr(lang, "Unknown setting", "未知设置项", "不明な設定"),
+                key,
+                i18n.tr(lang, "Available", "可用", "利用可能"),
+            }) catch "Unknown setting";
+            try output.printError(w, err_msg, caps);
+            try w.flush();
+            return;
+        }
+
+        try sites_mod.saveSettings(allocator, settings);
+
+        var msg_buf: [128]u8 = undefined;
+        const msg = std.fmt.bufPrint(&msg_buf, "{s} = {s}", .{
             key,
-            i18n.tr(lang, "Available", "可用", "利用可能"),
-        }) catch "Unknown setting";
-        try output.printError(w, err_msg, caps);
-        try w.flush();
-        return;
+            if (bool_val) "on" else "off",
+        }) catch "Updated";
+        try output.printSuccess(w, msg, caps);
     }
-
-    try sites_mod.saveSettings(allocator, settings);
-
-    var msg_buf: [128]u8 = undefined;
-    const msg = std.fmt.bufPrint(&msg_buf, "{s} = {s}", .{
-        key,
-        if (bool_val) "on" else "off",
-    }) catch "Updated";
-    try output.printSuccess(w, msg, caps);
 
     // Show all current settings
     try output.printKeyValue(w, "  model_check:", if (settings.model_check) "on" else "off", caps);
     try output.printKeyValue(w, "  list_latency:", if (settings.list_latency) "on" else "off", caps);
     try output.printKeyValue(w, "  auto_archive:", if (settings.auto_archive) "on" else "off", caps);
     try output.printKeyValue(w, "  auto_pick_compatible_model:", if (settings.auto_pick_compatible_model) "on" else "off", caps);
+    try output.printKeyValue(w, "  list_sort:", settings.list_sort.toString(), caps);
     try w.flush();
 }
 

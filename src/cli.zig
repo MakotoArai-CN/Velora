@@ -26,6 +26,7 @@ pub const DelArgs = struct {
 pub const ListArgs = struct {
     show_all: bool = false,
     global_check: bool = false, // -g flag for global check including archived
+    sort_mode: ?sites.SortMode = null, // CLI override for sort mode
 };
 
 pub const UseArgs = struct {
@@ -166,11 +167,26 @@ pub fn parseArgs(_: std.mem.Allocator) ParseError!Config {
         }
         var show_all = false;
         var global_check = false;
-        for (rest) |arg| {
-            if (eql(arg, "all")) show_all = true;
-            if (eql(arg, "-g") or eql(arg, "--global")) global_check = true;
+        var sort_mode: ?sites.SortMode = null;
+        var i_rest: usize = 0;
+        while (i_rest < rest.len) : (i_rest += 1) {
+            const arg = rest[i_rest];
+            if (eql(arg, "all")) {
+                show_all = true;
+            } else if (eql(arg, "-g") or eql(arg, "--global")) {
+                global_check = true;
+            } else if (eql(arg, "-s") or eql(arg, "--sort")) {
+                // -s <mode> or --sort <mode>
+                if (i_rest + 1 < rest.len) {
+                    sort_mode = sites.SortMode.fromString(rest[i_rest + 1]);
+                    i_rest += 1;
+                }
+            } else if (std.mem.startsWith(u8, arg, "--sort=")) {
+                // --sort=<mode>
+                sort_mode = sites.SortMode.fromString(arg[7..]);
+            }
         }
-        config.command = .{ .list = .{ .show_all = show_all, .global_check = global_check } };
+        config.command = .{ .list = .{ .show_all = show_all, .global_check = global_check, .sort_mode = sort_mode } };
     } else if (eql(sub, "cx") or eql(sub, "codex")) {
         if (rest.len > 0 and isHelpArg(rest[0])) {
             printHelp(lang);
@@ -306,6 +322,7 @@ fn expandSettingKey(s: []const u8) []const u8 {
     if (eql(s, "ll")) return "list_latency";
     if (eql(s, "aa")) return "auto_archive";
     if (eql(s, "ap")) return "auto_pick_compatible_model";
+    if (eql(s, "ls") or eql(s, "sort")) return "list_sort";
     return s;
 }
 
@@ -337,6 +354,7 @@ fn printHelp(lang: i18n.Language) void {
         \\  list                               显示站点列表（含连通性检测）
         \\  list -g                            全局检测（含已归档站点）
         \\  list all                           显示详细站点信息
+        \\  list --sort=<模式>                 排序: time, alpha, tool, model
         \\  use <别名> [模型]                  自动应用站点（根据类型）
         \\  use <类型> <别名> [模型]           应用站点到指定工具，可覆盖模型
         \\  cx use <别名> [模型]               应用站点到 Codex
@@ -345,13 +363,14 @@ fn printHelp(lang: i18n.Language) void {
         \\  nb use <别名> [模型]               应用站点到 Nanobot
         \\  ow use <别名> [模型]               应用站点到 OpenClaw
         \\  models|m <别名>                    浏览站点支持的全部模型
-        \\  set|s <选项> <on/off>              设置选项开关
+        \\  set|s <选项> <on/off|值>           设置选项开关
         \\
         \\设置选项 (缩写):
         \\  model_check (mc)                   模型检测 (默认: on)
         \\  list_latency (ll)                  列表延迟检测 (默认: on)
         \\  auto_archive (aa)                  自动归档不可用站点 (默认: off)
         \\  auto_pick_compatible_model (ap)    类型不匹配时自动选择兼容模型 (默认: on)
+        \\  list_sort (ls)                     列表排序: time, alpha, tool, model (默认: time)
         \\
         \\类型:
         \\  cx    Codex (OPENAI_API_KEY)
@@ -383,9 +402,12 @@ fn printHelp(lang: i18n.Language) void {
         \\  velora s aa on
         \\  velora s ap off
         \\  velora s ap on
+        \\  velora s ls alpha
         \\  velora list
         \\  velora list -g
         \\  velora list all
+        \\  velora list --sort=alpha
+        \\  velora list -s tool
         \\  velora edit openai
         \\  velora del openai
         \\
@@ -401,6 +423,7 @@ fn printHelp(lang: i18n.Language) void {
         \\  list                                  サイト一覧表示（接続確認付き）
         \\  list -g                               グローバル検出（アーカイブ含む）
         \\  list all                              サイト詳細表示
+        \\  list --sort=<モード>                  ソート: time, alpha, tool, model
         \\  use <エイリアス> [モデル]              サイトを自動適用（タイプに基づく）
         \\  use <タイプ> <エイリアス> [モデル]     指定ツールに適用し、モデルを上書き可能
         \\  cx use <エイリアス> [モデル]           サイトをCodexに適用
@@ -409,13 +432,14 @@ fn printHelp(lang: i18n.Language) void {
         \\  nb use <エイリアス> [モデル]           サイトをNanobotに適用
         \\  ow use <エイリアス> [モデル]           サイトをOpenClawに適用
         \\  models|m <エイリアス>                  サイトの全モデルを表示
-        \\  set|s <項目> <on/off>                 設定の切り替え
+        \\  set|s <項目> <on/off|値>              設定の切り替え
         \\
         \\設定項目 (略称):
         \\  model_check (mc)                      モデル検出 (デフォルト: on)
         \\  list_latency (ll)                     リスト遅延チェック (デフォルト: on)
         \\  auto_archive (aa)                     不可用サイト自動アーカイブ (デフォルト: off)
         \\  auto_pick_compatible_model (ap)       タイプ不一致時に互換モデルを自動選択 (デフォルト: on)
+        \\  list_sort (ls)                        リストソート: time, alpha, tool, model (デフォルト: time)
         \\
         \\タイプ:
         \\  cx    Codex (OPENAI_API_KEY)
@@ -447,9 +471,12 @@ fn printHelp(lang: i18n.Language) void {
         \\  velora s aa on
         \\  velora s ap off
         \\  velora s ap on
+        \\  velora s ls alpha
         \\  velora list
         \\  velora list -g
         \\  velora list all
+        \\  velora list --sort=alpha
+        \\  velora list -s tool
         \\  velora edit openai
         \\  velora del openai
         \\
@@ -465,6 +492,7 @@ fn printHelp(lang: i18n.Language) void {
         \\  list                               List sites with connectivity check
         \\  list -g                            Global check (including archived)
         \\  list all                           List sites with full details
+        \\  list --sort=<mode>                 Sort: time, alpha, tool, model
         \\  use <alias> [model]                Apply site config (auto-detect type)
         \\  use <type> <alias> [model]         Apply to a target tool and optionally override model
         \\  cx use <alias> [model]             Apply site config to Codex
@@ -473,13 +501,14 @@ fn printHelp(lang: i18n.Language) void {
         \\  nb use <alias> [model]             Apply site config to Nanobot
         \\  ow use <alias> [model]             Apply site config to OpenClaw
         \\  models|m <alias>                   Browse all models for a site
-        \\  set|s <option> <on/off>            Toggle settings
+        \\  set|s <option> <on/off|value>      Toggle settings
         \\
         \\Settings (shorthand):
         \\  model_check (mc)                   Model detection on use (default: on)
         \\  list_latency (ll)                  Latency check on list (default: on)
         \\  auto_archive (aa)                  Auto-archive unreachable sites (default: off)
         \\  auto_pick_compatible_model (ap)    Auto-pick compatible model on type mismatch (default: on)
+        \\  list_sort (ls)                     List sort: time, alpha, tool, model (default: time)
         \\
         \\Types:
         \\  cx    Codex (OPENAI_API_KEY)
@@ -511,9 +540,12 @@ fn printHelp(lang: i18n.Language) void {
         \\  velora s aa on
         \\  velora s ap off
         \\  velora s ap on
+        \\  velora s ls alpha
         \\  velora list
         \\  velora list -g
         \\  velora list all
+        \\  velora list --sort=alpha
+        \\  velora list -s tool
         \\  velora edit openai
         \\  velora del openai
         \\

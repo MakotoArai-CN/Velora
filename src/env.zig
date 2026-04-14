@@ -369,10 +369,32 @@ pub fn extractJsonValue(allocator: std.mem.Allocator, content: []const u8, field
     const after_key = content[key_pos + search_key.len ..];
     const colon_pos = std.mem.indexOf(u8, after_key, ":") orelse return error.NotFound;
     const after_colon = after_key[colon_pos + 1 ..];
+
+    // Handle non-string values (booleans, numbers)
+    const trimmed = std.mem.trimLeft(u8, after_colon, " \t\r\n");
+    if (trimmed.len > 0 and trimmed[0] != '"') {
+        // Non-string value: read until comma, }, or newline
+        var end: usize = 0;
+        while (end < trimmed.len and trimmed[end] != ',' and trimmed[end] != '}' and trimmed[end] != '\n') : (end += 1) {}
+        const val = std.mem.trim(u8, trimmed[0..end], " \t\r\n");
+        if (val.len == 0) return error.EmptyValue;
+        return try allocator.dupe(u8, val);
+    }
+
     const q1 = std.mem.indexOf(u8, after_colon, "\"") orelse return error.NotFound;
     const val_start = after_colon[q1 + 1 ..];
-    const q2 = std.mem.indexOf(u8, val_start, "\"") orelse return error.NotFound;
-    const val = val_start[0..q2];
+
+    // Find closing quote, skipping escaped quotes (\")
+    var i: usize = 0;
+    while (i < val_start.len) : (i += 1) {
+        if (val_start[i] == '\\' and i + 1 < val_start.len) {
+            i += 1; // skip escaped character
+            continue;
+        }
+        if (val_start[i] == '"') break;
+    }
+    if (i >= val_start.len) return error.NotFound;
+    const val = val_start[0..i];
 
     if (val.len == 0) return error.EmptyValue;
     return try allocator.dupe(u8, val);
