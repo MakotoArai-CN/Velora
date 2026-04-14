@@ -8,17 +8,6 @@ const output = @import("output.zig");
 const terminal = @import("terminal.zig");
 const i18n = @import("i18n.zig");
 
-/// Helper: escape and append a JSON string value to an output list.
-fn appendEscapedJson(out: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, input: []const u8) !void {
-    if (!sites_mod.needsJsonEscape(input)) {
-        try out.appendSlice(allocator, input);
-        return;
-    }
-    var esc_buf: [2048]u8 = undefined;
-    const escaped = sites_mod.escapeJsonString(&esc_buf, input);
-    try out.appendSlice(allocator, escaped);
-}
-
 /// Apply a site's configuration to Codex.
 /// Updates ~/.codex/config.toml base_url and sets the OPENAI_API_KEY env var.
 pub fn applyToCodex(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCaps, lang: i18n.Language, site: sites_mod.Site, tool_model: []const u8) !void {
@@ -280,11 +269,11 @@ fn updateClaudeSettings(allocator: std.mem.Allocator, api_key: []const u8, base_
         var result: std.ArrayListUnmanaged(u8) = .empty;
         defer result.deinit(allocator);
         try result.appendSlice(allocator, "{\n  \"env\": {\n    \"ANTHROPIC_AUTH_TOKEN\": \"");
-        try appendEscapedJson(&result, allocator, api_key);
+        try result.appendSlice(allocator, api_key);
         try result.appendSlice(allocator, "\",\n    \"ANTHROPIC_BASE_URL\": \"");
-        try appendEscapedJson(&result, allocator, base_url);
+        try result.appendSlice(allocator, base_url);
         try result.appendSlice(allocator, "\"\n  },\n  \"model\": \"");
-        try appendEscapedJson(&result, allocator, model);
+        try result.appendSlice(allocator, model);
         try result.appendSlice(allocator, "\"\n}\n");
 
         // Ensure directory exists
@@ -352,12 +341,12 @@ fn updateClaudeSettings(allocator: std.mem.Allocator, api_key: []const u8, base_
                 if (!auth_token_found or !base_url_found) {
                     if (!auth_token_found) {
                         try result.appendSlice(allocator, "    \"ANTHROPIC_AUTH_TOKEN\": \"");
-                        try appendEscapedJson(&result, allocator, api_key);
+                        try result.appendSlice(allocator, api_key);
                         try result.appendSlice(allocator, "\",\n");
                     }
                     if (!base_url_found) {
                         try result.appendSlice(allocator, "    \"ANTHROPIC_BASE_URL\": \"");
-                        try appendEscapedJson(&result, allocator, base_url);
+                        try result.appendSlice(allocator, base_url);
                         try result.appendSlice(allocator, "\",\n");
                     }
                 }
@@ -370,7 +359,7 @@ fn updateClaudeSettings(allocator: std.mem.Allocator, api_key: []const u8, base_
             // Replace ANTHROPIC_AUTH_TOKEN value
             if (std.mem.indexOf(u8, trimmed, "\"ANTHROPIC_AUTH_TOKEN\"") != null) {
                 try result.appendSlice(allocator, "    \"ANTHROPIC_AUTH_TOKEN\": \"");
-                try appendEscapedJson(&result, allocator, api_key);
+                try result.appendSlice(allocator, api_key);
                 // Check if line has trailing comma
                 if (trimmed.len > 0 and trimmed[trimmed.len - 1] == ',') {
                     try result.appendSlice(allocator, "\",\n");
@@ -384,7 +373,7 @@ fn updateClaudeSettings(allocator: std.mem.Allocator, api_key: []const u8, base_
             // Replace ANTHROPIC_BASE_URL value
             if (std.mem.indexOf(u8, trimmed, "\"ANTHROPIC_BASE_URL\"") != null) {
                 try result.appendSlice(allocator, "    \"ANTHROPIC_BASE_URL\": \"");
-                try appendEscapedJson(&result, allocator, base_url);
+                try result.appendSlice(allocator, base_url);
                 if (trimmed.len > 0 and trimmed[trimmed.len - 1] == ',') {
                     try result.appendSlice(allocator, "\",\n");
                 } else {
@@ -518,12 +507,12 @@ fn updateOpenCodeConfig(allocator: std.mem.Allocator, api_key: []const u8, base_
                 // Inject missing keys before closing brace
                 if (!base_url_found) {
                     try result.appendSlice(allocator, "        \"baseURL\": \"");
-                    try appendEscapedJson(&result, allocator, base_url);
+                    try result.appendSlice(allocator, base_url);
                     try result.appendSlice(allocator, "\",\n");
                 }
                 if (!api_key_found) {
                     try result.appendSlice(allocator, "        \"apiKey\": \"");
-                    try appendEscapedJson(&result, allocator, api_key);
+                    try result.appendSlice(allocator, api_key);
                     try result.appendSlice(allocator, "\"\n");
                 }
                 try result.appendSlice(allocator, line);
@@ -535,7 +524,7 @@ fn updateOpenCodeConfig(allocator: std.mem.Allocator, api_key: []const u8, base_
             if (std.mem.indexOf(u8, trimmed, "\"baseURL\"") != null) {
                 const trailing_comma = trimmed.len > 0 and trimmed[trimmed.len - 1] == ',';
                 try result.appendSlice(allocator, "        \"baseURL\": \"");
-                try appendEscapedJson(&result, allocator, base_url);
+                try result.appendSlice(allocator, base_url);
                 try result.appendSlice(allocator, if (trailing_comma) "\"," else "\"");
                 if (line_iter.peek() != null) try result.append(allocator, '\n');
                 base_url_found = true;
@@ -546,7 +535,7 @@ fn updateOpenCodeConfig(allocator: std.mem.Allocator, api_key: []const u8, base_
             if (std.mem.indexOf(u8, trimmed, "\"apiKey\"") != null) {
                 const trailing_comma = trimmed.len > 0 and trimmed[trimmed.len - 1] == ',';
                 try result.appendSlice(allocator, "        \"apiKey\": \"");
-                try appendEscapedJson(&result, allocator, api_key);
+                try result.appendSlice(allocator, api_key);
                 try result.appendSlice(allocator, if (trailing_comma) "\"," else "\"");
                 if (line_iter.peek() != null) try result.append(allocator, '\n');
                 api_key_found = true;
@@ -577,10 +566,10 @@ fn writeNewOpenCodeConfig(allocator: std.mem.Allocator, path: []const u8, api_ke
         "      \"options\": {\n"
     );
     try out.appendSlice(allocator, "        \"baseURL\": \"");
-    try appendEscapedJson(&out, allocator, base_url);
+    try out.appendSlice(allocator, base_url);
     try out.appendSlice(allocator, "\",\n");
     try out.appendSlice(allocator, "        \"apiKey\": \"");
-    try appendEscapedJson(&out, allocator, api_key);
+    try out.appendSlice(allocator, api_key);
     try out.appendSlice(allocator, "\"\n");
     try out.appendSlice(allocator,
         "      }\n" ++
@@ -588,7 +577,7 @@ fn writeNewOpenCodeConfig(allocator: std.mem.Allocator, path: []const u8, api_ke
         "  },\n" ++
         "  \"model\": \""
     );
-    try appendEscapedJson(&out, allocator, model);
+    try out.appendSlice(allocator, model);
     try out.appendSlice(allocator,
         "\",\n" ++
         "  \"$schema\": \"https://opencode.ai/config.json\"\n" ++
@@ -779,7 +768,7 @@ fn updateNanobotConfig(allocator: std.mem.Allocator, api_key: []const u8, base_u
                 @memset(indent, ' ');
                 try result.appendSlice(allocator, indent);
                 try result.appendSlice(allocator, "\"apiKey\": \"");
-                try appendEscapedJson(&result, allocator, api_key);
+                try result.appendSlice(allocator, api_key);
                 try result.appendSlice(allocator, if (trailing_comma) "\"," else "\"");
                 if (line_iter.peek() != null) try result.append(allocator, '\n');
                 continue;
@@ -801,7 +790,7 @@ fn updateNanobotConfig(allocator: std.mem.Allocator, api_key: []const u8, base_u
                 @memset(indent, ' ');
                 try result.appendSlice(allocator, indent);
                 try result.appendSlice(allocator, "\"apiBase\": \"");
-                try appendEscapedJson(&result, allocator, base_url);
+                try result.appendSlice(allocator, base_url);
                 try result.appendSlice(allocator, if (trailing_comma) "\"," else "\"");
                 if (line_iter.peek() != null) try result.append(allocator, '\n');
                 continue;
@@ -861,11 +850,11 @@ fn writeNewNanobotConfig(allocator: std.mem.Allocator, path: []const u8, api_key
         std.fmt.bufPrint(&model_val_buf, "openai/{s}", .{model}) catch model;
 
     try out.appendSlice(allocator, "{\n  \"agents\": {\n    \"defaults\": {\n      \"model\": \"");
-    try appendEscapedJson(&out, allocator, model_val);
+    try out.appendSlice(allocator, model_val);
     try out.appendSlice(allocator, "\",\n      \"provider\": \"auto\"\n    }\n  },\n  \"providers\": {\n    \"openai\": {\n      \"apiKey\": \"");
-    try appendEscapedJson(&out, allocator, api_key);
+    try out.appendSlice(allocator, api_key);
     try out.appendSlice(allocator, "\",\n      \"apiBase\": \"");
-    try appendEscapedJson(&out, allocator, base_url);
+    try out.appendSlice(allocator, base_url);
     try out.appendSlice(allocator, "\",\n      \"extraHeaders\": null\n    }\n  }\n}\n");
 
     const file = try std.fs.createFileAbsolute(path, .{});
@@ -956,7 +945,7 @@ fn updateOpenClawConfig(allocator: std.mem.Allocator, api_key: []const u8, base_
             if (std.mem.indexOf(u8, trimmed, "\"apiKey\"") != null) {
                 const trailing_comma = trimmed.len > 0 and trimmed[trimmed.len - 1] == ',';
                 try result.appendSlice(allocator, "        \"apiKey\": \"");
-                try appendEscapedJson(&result, allocator, api_key);
+                try result.appendSlice(allocator, api_key);
                 try result.append(allocator, '"');
                 if (trailing_comma) try result.append(allocator, ',');
                 if (line_iter.peek() != null) try result.append(allocator, '\n');
@@ -965,7 +954,7 @@ fn updateOpenClawConfig(allocator: std.mem.Allocator, api_key: []const u8, base_
             if (std.mem.indexOf(u8, trimmed, "\"baseUrl\"") != null) {
                 const trailing_comma = trimmed.len > 0 and trimmed[trimmed.len - 1] == ',';
                 try result.appendSlice(allocator, "        \"baseUrl\": \"");
-                try appendEscapedJson(&result, allocator, base_url);
+                try result.appendSlice(allocator, base_url);
                 try result.append(allocator, '"');
                 if (trailing_comma) try result.append(allocator, ',');
                 if (line_iter.peek() != null) try result.append(allocator, '\n');
@@ -1021,10 +1010,10 @@ fn writeNewOpenClawConfig(allocator: std.mem.Allocator, path: []const u8, api_ke
         "      \"velora\": {\n"
     );
     try out.appendSlice(allocator, "        \"baseUrl\": \"");
-    try appendEscapedJson(&out, allocator, base_url);
+    try out.appendSlice(allocator, base_url);
     try out.appendSlice(allocator, "\",\n");
     try out.appendSlice(allocator, "        \"apiKey\": \"");
-    try appendEscapedJson(&out, allocator, api_key);
+    try out.appendSlice(allocator, api_key);
     try out.appendSlice(allocator, "\",\n");
     try out.appendSlice(allocator,
         "        \"api\": \"openai-completions\"\n" ++
@@ -1036,7 +1025,7 @@ fn writeNewOpenClawConfig(allocator: std.mem.Allocator, path: []const u8, api_ke
         "      \"model\": {\n" ++
         "        \"primary\": \""
     );
-    try appendEscapedJson(&out, allocator, model_val);
+    try out.appendSlice(allocator, model_val);
     try out.appendSlice(allocator,
         "\"\n" ++
         "      }\n" ++
