@@ -8,6 +8,23 @@ const output = @import("output.zig");
 const terminal = @import("terminal.zig");
 const i18n = @import("i18n.zig");
 
+/// Read entire file into an ArrayListUnmanaged via chunked reads (no fixed-size cap).
+/// Returns true if the file was successfully read, false if it could not be opened.
+fn readFileIntoList(allocator: std.mem.Allocator, path: []const u8, list: *std.ArrayListUnmanaged(u8)) bool {
+    const file = std.fs.openFileAbsolute(path, .{}) catch return false;
+    defer file.close();
+    const stat = file.stat() catch return false;
+    const file_size: usize = @intCast(@min(stat.size, 16 * 1024 * 1024)); // cap at 16 MB
+    list.ensureTotalCapacity(allocator, file_size + 1) catch return false;
+    var buf: [65536]u8 = undefined;
+    while (true) {
+        const n = file.read(&buf) catch return false;
+        if (n == 0) break;
+        list.appendSlice(allocator, buf[0..n]) catch return false;
+    }
+    return true;
+}
+
 /// Apply a site's configuration to Codex.
 /// Updates ~/.codex/config.toml base_url and sets the OPENAI_API_KEY env var.
 pub fn applyToCodex(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCaps, lang: i18n.Language, site: sites_mod.Site, tool_model: []const u8) !void {
@@ -94,14 +111,7 @@ fn updateCodexToml(allocator: std.mem.Allocator, new_base_url: []const u8, new_m
     var existing: std.ArrayListUnmanaged(u8) = .empty;
     defer existing.deinit(allocator);
 
-    const has_file = blk: {
-        const file = std.fs.openFileAbsolute(path, .{}) catch break :blk false;
-        defer file.close();
-        var buf: [65536]u8 = undefined;
-        const bytes_read = file.readAll(&buf) catch break :blk false;
-        existing.appendSlice(allocator, buf[0..bytes_read]) catch break :blk false;
-        break :blk true;
-    };
+    const has_file = readFileIntoList(allocator, path, &existing);
 
     if (!has_file) return false;
 
@@ -210,12 +220,10 @@ fn readCodexEnvKeyName(allocator: std.mem.Allocator) !EnvKeyResult {
     const path = try getCodexTomlPath(allocator);
     defer allocator.free(path);
 
-    const file = std.fs.openFileAbsolute(path, .{}) catch return .{ .key = "OPENAI_API_KEY", .owned = false };
-    defer file.close();
-
-    var buf: [65536]u8 = undefined;
-    const bytes_read = file.readAll(&buf) catch return .{ .key = "OPENAI_API_KEY", .owned = false };
-    const content = buf[0..bytes_read];
+    var file_data: std.ArrayListUnmanaged(u8) = .empty;
+    defer file_data.deinit(allocator);
+    if (!readFileIntoList(allocator, path, &file_data)) return .{ .key = "OPENAI_API_KEY", .owned = false };
+    const content = file_data.items;
 
     var in_proxy = false;
     var line_iter = std.mem.splitScalar(u8, content, '\n');
@@ -258,10 +266,19 @@ fn updateClaudeSettings(allocator: std.mem.Allocator, api_key: []const u8, base_
     const has_file = blk: {
         const file = std.fs.openFileAbsolute(path, .{}) catch break :blk false;
         defer file.close();
-        var buf: [65536]u8 = undefined;
-        const bytes_read = file.readAll(&buf) catch break :blk false;
-        existing.appendSlice(allocator, buf[0..bytes_read]) catch break :blk false;
-        break :blk true;
+        const stat = file.stat() catch break :blk false;
+        const file_size = @as(usize, @intCast(stat.size));
+        if (file_size == 0) break :blk false;
+        existing.ensureTotalCapacity(allocator, file_size) catch break :blk false;
+        var total_read: usize = 0;
+        while (total_read < file_size) {
+            var tmp_buf: [8192]u8 = undefined;
+            const n = file.read(&tmp_buf) catch break;
+            if (n == 0) break;
+            existing.appendSlice(allocator, tmp_buf[0..n]) catch break;
+            total_read += n;
+        }
+        break :blk existing.items.len > 0;
     };
 
     if (!has_file) {
@@ -289,21 +306,99 @@ fn updateClaudeSettings(allocator: std.mem.Allocator, api_key: []const u8, base_
         return;
     }
 
-    // Strategy: surgically replace only the value bytes inside JSON string literals.
-    // We find the "env" object, then locate ANTHROPIC_AUTH_TOKEN and ANTHROPIC_BASE_URL
-    // value strings inside it, and replace just the content between the quotes.
-    // Everything else (whitespace, indentation, other keys) is preserved byte-for-byte.
-    var content = existing.items;
+    // Parse and modify existing JSON — line-by-line approach.
+    // For lines containing ANTHROPIC_AUTH_TOKEN or ANTHROPIC_BASE_URL inside the "env" block,
+    // we replace only the value portion between quotes, preserving original indentation.
+    // All other lines are kept byte-for-byte identical.
+    const content = existing.items;
 
-    // Replace ANTHROPIC_AUTH_TOKEN value inside "env" object
-    content = try replaceNestedJsonStringValue(allocator, content, "env", "ANTHROPIC_AUTH_TOKEN", api_key) orelse content;
-    defer if (content.ptr != existing.items.ptr) allocator.free(content);
+    var result: std.ArrayListUnmanaged(u8) = .empty;
+    defer result.deinit(allocator);
 
-    const content2 = try replaceNestedJsonStringValue(allocator, content, "env", "ANTHROPIC_BASE_URL", base_url) orelse content;
-    defer if (content2.ptr != content.ptr) allocator.free(content2);
+    var in_env = false;
+    var env_depth: i32 = 0;
+    var auth_token_found = false;
+    var base_url_found = false;
+    var line_iter = std.mem.splitScalar(u8, content, '\n');
 
-    // Replace or insert top-level "model" field
-    const updated = try upsertTopLevelJsonStringField(allocator, content2, "model", model);
+    while (line_iter.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+
+        // Detect entering env block
+        if (!in_env and std.mem.indexOf(u8, trimmed, "\"env\"") != null) {
+            in_env = true;
+            env_depth = 0;
+            if (std.mem.indexOf(u8, trimmed, "{") != null) {
+                env_depth = 1;
+            }
+            try result.appendSlice(allocator, line);
+            if (line_iter.peek() != null) try result.append(allocator, '\n');
+            continue;
+        }
+
+        if (in_env and env_depth == 0) {
+            if (std.mem.indexOf(u8, trimmed, "{") != null) {
+                env_depth = 1;
+            }
+            try result.appendSlice(allocator, line);
+            if (line_iter.peek() != null) try result.append(allocator, '\n');
+            continue;
+        }
+
+        if (in_env and env_depth > 0) {
+            // Count braces (outside of strings)
+            for (trimmed) |ch| {
+                if (ch == '{') env_depth += 1;
+                if (ch == '}') env_depth -= 1;
+            }
+
+            if (env_depth <= 0) {
+                // Closing brace of env block — inject missing keys before closing
+                if (!auth_token_found or !base_url_found) {
+                    if (!auth_token_found) {
+                        try result.appendSlice(allocator, "    \"ANTHROPIC_AUTH_TOKEN\": \"");
+                        try result.appendSlice(allocator, api_key);
+                        try result.appendSlice(allocator, "\",\n");
+                    }
+                    if (!base_url_found) {
+                        try result.appendSlice(allocator, "    \"ANTHROPIC_BASE_URL\": \"");
+                        try result.appendSlice(allocator, base_url);
+                        try result.appendSlice(allocator, "\",\n");
+                    }
+                }
+                in_env = false;
+                try result.appendSlice(allocator, line);
+                if (line_iter.peek() != null) try result.append(allocator, '\n');
+                continue;
+            }
+
+            // Inside env block — check for target keys and replace value only
+            if (std.mem.indexOf(u8, trimmed, "\"ANTHROPIC_AUTH_TOKEN\"") != null) {
+                try replaceJsonLineValue(allocator, &result, line, api_key);
+                if (line_iter.peek() != null) try result.append(allocator, '\n');
+                auth_token_found = true;
+                continue;
+            }
+
+            if (std.mem.indexOf(u8, trimmed, "\"ANTHROPIC_BASE_URL\"") != null) {
+                try replaceJsonLineValue(allocator, &result, line, base_url);
+                if (line_iter.peek() != null) try result.append(allocator, '\n');
+                base_url_found = true;
+                continue;
+            }
+
+            // Other env lines — keep as-is
+            try result.appendSlice(allocator, line);
+            if (line_iter.peek() != null) try result.append(allocator, '\n');
+            continue;
+        }
+
+        // Outside env block — keep as-is
+        try result.appendSlice(allocator, line);
+        if (line_iter.peek() != null) try result.append(allocator, '\n');
+    }
+
+    const updated = try upsertTopLevelJsonStringField(allocator, result.items, "model", model);
     defer allocator.free(updated);
 
     const file = try std.fs.createFileAbsolute(path, .{});
@@ -311,110 +406,37 @@ fn updateClaudeSettings(allocator: std.mem.Allocator, api_key: []const u8, base_
     try file.writeAll(updated);
 }
 
-/// Find a nested JSON string value: locate "parent_key": { ... "child_key": "VALUE" ... }
-/// and replace VALUE, returning a new allocated slice. Returns null if not found.
-fn replaceNestedJsonStringValue(allocator: std.mem.Allocator, content: []const u8, parent_key: []const u8, child_key: []const u8, new_value: []const u8) !?[]u8 {
-    // Find the parent object
-    const parent_obj_start = findJsonObjectForKey(content, parent_key) orelse return null;
-    const parent_obj_end = findMatchingBrace(content, parent_obj_start) orelse return null;
-
-    // Within the parent object range, find the child key's string value
-    const parent_content = content[parent_obj_start .. parent_obj_end + 1];
-    const value_range = findJsonStringValueForKey(parent_content, child_key) orelse return null;
-
-    // value_range is relative to parent_content; convert to absolute offsets
-    const abs_val_start = parent_obj_start + value_range.start;
-    const abs_val_end = parent_obj_start + value_range.end;
-
-    // Build result: everything before value + new value + everything after value
-    var result: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer result.deinit(allocator);
-    try result.appendSlice(allocator, content[0..abs_val_start]);
-    try result.appendSlice(allocator, new_value);
-    try result.appendSlice(allocator, content[abs_val_end..]);
-    return @as(?[]u8, try result.toOwnedSlice(allocator));
-}
-
-/// Find the opening '{' of the object value for a given top-level key.
-/// Searches for "key" : { and returns the index of '{'.
-fn findJsonObjectForKey(content: []const u8, key: []const u8) ?usize {
-    var i: usize = 0;
-    while (i < content.len) {
-        if (content[i] == '"') {
-            const str_end = findJsonStringEnd(content, i + 1) orelse return null;
-            const str_content = content[i + 1 .. str_end];
-            if (std.mem.eql(u8, str_content, key)) {
-                // Found the key, now find ':' then '{'
-                var pos = skipJsonWhitespace(content, str_end + 1);
-                if (pos < content.len and content[pos] == ':') {
-                    pos = skipJsonWhitespace(content, pos + 1);
-                    if (pos < content.len and content[pos] == '{') {
-                        return pos;
-                    }
-                }
+/// Replace only the value portion of a JSON "key": "value" line, preserving indentation and trailing comma.
+/// Given a line like `    "ANTHROPIC_AUTH_TOKEN": "old-key",`
+/// produces        `    "ANTHROPIC_AUTH_TOKEN": "new-key",`
+fn replaceJsonLineValue(allocator: std.mem.Allocator, result: *std.ArrayListUnmanaged(u8), line: []const u8, new_value: []const u8) !void {
+    // Find ': "' pattern — the colon followed by optional space and opening quote
+    // We search for the value's opening quote after the colon
+    if (std.mem.indexOf(u8, line, ":")) |colon_pos| {
+        const after_colon = colon_pos + 1;
+        // Find the opening quote of the value
+        var quote_start: ?usize = null;
+        for (line[after_colon..], after_colon..) |ch, idx| {
+            if (ch == '"') {
+                quote_start = idx;
+                break;
             }
-            i = str_end + 1;
-        } else {
-            i += 1;
+            if (ch != ' ' and ch != '\t') break; // non-space before quote means unexpected format
         }
-    }
-    return null;
-}
-
-/// Find matching closing '}' for an opening '{' at the given position, respecting nesting and strings.
-fn findMatchingBrace(content: []const u8, start: usize) ?usize {
-    if (start >= content.len or content[start] != '{') return null;
-    var depth: i32 = 0;
-    var i: usize = start;
-    while (i < content.len) {
-        switch (content[i]) {
-            '{' => {
-                depth += 1;
-                i += 1;
-            },
-            '}' => {
-                depth -= 1;
-                if (depth == 0) return i;
-                i += 1;
-            },
-            '"' => {
-                // Skip over string content
-                const str_end = findJsonStringEnd(content, i + 1) orelse return null;
-                i = str_end + 1;
-            },
-            else => i += 1,
-        }
-    }
-    return null;
-}
-
-const ValueRange = struct { start: usize, end: usize };
-
-/// Within a JSON object body, find the string value for a given key.
-/// Returns the range (start, end) of the content BETWEEN the quotes (exclusive of quotes).
-fn findJsonStringValueForKey(content: []const u8, key: []const u8) ?ValueRange {
-    var i: usize = 0;
-    while (i < content.len) {
-        if (content[i] == '"') {
-            const str_end = findJsonStringEnd(content, i + 1) orelse return null;
-            const str_content = content[i + 1 .. str_end];
-            if (std.mem.eql(u8, str_content, key)) {
-                // Found key, find ':' then '"value"'
-                var pos = skipJsonWhitespace(content, str_end + 1);
-                if (pos < content.len and content[pos] == ':') {
-                    pos = skipJsonWhitespace(content, pos + 1);
-                    if (pos < content.len and content[pos] == '"') {
-                        const val_end = findJsonStringEnd(content, pos + 1) orelse return null;
-                        return .{ .start = pos + 1, .end = val_end };
-                    }
-                }
+        if (quote_start) |qs| {
+            // Find the closing quote of the value
+            const val_start = qs + 1;
+            if (findJsonStringEnd(line, val_start)) |val_end| {
+                // Reconstruct: prefix (up to and including opening quote) + new value + closing quote + suffix
+                try result.appendSlice(allocator, line[0..val_start]); // everything up to value start
+                try result.appendSlice(allocator, new_value);
+                try result.appendSlice(allocator, line[val_end..]); // closing quote + comma/whitespace
+                return;
             }
-            i = str_end + 1;
-        } else {
-            i += 1;
         }
     }
-    return null;
+    // Fallback: could not parse, keep line as-is
+    try result.appendSlice(allocator, line);
 }
 
 // --- OpenCode JSON editing ---
@@ -461,14 +483,7 @@ fn updateOpenCodeConfig(allocator: std.mem.Allocator, api_key: []const u8, base_
     var existing: std.ArrayListUnmanaged(u8) = .empty;
     defer existing.deinit(allocator);
 
-    const has_file = blk: {
-        const file = std.fs.openFileAbsolute(path, .{}) catch break :blk false;
-        defer file.close();
-        var buf: [131072]u8 = undefined;
-        const bytes_read = file.readAll(&buf) catch break :blk false;
-        existing.appendSlice(allocator, buf[0..bytes_read]) catch break :blk false;
-        break :blk true;
-    };
+    const has_file = readFileIntoList(allocator, path, &existing);
 
     if (!has_file) {
         // Create new config with openai provider
@@ -483,42 +498,81 @@ fn updateOpenCodeConfig(allocator: std.mem.Allocator, api_key: []const u8, base_
 
     var base_url_found = false;
     var api_key_found = false;
-    var in_openai_options = false;
+    var in_openai_provider = false; // true when inside "openai": { ... }
+    var openai_depth: i32 = 0; // brace depth within the openai provider block
+    var in_openai_options = false; // true when inside "options": { ... } under openai
     var options_depth: i32 = 0;
-    var brace_depth: i32 = 0;
-    var in_string = false;
-    var escaped = false;
 
     // Line-by-line approach for updating known keys
     var line_iter = std.mem.splitScalar(u8, content, '\n');
     while (line_iter.next()) |line| {
         const trimmed = std.mem.trim(u8, line, " \t\r");
 
-        // Track entry into "options" block under openai provider
-        if (std.mem.indexOf(u8, trimmed, "\"options\"") != null and
+        // Detect entering "openai" provider block: "openai": {
+        if (!in_openai_provider and std.mem.indexOf(u8, trimmed, "\"openai\"") != null and
             std.mem.indexOf(u8, trimmed, "{") != null)
         {
-            in_openai_options = true;
-            options_depth = 1;
-            brace_depth += 1;
+            in_openai_provider = true;
+            openai_depth = 1;
+            try result.appendSlice(allocator, line);
+            if (line_iter.peek() != null) try result.append(allocator, '\n');
+            continue;
+        }
+
+        if (in_openai_provider and !in_openai_options) {
+            // Track brace depth in the openai block to know when we leave it
+            var esc_s = false;
+            var in_str = false;
+            for (trimmed) |ch| {
+                if (esc_s) { esc_s = false; continue; }
+                if (ch == '\\' and in_str) { esc_s = true; continue; }
+                if (ch == '"') { in_str = !in_str; continue; }
+                if (in_str) continue;
+                if (ch == '{') openai_depth += 1;
+                if (ch == '}') openai_depth -= 1;
+            }
+
+            if (openai_depth <= 0) {
+                in_openai_provider = false;
+                try result.appendSlice(allocator, line);
+                if (line_iter.peek() != null) try result.append(allocator, '\n');
+                continue;
+            }
+
+            // Detect entering "options" block within openai provider
+            if (std.mem.indexOf(u8, trimmed, "\"options\"") != null and
+                std.mem.indexOf(u8, trimmed, "{") != null)
+            {
+                in_openai_options = true;
+                options_depth = 1;
+                try result.appendSlice(allocator, line);
+                if (line_iter.peek() != null) try result.append(allocator, '\n');
+                continue;
+            }
+
             try result.appendSlice(allocator, line);
             if (line_iter.peek() != null) try result.append(allocator, '\n');
             continue;
         }
 
         if (in_openai_options) {
-            // Track brace depth
+            // Track brace depth within options block
+            var esc_s = false;
+            var in_str = false;
             for (trimmed) |ch| {
-                if (escaped) { escaped = false; continue; }
-                if (ch == '\\' and in_string) { escaped = true; continue; }
-                if (ch == '"') { in_string = !in_string; continue; }
-                if (in_string) continue;
+                if (esc_s) { esc_s = false; continue; }
+                if (ch == '\\' and in_str) { esc_s = true; continue; }
+                if (ch == '"') { in_str = !in_str; continue; }
+                if (in_str) continue;
                 if (ch == '{') options_depth += 1;
                 if (ch == '}') options_depth -= 1;
             }
 
             if (options_depth <= 0) {
                 in_openai_options = false;
+                // Also count this closing brace for the openai provider depth
+                openai_depth -= 1;
+                if (openai_depth <= 0) in_openai_provider = false;
                 // Inject missing keys before closing brace
                 if (!base_url_found) {
                     try result.appendSlice(allocator, "        \"baseURL\": \"");
@@ -537,10 +591,7 @@ fn updateOpenCodeConfig(allocator: std.mem.Allocator, api_key: []const u8, base_
 
             // Replace baseURL
             if (std.mem.indexOf(u8, trimmed, "\"baseURL\"") != null) {
-                const trailing_comma = trimmed.len > 0 and trimmed[trimmed.len - 1] == ',';
-                try result.appendSlice(allocator, "        \"baseURL\": \"");
-                try result.appendSlice(allocator, base_url);
-                try result.appendSlice(allocator, if (trailing_comma) "\"," else "\"");
+                try replaceJsonLineValue(allocator, &result, line, base_url);
                 if (line_iter.peek() != null) try result.append(allocator, '\n');
                 base_url_found = true;
                 continue;
@@ -548,10 +599,7 @@ fn updateOpenCodeConfig(allocator: std.mem.Allocator, api_key: []const u8, base_
 
             // Replace apiKey
             if (std.mem.indexOf(u8, trimmed, "\"apiKey\"") != null) {
-                const trailing_comma = trimmed.len > 0 and trimmed[trimmed.len - 1] == ',';
-                try result.appendSlice(allocator, "        \"apiKey\": \"");
-                try result.appendSlice(allocator, api_key);
-                try result.appendSlice(allocator, if (trailing_comma) "\"," else "\"");
+                try replaceJsonLineValue(allocator, &result, line, api_key);
                 if (line_iter.peek() != null) try result.append(allocator, '\n');
                 api_key_found = true;
                 continue;
@@ -645,9 +693,9 @@ fn upsertTopLevelJsonStringField(allocator: std.mem.Allocator, content: []const 
 
     // Field not found — insert it right after the opening '{'
     const object_start = std.mem.indexOfScalar(u8, content, '{') orelse return try allocator.dupe(u8, content);
-    // Insert right after '{', preserving whatever whitespace follows for existing members
+
+    // Check if the object has any existing members by scanning after '{'
     const after_brace = object_start + 1;
-    // Check if there are existing members by scanning past whitespace
     const first_non_ws = skipJsonWhitespace(content, after_brace);
     const has_members = first_non_ws < content.len and content[first_non_ws] != '}';
 
@@ -657,13 +705,13 @@ fn upsertTopLevelJsonStringField(allocator: std.mem.Allocator, content: []const 
     // Keep everything up to and including '{'
     try updated.appendSlice(allocator, content[0 .. object_start + 1]);
     if (has_members) {
-        // Insert new field, then restore original content (including its whitespace/indentation)
+        // Insert new field, then re-emit the original whitespace + rest of content
         try updated.appendSlice(allocator, "\n  \"");
         try updated.appendSlice(allocator, field);
         try updated.appendSlice(allocator, "\": \"");
         try updated.appendSlice(allocator, value);
         try updated.appendSlice(allocator, "\",");
-        // Append original content after '{' (which starts with \n  "env"...)
+        // Append everything after '{' — this preserves the original \n  before "env"
         try updated.appendSlice(allocator, content[after_brace..]);
     } else {
         try updated.appendSlice(allocator, "\n  \"");
@@ -746,14 +794,7 @@ fn updateNanobotConfig(allocator: std.mem.Allocator, api_key: []const u8, base_u
     var existing: std.ArrayListUnmanaged(u8) = .empty;
     defer existing.deinit(allocator);
 
-    const has_file = blk: {
-        const file = std.fs.openFileAbsolute(path, .{}) catch break :blk false;
-        defer file.close();
-        var buf: [131072]u8 = undefined;
-        const bytes_read = file.readAll(&buf) catch break :blk false;
-        existing.appendSlice(allocator, buf[0..bytes_read]) catch break :blk false;
-        break :blk true;
-    };
+    const has_file = readFileIntoList(allocator, path, &existing);
 
     if (!has_file) {
         // Create minimal nanobot config
@@ -928,14 +969,7 @@ fn updateOpenClawConfig(allocator: std.mem.Allocator, api_key: []const u8, base_
     var existing: std.ArrayListUnmanaged(u8) = .empty;
     defer existing.deinit(allocator);
 
-    const has_file = blk: {
-        const file = std.fs.openFileAbsolute(path, .{}) catch break :blk false;
-        defer file.close();
-        var buf: [131072]u8 = undefined;
-        const bytes_read = file.readAll(&buf) catch break :blk false;
-        existing.appendSlice(allocator, buf[0..bytes_read]) catch break :blk false;
-        break :blk true;
-    };
+    const has_file = readFileIntoList(allocator, path, &existing);
 
     if (!has_file) {
         try writeNewOpenClawConfig(allocator, path, api_key, base_url, model);
