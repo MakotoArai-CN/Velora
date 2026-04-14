@@ -289,117 +289,132 @@ fn updateClaudeSettings(allocator: std.mem.Allocator, api_key: []const u8, base_
         return;
     }
 
-    // Parse and modify existing JSON
-    const content = existing.items;
+    // Strategy: surgically replace only the value bytes inside JSON string literals.
+    // We find the "env" object, then locate ANTHROPIC_AUTH_TOKEN and ANTHROPIC_BASE_URL
+    // value strings inside it, and replace just the content between the quotes.
+    // Everything else (whitespace, indentation, other keys) is preserved byte-for-byte.
+    var content = existing.items;
 
-    // Strategy: find "env" block, replace ANTHROPIC_AUTH_TOKEN and ANTHROPIC_BASE_URL values
-    var result: std.ArrayListUnmanaged(u8) = .empty;
-    defer result.deinit(allocator);
+    // Replace ANTHROPIC_AUTH_TOKEN value inside "env" object
+    content = try replaceNestedJsonStringValue(allocator, content, "env", "ANTHROPIC_AUTH_TOKEN", api_key) orelse content;
+    defer if (content.ptr != existing.items.ptr) allocator.free(content);
 
-    // Process line by line for simple key-value replacement within the env block
-    var in_env = false;
-    var env_depth: i32 = 0;
-    var auth_token_found = false;
-    var base_url_found = false;
-    var line_iter = std.mem.splitScalar(u8, content, '\n');
+    const content2 = try replaceNestedJsonStringValue(allocator, content, "env", "ANTHROPIC_BASE_URL", base_url) orelse content;
+    defer if (content2.ptr != content.ptr) allocator.free(content2);
 
-    while (line_iter.next()) |line| {
-        const trimmed = std.mem.trim(u8, line, " \t\r");
-
-        // Detect entering env block
-        if (!in_env and std.mem.indexOf(u8, trimmed, "\"env\"") != null) {
-            in_env = true;
-            env_depth = 0;
-            // Check if { is on same line
-            if (std.mem.indexOf(u8, trimmed, "{") != null) {
-                env_depth = 1;
-            }
-            try result.appendSlice(allocator, line);
-            if (line_iter.peek() != null) try result.append(allocator, '\n');
-            continue;
-        }
-
-        if (in_env and env_depth == 0) {
-            // Looking for the opening brace
-            if (std.mem.indexOf(u8, trimmed, "{") != null) {
-                env_depth = 1;
-            }
-            try result.appendSlice(allocator, line);
-            if (line_iter.peek() != null) try result.append(allocator, '\n');
-            continue;
-        }
-
-        if (in_env and env_depth > 0) {
-            // Count braces
-            for (trimmed) |ch| {
-                if (ch == '{') env_depth += 1;
-                if (ch == '}') env_depth -= 1;
-            }
-
-            if (env_depth <= 0) {
-                // Closing brace of env block - inject missing keys before closing
-                if (!auth_token_found or !base_url_found) {
-                    if (!auth_token_found) {
-                        try result.appendSlice(allocator, "    \"ANTHROPIC_AUTH_TOKEN\": \"");
-                        try result.appendSlice(allocator, api_key);
-                        try result.appendSlice(allocator, "\",\n");
-                    }
-                    if (!base_url_found) {
-                        try result.appendSlice(allocator, "    \"ANTHROPIC_BASE_URL\": \"");
-                        try result.appendSlice(allocator, base_url);
-                        try result.appendSlice(allocator, "\",\n");
-                    }
-                }
-                in_env = false;
-                try result.appendSlice(allocator, line);
-                if (line_iter.peek() != null) try result.append(allocator, '\n');
-                continue;
-            }
-
-            // Replace ANTHROPIC_AUTH_TOKEN value
-            if (std.mem.indexOf(u8, trimmed, "\"ANTHROPIC_AUTH_TOKEN\"") != null) {
-                try result.appendSlice(allocator, "    \"ANTHROPIC_AUTH_TOKEN\": \"");
-                try result.appendSlice(allocator, api_key);
-                // Check if line has trailing comma
-                if (trimmed.len > 0 and trimmed[trimmed.len - 1] == ',') {
-                    try result.appendSlice(allocator, "\",\n");
-                } else {
-                    try result.appendSlice(allocator, "\"\n");
-                }
-                auth_token_found = true;
-                continue;
-            }
-
-            // Replace ANTHROPIC_BASE_URL value
-            if (std.mem.indexOf(u8, trimmed, "\"ANTHROPIC_BASE_URL\"") != null) {
-                try result.appendSlice(allocator, "    \"ANTHROPIC_BASE_URL\": \"");
-                try result.appendSlice(allocator, base_url);
-                if (trimmed.len > 0 and trimmed[trimmed.len - 1] == ',') {
-                    try result.appendSlice(allocator, "\",\n");
-                } else {
-                    try result.appendSlice(allocator, "\"\n");
-                }
-                base_url_found = true;
-                continue;
-            }
-
-            // Keep other env lines as-is
-            try result.appendSlice(allocator, line);
-            if (line_iter.peek() != null) try result.append(allocator, '\n');
-            continue;
-        }
-
-        // Outside env block, keep as-is
-        try result.appendSlice(allocator, line);
-        if (line_iter.peek() != null) try result.append(allocator, '\n');
-    }
-
-    const updated = try upsertTopLevelJsonStringField(allocator, result.items, "model", model);
+    // Replace or insert top-level "model" field
+    const updated = try upsertTopLevelJsonStringField(allocator, content2, "model", model);
     defer allocator.free(updated);
 
     const file = try std.fs.createFileAbsolute(path, .{});
     defer file.close();
     try file.writeAll(updated);
+}
+
+/// Find a nested JSON string value: locate "parent_key": { ... "child_key": "VALUE" ... }
+/// and replace VALUE, returning a new allocated slice. Returns null if not found.
+fn replaceNestedJsonStringValue(allocator: std.mem.Allocator, content: []const u8, parent_key: []const u8, child_key: []const u8, new_value: []const u8) !?[]u8 {
+    // Find the parent object
+    const parent_obj_start = findJsonObjectForKey(content, parent_key) orelse return null;
+    const parent_obj_end = findMatchingBrace(content, parent_obj_start) orelse return null;
+
+    // Within the parent object range, find the child key's string value
+    const parent_content = content[parent_obj_start .. parent_obj_end + 1];
+    const value_range = findJsonStringValueForKey(parent_content, child_key) orelse return null;
+
+    // value_range is relative to parent_content; convert to absolute offsets
+    const abs_val_start = parent_obj_start + value_range.start;
+    const abs_val_end = parent_obj_start + value_range.end;
+
+    // Build result: everything before value + new value + everything after value
+    var result: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer result.deinit(allocator);
+    try result.appendSlice(allocator, content[0..abs_val_start]);
+    try result.appendSlice(allocator, new_value);
+    try result.appendSlice(allocator, content[abs_val_end..]);
+    return @as(?[]u8, try result.toOwnedSlice(allocator));
+}
+
+/// Find the opening '{' of the object value for a given top-level key.
+/// Searches for "key" : { and returns the index of '{'.
+fn findJsonObjectForKey(content: []const u8, key: []const u8) ?usize {
+    var i: usize = 0;
+    while (i < content.len) {
+        if (content[i] == '"') {
+            const str_end = findJsonStringEnd(content, i + 1) orelse return null;
+            const str_content = content[i + 1 .. str_end];
+            if (std.mem.eql(u8, str_content, key)) {
+                // Found the key, now find ':' then '{'
+                var pos = skipJsonWhitespace(content, str_end + 1);
+                if (pos < content.len and content[pos] == ':') {
+                    pos = skipJsonWhitespace(content, pos + 1);
+                    if (pos < content.len and content[pos] == '{') {
+                        return pos;
+                    }
+                }
+            }
+            i = str_end + 1;
+        } else {
+            i += 1;
+        }
+    }
+    return null;
+}
+
+/// Find matching closing '}' for an opening '{' at the given position, respecting nesting and strings.
+fn findMatchingBrace(content: []const u8, start: usize) ?usize {
+    if (start >= content.len or content[start] != '{') return null;
+    var depth: i32 = 0;
+    var i: usize = start;
+    while (i < content.len) {
+        switch (content[i]) {
+            '{' => {
+                depth += 1;
+                i += 1;
+            },
+            '}' => {
+                depth -= 1;
+                if (depth == 0) return i;
+                i += 1;
+            },
+            '"' => {
+                // Skip over string content
+                const str_end = findJsonStringEnd(content, i + 1) orelse return null;
+                i = str_end + 1;
+            },
+            else => i += 1,
+        }
+    }
+    return null;
+}
+
+const ValueRange = struct { start: usize, end: usize };
+
+/// Within a JSON object body, find the string value for a given key.
+/// Returns the range (start, end) of the content BETWEEN the quotes (exclusive of quotes).
+fn findJsonStringValueForKey(content: []const u8, key: []const u8) ?ValueRange {
+    var i: usize = 0;
+    while (i < content.len) {
+        if (content[i] == '"') {
+            const str_end = findJsonStringEnd(content, i + 1) orelse return null;
+            const str_content = content[i + 1 .. str_end];
+            if (std.mem.eql(u8, str_content, key)) {
+                // Found key, find ':' then '"value"'
+                var pos = skipJsonWhitespace(content, str_end + 1);
+                if (pos < content.len and content[pos] == ':') {
+                    pos = skipJsonWhitespace(content, pos + 1);
+                    if (pos < content.len and content[pos] == '"') {
+                        const val_end = findJsonStringEnd(content, pos + 1) orelse return null;
+                        return .{ .start = pos + 1, .end = val_end };
+                    }
+                }
+            }
+            i = str_end + 1;
+        } else {
+            i += 1;
+        }
+    }
+    return null;
 }
 
 // --- OpenCode JSON editing ---
@@ -628,31 +643,36 @@ fn upsertTopLevelJsonStringField(allocator: std.mem.Allocator, content: []const 
         }
     }
 
+    // Field not found — insert it right after the opening '{'
     const object_start = std.mem.indexOfScalar(u8, content, '{') orelse return try allocator.dupe(u8, content);
-    const insert_pos = skipJsonWhitespace(content, object_start + 1);
-    const has_members = insert_pos < content.len and content[insert_pos] != '}';
+    // Insert right after '{', preserving whatever whitespace follows for existing members
+    const after_brace = object_start + 1;
+    // Check if there are existing members by scanning past whitespace
+    const first_non_ws = skipJsonWhitespace(content, after_brace);
+    const has_members = first_non_ws < content.len and content[first_non_ws] != '}';
 
     var updated: std.ArrayListUnmanaged(u8) = .empty;
     defer updated.deinit(allocator);
 
-    try updated.appendSlice(allocator, content[0..insert_pos]);
+    // Keep everything up to and including '{'
+    try updated.appendSlice(allocator, content[0 .. object_start + 1]);
     if (has_members) {
+        // Insert new field, then restore original content (including its whitespace/indentation)
         try updated.appendSlice(allocator, "\n  \"");
         try updated.appendSlice(allocator, field);
         try updated.appendSlice(allocator, "\": \"");
         try updated.appendSlice(allocator, value);
         try updated.appendSlice(allocator, "\",");
-        if (content[insert_pos] != '\n') {
-            try updated.append(allocator, '\n');
-        }
+        // Append original content after '{' (which starts with \n  "env"...)
+        try updated.appendSlice(allocator, content[after_brace..]);
     } else {
         try updated.appendSlice(allocator, "\n  \"");
         try updated.appendSlice(allocator, field);
         try updated.appendSlice(allocator, "\": \"");
         try updated.appendSlice(allocator, value);
         try updated.appendSlice(allocator, "\"\n");
+        try updated.appendSlice(allocator, content[after_brace..]);
     }
-    try updated.appendSlice(allocator, content[insert_pos..]);
     return updated.toOwnedSlice(allocator);
 }
 
