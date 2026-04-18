@@ -19,12 +19,13 @@ The build system cross-compiles for 18 targets (Linux, Alpine/musl, Windows, mac
 
 ## Architecture
 
-- **Entry point**: `src/main.zig` — wires CLI parsing to command handlers (`runAdd`, `runEdit`, `runDel`, `runList`, `runUse`, `runInstall`, `runUpdate`). Also contains interactive input helpers and the version constant.
-- **`src/cli.zig`** — Argument parsing. Produces a `Config` struct with a `Command` tagged union. No external arg-parsing library.
+- **Entry point**: `src/main.zig` — wires CLI parsing to command handlers (`runAdd`, `runEdit`, `runDel`, `runList`, `runUse`, `runModels`, `runModelTest`, `runInstall`, `runUpdate`). Also contains interactive input helpers and the version constant. `runList` runs connectivity checks in parallel via heap-allocated `CheckTask` (refcount-2) workers and repaints rows in place. `runModelTest` does the same with `ModelTestTask` workers and a spinner animation.
+- **`src/cli.zig`** — Argument parsing. Produces a `Config` struct with a `Command` tagged union. No external arg-parsing library. Help is split: `printHelp` shows commands/options + a hint, `printExamples` (invoked via `velora help examples` or `--examples`) shows the full usage examples.
 - **`src/app.zig`** — Compile-time constants: app name, config paths, GitHub repo URL, default models per tool type.
 - **`src/sites.zig`** — `SitesStore` (fixed-capacity array of up to 64 sites), JSON load/save for `~/.velora/sites.json`. Manual JSON parsing (no std.json). Per-site multi-tool defaults (`default_tools_mask`), per-tool model overrides (`models_cx`/`cc`/`oc`/`nb`/`ow`), selection mode, and settings management.
 - **`src/apply.zig`** — Writes site configs to target tool config files: Codex TOML (`~/.codex/config.toml`), Claude Code JSON (`~/.claude/settings.json`), OpenCode JSON (`~/.config/opencode/opencode.json`), Nanobot JSON (`~/.nanobot/config.json`), OpenClaw JSON (`~/.openclaw/openclaw.json`). Line-by-line text manipulation.
-- **`src/check.zig`** — HTTP connectivity checks, model detection, model family classification, compatibility checks, and model call testing for sites. Uses heap-allocated refcounted contexts for thread+timeout patterns to avoid use-after-free on detached threads.
+- **`src/check.zig`** — HTTP connectivity checks, model detection, model family classification, compatibility checks, model call testing (`testModelCall`), and benchmark POST (`benchmarkModel` returning `BenchResult` with `tokens_per_sec` parsed from `usage.completion_tokens`/`usage.output_tokens`). Uses heap-allocated refcounted contexts for thread+timeout patterns. `checkConnectivityInner` is `pub` so parallel workers can call it directly.
+- **`src/current.zig`** — Reads each tool's currently-applied config (Codex TOML proxy section, Claude Code env block, OpenCode/Nanobot/OpenClaw JSON provider sections) and exposes `CurrentTools.matchSite(base_url, api_key)` returning a `u8` bitmask of tools currently pointed at a given site. Match succeeds on either base_url or api_key (handles URL drift while keys stay consistent).
 - **`src/env.zig`** — Cross-platform environment variable persistence (writes to shell profile on POSIX, registry on Windows).
 - **`src/install.zig`** — Self-install/uninstall to `~/.velora/bin` with PATH management.
 - **`src/update.zig`** — GitHub releases API check and self-update.

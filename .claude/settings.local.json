@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(tee /tmp/zig_build.log)",
+      "Bash(echo \"EXIT=$?\")",
+      "Bash(zig-out/bin/velora.exe ls *)",
+      "Bash(zig-out/bin/velora.exe t *)",
+      "Bash(zig-out/bin/velora.exe --help)",
+      "Bash(zig-out/bin/velora.exe help *)",
+      "Bash(zig-out/bin/velora.exe --version)"
+    ]
+  }
+}

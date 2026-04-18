@@ -44,6 +44,11 @@ pub const ModelsArgs = struct {
     alias: []const u8,
 };
 
+pub const TestArgs = struct {
+    alias: ?[]const u8 = null,
+    perf: bool = false,
+};
+
 pub const Command = union(enum) {
     add: AddArgs,
     edit: EditArgs,
@@ -52,6 +57,7 @@ pub const Command = union(enum) {
     use: UseArgs,
     set: SetArgs,
     models: ModelsArgs,
+    model_test: TestArgs,
     install,
     uninstall,
     update_check, // --update: check and apply update
@@ -136,7 +142,15 @@ pub fn parseArgs(_: std.mem.Allocator) ParseError!Config {
     var config: Config = .{ .language = lang, .command = .help };
 
     if (eql(sub, "-h") or eql(sub, "--help") or eql(sub, "help")) {
+        // `velora help examples` / `velora --help examples` → only the examples section
+        if (rest.len > 0 and (eql(rest[0], "examples") or eql(rest[0], "example") or eql(rest[0], "ex"))) {
+            printExamples(lang);
+            return error.HelpRequested;
+        }
         printHelp(lang);
+        return error.HelpRequested;
+    } else if (eql(sub, "--examples") or eql(sub, "examples")) {
+        printExamples(lang);
         return error.HelpRequested;
     } else if (eql(sub, "-v") or eql(sub, "--version") or eql(sub, "version")) {
         config.command = .version;
@@ -247,6 +261,21 @@ pub fn parseArgs(_: std.mem.Allocator) ParseError!Config {
         // velora models <alias>  /  velora m <alias>
         if (rest.len < 1) return error.InvalidArgument;
         config.command = .{ .models = .{ .alias = rest[0] } };
+    } else if (eql(sub, "test") or eql(sub, "t")) {
+        if (rest.len > 0 and isHelpArg(rest[0])) {
+            printHelp(lang);
+            return error.HelpRequested;
+        }
+        // velora test [alias] [-p|--perf]
+        var args_out: TestArgs = .{};
+        for (rest) |arg| {
+            if (eql(arg, "-p") or eql(arg, "--perf") or eql(arg, "--bench")) {
+                args_out.perf = true;
+            } else if (args_out.alias == null) {
+                args_out.alias = arg;
+            }
+        }
+        config.command = .{ .model_test = args_out };
     } else if (eql(sub, "install") or eql(sub, "--install")) {
         config.command = .install;
     } else if (eql(sub, "uninstall") or eql(sub, "--uninstall") or eql(sub, "--del")) {
@@ -334,6 +363,7 @@ fn printHelp(lang: i18n.Language) void {
 
     const cyan = if (caps.color) output.Color.miku_cyan else "";
     const accent = if (caps.color) output.Color.miku_accent else "";
+    const gray = if (caps.color) output.Color.miku_gray else "";
     const reset = if (caps.color) output.Color.reset else "";
 
     const title = switch (lang) {
@@ -351,7 +381,7 @@ fn printHelp(lang: i18n.Language) void {
         \\  add <类型> <别名> <URL> <Key> [模型] 一次性添加站点 (类型: cx, cc, oc, nb, ow)
         \\  edit <别名>                        编辑站点配置
         \\  del <别名>                         删除站点
-        \\  list                               显示站点列表（含连通性检测）
+        \\  list                               显示站点列表（含连通性检测，并行）
         \\  list -g                            全局检测（含已归档站点）
         \\  list all                           显示详细站点信息
         \\  list --sort=<模式>                 排序: time, alpha, tool, model
@@ -363,7 +393,9 @@ fn printHelp(lang: i18n.Language) void {
         \\  nb use <别名> [模型]               应用站点到 Nanobot
         \\  ow use <别名> [模型]               应用站点到 OpenClaw
         \\  models|m <别名>                    浏览站点支持的全部模型
+        \\  test|t [别名] [-p|--perf]          全自动检测模型调用 (--perf 进入性能基准测试,交互选择站点)
         \\  set|s <选项> <on/off|值>           设置选项开关
+        \\  help examples                      显示完整用法示例
         \\
         \\设置选项 (缩写):
         \\  model_check (mc)                   模型检测 (默认: on)
@@ -381,35 +413,10 @@ fn printHelp(lang: i18n.Language) void {
         \\
         \\选项:
         \\  -h, --help             显示帮助
+        \\  --examples             显示完整用法示例
         \\  -v, --version          显示版本（检查更新）
         \\  --update               检查并自动更新
         \\  -l, --lang <LANG>      语言: en, zh, ja
-        \\
-        \\示例:
-        \\  velora add openai
-        \\  velora add cx openai https://api.example.com/v1 sk-xxx
-        \\  velora add cc claude https://api.example.com sk-ant claude-opus-4-6
-        \\  velora use openai
-        \\  velora use cc openai claude-opus-4-6
-        \\  velora cx use openai
-        \\  velora cc use claude
-        \\  velora oc use openai claude-haiku-4-5-20251001
-        \\  velora nb use openai
-        \\  velora ow use openai
-        \\  velora m openai
-        \\  velora s mc off
-        \\  velora s ll off
-        \\  velora s aa on
-        \\  velora s ap off
-        \\  velora s ap on
-        \\  velora s ls alpha
-        \\  velora list
-        \\  velora list -g
-        \\  velora list all
-        \\  velora list --sort=alpha
-        \\  velora list -s tool
-        \\  velora edit openai
-        \\  velora del openai
         \\
         ,
         .ja =>
@@ -420,7 +427,7 @@ fn printHelp(lang: i18n.Language) void {
         \\  add <タイプ> <エイリアス> <URL> <Key> [モデル] サイトを一括で追加 (タイプ: cx, cc, oc, nb, ow)
         \\  edit <エイリアス>                      サイトの設定を編集
         \\  del <エイリアス>                       サイトを削除
-        \\  list                                  サイト一覧表示（接続確認付き）
+        \\  list                                  サイト一覧表示（接続確認、並列）
         \\  list -g                               グローバル検出（アーカイブ含む）
         \\  list all                              サイト詳細表示
         \\  list --sort=<モード>                  ソート: time, alpha, tool, model
@@ -432,7 +439,9 @@ fn printHelp(lang: i18n.Language) void {
         \\  nb use <エイリアス> [モデル]           サイトをNanobotに適用
         \\  ow use <エイリアス> [モデル]           サイトをOpenClawに適用
         \\  models|m <エイリアス>                  サイトの全モデルを表示
+        \\  test|t [エイリアス] [-p|--perf]        モデル呼び出し自動検出 (--perf でベンチマーク・対話選択)
         \\  set|s <項目> <on/off|値>              設定の切り替え
+        \\  help examples                         使用例の一覧を表示
         \\
         \\設定項目 (略称):
         \\  model_check (mc)                      モデル検出 (デフォルト: on)
@@ -450,35 +459,10 @@ fn printHelp(lang: i18n.Language) void {
         \\
         \\オプション:
         \\  -h, --help             ヘルプを表示
+        \\  --examples             使用例の一覧を表示
         \\  -v, --version          バージョンを表示（更新確認）
         \\  --update               更新を確認して適用
         \\  -l, --lang <LANG>      言語: en, zh, ja
-        \\
-        \\例:
-        \\  velora add openai
-        \\  velora add cx openai https://api.example.com/v1 sk-xxx
-        \\  velora add cc claude https://api.example.com sk-ant claude-opus-4-6
-        \\  velora use openai
-        \\  velora use cc openai claude-opus-4-6
-        \\  velora cx use openai
-        \\  velora cc use claude
-        \\  velora oc use openai claude-haiku-4-5-20251001
-        \\  velora nb use openai
-        \\  velora ow use openai
-        \\  velora m openai
-        \\  velora s mc off
-        \\  velora s ll off
-        \\  velora s aa on
-        \\  velora s ap off
-        \\  velora s ap on
-        \\  velora s ls alpha
-        \\  velora list
-        \\  velora list -g
-        \\  velora list all
-        \\  velora list --sort=alpha
-        \\  velora list -s tool
-        \\  velora edit openai
-        \\  velora del openai
         \\
         ,
         .en =>
@@ -489,7 +473,7 @@ fn printHelp(lang: i18n.Language) void {
         \\  add <type> <alias> <url> <key> [model] Add a site directly (type: cx, cc, oc, nb, ow)
         \\  edit <alias>                       Edit site configuration
         \\  del <alias>                        Delete a site
-        \\  list                               List sites with connectivity check
+        \\  list                               List sites with connectivity check (parallel)
         \\  list -g                            Global check (including archived)
         \\  list all                           List sites with full details
         \\  list --sort=<mode>                 Sort: time, alpha, tool, model
@@ -501,7 +485,9 @@ fn printHelp(lang: i18n.Language) void {
         \\  nb use <alias> [model]             Apply site config to Nanobot
         \\  ow use <alias> [model]             Apply site config to OpenClaw
         \\  models|m <alias>                   Browse all models for a site
+        \\  test|t [alias] [-p|--perf]         Auto-test model calls (--perf benchmark with interactive site selection)
         \\  set|s <option> <on/off|value>      Toggle settings
+        \\  help examples                      Show full usage examples
         \\
         \\Settings (shorthand):
         \\  model_check (mc)                   Model detection on use (default: on)
@@ -519,35 +505,155 @@ fn printHelp(lang: i18n.Language) void {
         \\
         \\Options:
         \\  -h, --help             Show help
+        \\  --examples             Show full usage examples
         \\  -v, --version          Show version (checks for updates)
         \\  --update               Check and apply update
         \\  -l, --lang <LANG>      Language: en, zh, ja
         \\
-        \\Examples:
-        \\  velora add openai
+        ,
+    };
+
+    const hint = switch (lang) {
+        .zh => "提示: 运行 'velora help examples' 查看完整用法示例。",
+        .ja => "ヒント: 'velora help examples' で全ての使用例を表示。",
+        .en => "Tip: run 'velora help examples' to see all usage examples.",
+    };
+
+    w.print("{s}{s}{s} v{s}\n\n", .{ cyan, title, reset, main_mod.version }) catch {};
+    w.print("{s}{s}{s}", .{ accent, body, reset }) catch {};
+    w.print("{s}{s}{s}\n", .{ gray, hint, reset }) catch {};
+    w.flush() catch {};
+}
+
+fn printExamples(lang: i18n.Language) void {
+    var stdout_buffer: [8192]u8 = undefined;
+    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+    const w = &stdout_writer.interface;
+    const caps = terminal.TermCaps.detect();
+
+    const cyan = if (caps.color) output.Color.miku_cyan else "";
+    const accent = if (caps.color) output.Color.miku_accent else "";
+    const reset = if (caps.color) output.Color.reset else "";
+
+    const title = switch (lang) {
+        .zh => "velora 用法示例",
+        .ja => "velora 使用例",
+        .en => "velora usage examples",
+    };
+
+    const body = switch (lang) {
+        .zh =>
+        \\添加 / 编辑 / 删除站点:
+        \\  velora add openai                              # 交互式添加
         \\  velora add cx openai https://api.example.com/v1 sk-xxx
         \\  velora add cc claude https://api.example.com sk-ant claude-opus-4-6
-        \\  velora use openai
-        \\  velora use cc openai claude-opus-4-6
-        \\  velora cx use openai
+        \\  velora edit openai                             # 编辑现有站点
+        \\  velora del openai                              # 删除站点
+        \\
+        \\应用站点到工具:
+        \\  velora use openai                              # 自动选默认工具
+        \\  velora use cc openai claude-opus-4-6           # 指定目标工具+模型
+        \\  velora cx use openai                           # 缩写: 应用到 Codex
         \\  velora cc use claude
         \\  velora oc use openai claude-haiku-4-5-20251001
         \\  velora nb use openai
         \\  velora ow use openai
-        \\  velora m openai
-        \\  velora s mc off
-        \\  velora s ll off
-        \\  velora s aa on
-        \\  velora s ap off
-        \\  velora s ap on
-        \\  velora s ls alpha
-        \\  velora list
-        \\  velora list -g
-        \\  velora list all
-        \\  velora list --sort=alpha
+        \\
+        \\查看站点列表:
+        \\  velora list                                    # 默认: 并行连通性检测 + [← 当前使用工具] 标签
+        \\  velora list -g                                 # 含已归档站点
+        \\  velora list all                                # 详细信息（base_url, key, model）
+        \\  velora list --sort=alpha                       # 排序: time / alpha / tool / model
         \\  velora list -s tool
-        \\  velora edit openai
-        \\  velora del openai
+        \\
+        \\模型调用测试 (新增):
+        \\  velora t                                       # 并行测试所有站点的模型可调用性
+        \\  velora t openai                                # 测试单个站点
+        \\  velora t --perf                                # 性能基准测试 (交互式选择站点)
+        \\
+        \\浏览模型 / 设置:
+        \\  velora m openai
+        \\  velora s mc off                                # 关闭 use 时模型检测
+        \\  velora s ll off                                # 关闭 list 时延迟检测
+        \\  velora s aa on                                 # 开启自动归档
+        \\  velora s ap off                                # 关闭类型不匹配时的自动兼容模型选择
+        \\  velora s ls alpha                              # 默认列表排序按 alpha
+        \\
+        ,
+        .ja =>
+        \\サイトの追加 / 編集 / 削除:
+        \\  velora add openai                              # 対話式で追加
+        \\  velora add cx openai https://api.example.com/v1 sk-xxx
+        \\  velora add cc claude https://api.example.com sk-ant claude-opus-4-6
+        \\  velora edit openai                             # 既存サイトを編集
+        \\  velora del openai                              # サイト削除
+        \\
+        \\ツールへ適用:
+        \\  velora use openai                              # デフォルトツールへ自動適用
+        \\  velora use cc openai claude-opus-4-6           # ツールとモデルを指定
+        \\  velora cx use openai                           # 略記: Codex へ適用
+        \\  velora cc use claude
+        \\  velora oc use openai claude-haiku-4-5-20251001
+        \\  velora nb use openai
+        \\  velora ow use openai
+        \\
+        \\サイト一覧:
+        \\  velora list                                    # 並列接続テスト + [← 使用中ツール] タグ
+        \\  velora list -g                                 # アーカイブ済みも含む
+        \\  velora list all                                # 詳細表示
+        \\  velora list --sort=alpha                       # ソート: time / alpha / tool / model
+        \\  velora list -s tool
+        \\
+        \\モデル呼び出しテスト (新機能):
+        \\  velora t                                       # 全サイトのモデル呼び出しを並列検証
+        \\  velora t openai                                # 単一サイトのテスト
+        \\  velora t --perf                                # ベンチマーク (対話的にサイト選択)
+        \\
+        \\モデル一覧 / 設定:
+        \\  velora m openai
+        \\  velora s mc off                                # use 時のモデル検出を無効
+        \\  velora s ll off                                # list 時の遅延チェックを無効
+        \\  velora s aa on                                 # 自動アーカイブを有効
+        \\  velora s ap off                                # 互換モデル自動選択を無効
+        \\  velora s ls alpha                              # 既定ソートを alpha に
+        \\
+        ,
+        .en =>
+        \\Add / edit / remove sites:
+        \\  velora add openai                              # interactive add
+        \\  velora add cx openai https://api.example.com/v1 sk-xxx
+        \\  velora add cc claude https://api.example.com sk-ant claude-opus-4-6
+        \\  velora edit openai                             # edit an existing site
+        \\  velora del openai                              # remove a site
+        \\
+        \\Apply a site to a tool:
+        \\  velora use openai                              # auto-pick default tool
+        \\  velora use cc openai claude-opus-4-6           # explicit tool + model override
+        \\  velora cx use openai                           # short form: apply to Codex
+        \\  velora cc use claude
+        \\  velora oc use openai claude-haiku-4-5-20251001
+        \\  velora nb use openai
+        \\  velora ow use openai
+        \\
+        \\Listing sites:
+        \\  velora list                                    # parallel reachability check + [← in-use] tag
+        \\  velora list -g                                 # include archived sites
+        \\  velora list all                                # full details (base_url, key, model)
+        \\  velora list --sort=alpha                       # sort: time / alpha / tool / model
+        \\  velora list -s tool
+        \\
+        \\Model call tests (new):
+        \\  velora t                                       # test every site's model in parallel
+        \\  velora t openai                                # single-site test
+        \\  velora t --perf                                # interactive benchmark (multi-select)
+        \\
+        \\Browse models / settings:
+        \\  velora m openai
+        \\  velora s mc off                                # disable model detection on use
+        \\  velora s ll off                                # disable latency check on list
+        \\  velora s aa on                                 # enable auto-archive
+        \\  velora s ap off                                # disable compatible-model auto-pick
+        \\  velora s ls alpha                              # default list sort to alpha
         \\
         ,
     };

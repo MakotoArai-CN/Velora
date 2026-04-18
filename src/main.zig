@@ -8,6 +8,7 @@ const config_mod = @import("config.zig");
 const sites_mod = @import("sites.zig");
 const apply_mod = @import("apply.zig");
 const check_mod = @import("check.zig");
+const current_mod = @import("current.zig");
 const install_mod = @import("install.zig");
 const update_mod = @import("update.zig");
 const app = @import("app.zig");
@@ -66,6 +67,7 @@ pub fn main() !void {
         .use => |args| try runUse(gpa, w, caps, lang, args),
         .set => |args| try runSet(gpa, w, caps, lang, args),
         .models => |args| try runModels(gpa, w, caps, lang, args),
+        .model_test => |args| try runModelTest(gpa, w, caps, lang, args),
         .install => try runInstall(gpa, w, caps, lang),
         .uninstall => try runUninstall(gpa, w, caps, lang),
         .update_check => try runUpdate(gpa, w, caps, lang),
@@ -410,6 +412,9 @@ fn runList(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermC
 
     const settings = sites_mod.loadSettings(allocator);
 
+    var current = current_mod.CurrentTools.load(allocator);
+    defer current.deinit(allocator);
+
     // Build list of indices (used for both -a and normal views)
     var all_indices: [64]usize = undefined;
     var all_count: usize = 0;
@@ -430,15 +435,20 @@ fn runList(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermC
             const entry = store.entries[all_indices[ci]];
             try w.print("\n", .{});
 
-            var alias_buf: [128]u8 = undefined;
+            const in_use_mask = current.matchSite(entry.site.base_url, entry.site.api_key);
+            var tag_buf: [384]u8 = undefined;
+            const tag = formatInUseTag(&tag_buf, in_use_mask, caps);
+
+            var alias_buf: [576]u8 = undefined;
             const alias_display = if (entry.site.archived)
-                std.fmt.bufPrint(&alias_buf, "{s} ({s}) [{s}]", .{
+                std.fmt.bufPrint(&alias_buf, "{s} ({s}) [{s}]{s}", .{
                     entry.alias,
                     entry.site.site_type.displayName(),
                     i18n.tr(lang, "archived", "已归档", "アーカイブ済"),
+                    tag,
                 }) catch entry.alias
             else
-                std.fmt.bufPrint(&alias_buf, "{s} ({s})", .{ entry.alias, entry.site.site_type.displayName() }) catch entry.alias;
+                std.fmt.bufPrint(&alias_buf, "{s} ({s}){s}", .{ entry.alias, entry.site.site_type.displayName(), tag }) catch entry.alias;
             try output.printInfo(w, alias_display, caps);
             try output.printKeyValue(w, "    Base URL:", entry.site.base_url, caps);
             var masked_buf: [64]u8 = undefined;
@@ -489,13 +499,16 @@ fn runList(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermC
                 }) catch " [archived]"
             else
                 "";
-            var line_buf: [256]u8 = undefined;
-            const line = std.fmt.bufPrint(&line_buf, "  {s}{s} ({s}){s}{s}", .{
+            var use_tag_buf: [384]u8 = undefined;
+            const use_tag = formatInUseTag(&use_tag_buf, current.matchSite(entry.site.base_url, entry.site.api_key), caps);
+            var line_buf: [640]u8 = undefined;
+            const line = std.fmt.bufPrint(&line_buf, "  {s}{s} ({s}){s}{s}{s}", .{
                 if (caps.color) output.Color.miku_white else "",
                 entry.alias,
                 entry.site.site_type.displayName(),
                 archived_tag,
                 if (caps.color) output.Color.reset else "",
+                use_tag,
             }) catch "";
             try w.print("{s}\n", .{line});
         }
@@ -507,47 +520,129 @@ fn runList(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermC
     // Phase 1: Print all sites with pending status
     for (0..check_count) |ci| {
         const entry = store.entries[check_indices[ci]];
-        try printSitePendingLine(w, caps, entry.alias, entry.site.site_type);
+        var use_tag_buf: [384]u8 = undefined;
+        const use_tag = formatInUseTag(&use_tag_buf, current.matchSite(entry.site.base_url, entry.site.api_key), caps);
+        try printSitePendingLine(w, caps, entry.alias, entry.site.site_type, use_tag);
     }
     try w.flush();
 
-    // Phase 2: Test each site and update the line in place
-    var store_changed = false;
+    // Phase 2: Run all connectivity checks in parallel and repaint each row
+    // as it completes. Per-task worker owns a page_allocator-backed context
+    // with a 2-count refcount so detached stragglers can clean up safely.
+    var tasks: [sites_mod.MAX_SITES]?*CheckTask = [_]?*CheckTask{null} ** sites_mod.MAX_SITES;
+    defer for (tasks[0..check_count]) |maybe_t| {
+        if (maybe_t) |t| releaseCheckTask(t);
+    };
+    var threads: [sites_mod.MAX_SITES]?std.Thread = [_]?std.Thread{null} ** sites_mod.MAX_SITES;
+    var rendered: [sites_mod.MAX_SITES]bool = [_]bool{false} ** sites_mod.MAX_SITES;
+    var final_results: [sites_mod.MAX_SITES]check_mod.ConnectivityResult =
+        [_]check_mod.ConnectivityResult{.{ .reachable = false, .latency_ms = null }} ** sites_mod.MAX_SITES;
+
+    // Spawn all workers
     for (0..check_count) |ci| {
-        const idx = check_indices[ci];
-        const entry = store.entries[idx];
-        const conn = check_mod.checkConnectivity(allocator, entry.site.base_url);
+        const entry = store.entries[check_indices[ci]];
+        const owned_url = std.heap.page_allocator.dupe(u8, entry.site.base_url) catch continue;
+        const task = std.heap.page_allocator.create(CheckTask) catch {
+            std.heap.page_allocator.free(owned_url);
+            continue;
+        };
+        task.* = .{ .owned_url = owned_url };
+        tasks[ci] = task;
+        threads[ci] = std.Thread.spawn(.{}, checkWorker, .{task}) catch {
+            releaseCheckTask(task);
+            tasks[ci] = null;
+            continue;
+        };
+    }
 
-        const lines_up = check_count - ci;
-        var esc_buf: [32]u8 = undefined;
-        const esc = std.fmt.bufPrint(&esc_buf, "\x1b[{d}A\r\x1b[2K", .{lines_up}) catch "";
-        try w.print("{s}", .{esc});
+    // Poll for completions, repaint each newly-finished row.
+    // Batch timeout is slightly above the 10s-per-request HTTP timeout
+    // embedded inside checkConnectivityInner via std.http.Client defaults.
+    const batch_start = std.time.milliTimestamp();
+    const batch_timeout_ms: i64 = 15000;
+    var done_count: usize = 0;
 
+    while (done_count < check_count) {
+        var progress = false;
+        for (0..check_count) |ci| {
+            if (rendered[ci]) continue;
+            const entry = store.entries[check_indices[ci]];
+
+            const finished: ?check_mod.ConnectivityResult = blk: {
+                const t = tasks[ci] orelse break :blk .{ .reachable = false, .latency_ms = null };
+                if (t.done.load(.acquire)) break :blk t.result;
+                break :blk null;
+            };
+            const conn = finished orelse continue;
+
+            final_results[ci] = conn;
+            rendered[ci] = true;
+            done_count += 1;
+            progress = true;
+
+            const status = check_mod.SiteStatus{
+                .alias = entry.alias,
+                .site = entry.site,
+                .conn = conn,
+            };
+            var use_tag_buf: [384]u8 = undefined;
+            const use_tag = formatInUseTag(&use_tag_buf, current.matchSite(entry.site.base_url, entry.site.api_key), caps);
+            try repaintStatusRow(w, caps, ci, check_count, status, use_tag);
+        }
+
+        if (done_count >= check_count) break;
+        if (std.time.milliTimestamp() - batch_start > batch_timeout_ms) break;
+        if (!progress) {
+            try w.flush();
+            std.Thread.sleep(50 * std.time.ns_per_ms);
+        }
+    }
+
+    // Any still-unrendered row is treated as timed out — draw it as unreachable.
+    for (0..check_count) |ci| {
+        if (rendered[ci]) continue;
+        const entry = store.entries[check_indices[ci]];
+        const conn = check_mod.ConnectivityResult{ .reachable = false, .latency_ms = null };
+        final_results[ci] = conn;
+        rendered[ci] = true;
         const status = check_mod.SiteStatus{
             .alias = entry.alias,
             .site = entry.site,
             .conn = conn,
         };
-        try printSiteStatusLine(w, caps, status, 0);
+        var use_tag_buf: [384]u8 = undefined;
+        const use_tag = formatInUseTag(&use_tag_buf, current.matchSite(entry.site.base_url, entry.site.api_key), caps);
+        try repaintStatusRow(w, caps, ci, check_count, status, use_tag);
+    }
+    try w.flush();
 
-        var down_buf: [32]u8 = undefined;
-        const down = std.fmt.bufPrint(&down_buf, "\x1b[{d}B", .{lines_up}) catch "";
-        try w.print("{s}", .{down});
-        try w.flush();
+    // Reap threads: join the ones that already finished, detach stragglers
+    // (the task's refcount guarantees the worker thread can still clean up).
+    for (0..check_count) |ci| {
+        const th = threads[ci] orelse continue;
+        const t = tasks[ci] orelse {
+            th.join();
+            continue;
+        };
+        if (t.done.load(.acquire)) th.join() else th.detach();
+    }
 
-        // Smart archival logic (only when auto_archive is enabled)
+    // Apply auto-archive logic using the final results we captured
+    var store_changed = false;
+    for (0..check_count) |ci| {
+        const idx = check_indices[ci];
+        const entry = store.entries[idx];
+        const conn = final_results[ci];
+
         if (settings.auto_archive) {
             if (!conn.reachable and !entry.site.archived) {
-                // Auto-archive unreachable site
                 store.entries[idx].site.archived = true;
                 store_changed = true;
             } else if (conn.reachable and entry.site.archived) {
-                // Auto-unarchive reachable archived site
                 store.entries[idx].site.archived = false;
                 store_changed = true;
             }
         } else if (args.global_check) {
-            // In -g mode without auto_archive, still auto-unarchive reachable archived sites
             if (conn.reachable and entry.site.archived) {
                 store.entries[idx].site.archived = false;
                 store_changed = true;
@@ -555,13 +650,54 @@ fn runList(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermC
         }
     }
 
-    try w.flush();
-
     if (store_changed) {
         sites_mod.saveSites(allocator, &store) catch {};
     }
 
     try output.printSeparator(w, caps);
+    try w.flush();
+}
+
+/// Worker-thread context for a single parallel connectivity check.
+/// Refcount starts at 2 (main + worker); whichever side decrements last frees.
+const CheckTask = struct {
+    owned_url: []u8,
+    result: check_mod.ConnectivityResult = .{ .reachable = false, .latency_ms = null },
+    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    refs: std.atomic.Value(u32) = std.atomic.Value(u32).init(2),
+};
+
+fn releaseCheckTask(t: *CheckTask) void {
+    if (t.refs.fetchSub(1, .acq_rel) == 1) {
+        std.heap.page_allocator.free(t.owned_url);
+        std.heap.page_allocator.destroy(t);
+    }
+}
+
+fn checkWorker(t: *CheckTask) void {
+    t.result = check_mod.checkConnectivityInner(std.heap.page_allocator, t.owned_url);
+    t.done.store(true, .release);
+    releaseCheckTask(t);
+}
+
+/// Move the cursor up to the target row inside the previously-printed pending
+/// block, clear the line, render the finished status, then return to the bottom.
+fn repaintStatusRow(
+    w: *std.Io.Writer,
+    caps: terminal.TermCaps,
+    row_ci: usize,
+    total_rows: usize,
+    status: check_mod.SiteStatus,
+    in_use_tag: []const u8,
+) !void {
+    const lines_up = total_rows - row_ci;
+    var esc_buf: [32]u8 = undefined;
+    const esc = std.fmt.bufPrint(&esc_buf, "\x1b[{d}A\r\x1b[2K", .{lines_up}) catch "";
+    try w.print("{s}", .{esc});
+    try printSiteStatusLine(w, caps, status, 0, in_use_tag);
+    var down_buf: [32]u8 = undefined;
+    const down = std.fmt.bufPrint(&down_buf, "\x1b[{d}B", .{lines_up}) catch "";
+    try w.print("{s}", .{down});
     try w.flush();
 }
 
@@ -603,10 +739,10 @@ fn compareEntries(store: *const sites_mod.SitesStore, a_idx: usize, b_idx: usize
     };
 }
 
-fn printSitePendingLine(w: *std.Io.Writer, caps: terminal.TermCaps, alias: []const u8, site_type: sites_mod.SiteType) !void {
+fn printSitePendingLine(w: *std.Io.Writer, caps: terminal.TermCaps, alias: []const u8, site_type: sites_mod.SiteType, in_use_tag: []const u8) !void {
     const pending_sym = if (caps.unicode) "◌" else "[.]";
-    var line_buf: [256]u8 = undefined;
-    const line = std.fmt.bufPrint(&line_buf, "  {s}{s}{s}{s} {s} ({s}) {s}...{s}", .{
+    var line_buf: [768]u8 = undefined;
+    const line = std.fmt.bufPrint(&line_buf, "  {s}{s}{s}{s} {s} ({s}) {s}...{s}{s}", .{
         if (caps.color) output.Color.miku_gray else "",
         pending_sym,
         if (caps.color) output.Color.reset else "",
@@ -615,11 +751,12 @@ fn printSitePendingLine(w: *std.Io.Writer, caps: terminal.TermCaps, alias: []con
         site_type.displayName(),
         if (caps.color) output.Color.miku_gray else "",
         if (caps.color) output.Color.reset else "",
+        in_use_tag,
     }) catch "";
     try w.print("{s}\n", .{line});
 }
 
-fn printSiteStatusLine(w: *std.Io.Writer, caps: terminal.TermCaps, status: check_mod.SiteStatus, col_width: u32) !void {
+fn printSiteStatusLine(w: *std.Io.Writer, caps: terminal.TermCaps, status: check_mod.SiteStatus, col_width: u32, in_use_tag: []const u8) !void {
     const check_sym = if (caps.unicode) "✓" else "[OK]";
     const fail_sym = if (caps.unicode) "✗" else "[X]";
 
@@ -630,8 +767,8 @@ fn printSiteStatusLine(w: *std.Io.Writer, caps: terminal.TermCaps, status: check
         else
             "?";
 
-        var line_buf: [256]u8 = undefined;
-        const line = std.fmt.bufPrint(&line_buf, "  {s}{s}{s}{s} {s} ({s}) {s}{s}{s}", .{
+        var line_buf: [768]u8 = undefined;
+        const line = std.fmt.bufPrint(&line_buf, "  {s}{s}{s}{s} {s} ({s}) {s}{s}{s}{s}", .{
             if (caps.color) output.Color.miku_green else "",
             check_sym,
             if (caps.color) output.Color.reset else "",
@@ -641,11 +778,12 @@ fn printSiteStatusLine(w: *std.Io.Writer, caps: terminal.TermCaps, status: check
             if (caps.color) output.Color.miku_gray else "",
             latency_str,
             if (caps.color) output.Color.reset else "",
+            in_use_tag,
         }) catch "";
         try w.print("{s}", .{line});
     } else {
-        var line_buf: [256]u8 = undefined;
-        const line = std.fmt.bufPrint(&line_buf, "  {s}{s}{s}{s} {s} ({s}) {s}unreachable{s}", .{
+        var line_buf: [768]u8 = undefined;
+        const line = std.fmt.bufPrint(&line_buf, "  {s}{s}{s}{s} {s} ({s}) {s}unreachable{s}{s}", .{
             if (caps.color) output.Color.miku_red else "",
             fail_sym,
             if (caps.color) output.Color.reset else "",
@@ -654,6 +792,7 @@ fn printSiteStatusLine(w: *std.Io.Writer, caps: terminal.TermCaps, status: check
             status.site.site_type.displayName(),
             if (caps.color) output.Color.miku_red else "",
             if (caps.color) output.Color.reset else "",
+            in_use_tag,
         }) catch "";
         try w.print("{s}", .{line});
     }
@@ -670,6 +809,62 @@ fn printSiteStatusLine(w: *std.Io.Writer, caps: terminal.TermCaps, status: check
     } else {
         try w.print("\n", .{});
     }
+}
+
+/// Build a " [← cx, cc]" style suffix listing every tool currently pointed at a site.
+/// Returns "" (empty slice) when no tools match. When the terminal does not
+/// advertise unicode we fall back to the ASCII marker "<-". When color is
+/// supported, the whole tag renders in bold accent to stand out from the row.
+fn formatInUseTag(buf: []u8, mask: u8, caps: terminal.TermCaps) []const u8 {
+    if (mask == 0) return "";
+    var fbs = std.io.fixedBufferStream(buf);
+    const fw = fbs.writer();
+    fw.writeAll(" ") catch return "";
+    if (caps.color) {
+        fw.writeAll(output.Color.bold) catch return "";
+        fw.writeAll(output.Color.miku_gray) catch return "";
+    }
+    fw.writeAll("[") catch return "";
+    if (caps.color) {
+        fw.writeAll(output.Color.reset) catch return "";
+        fw.writeAll(output.Color.bold) catch return "";
+        fw.writeAll(output.Color.miku_accent) catch return "";
+    }
+    if (caps.unicode) {
+        fw.writeAll("← ") catch return "";
+    } else {
+        fw.writeAll("<- ") catch return "";
+    }
+    if (caps.color) {
+        fw.writeAll(output.Color.reset) catch return "";
+        fw.writeAll(output.Color.bold) catch return "";
+        fw.writeAll(output.Color.miku_cyan) catch return "";
+    }
+    var first = true;
+    for ([_]sites_mod.SiteType{ .cx, .cc, .oc, .nb, .ow }) |tool| {
+        if ((mask & sites_mod.toolMask(tool)) == 0) continue;
+        if (!first) {
+            if (caps.color) {
+                fw.writeAll(output.Color.reset) catch return "";
+                fw.writeAll(output.Color.miku_gray) catch return "";
+            }
+            fw.writeAll(", ") catch return "";
+            if (caps.color) {
+                fw.writeAll(output.Color.bold) catch return "";
+                fw.writeAll(output.Color.miku_cyan) catch return "";
+            }
+        }
+        fw.writeAll(tool.toString()) catch return "";
+        first = false;
+    }
+    if (caps.color) {
+        fw.writeAll(output.Color.reset) catch return "";
+        fw.writeAll(output.Color.bold) catch return "";
+        fw.writeAll(output.Color.miku_gray) catch return "";
+    }
+    fw.writeAll("]") catch return "";
+    if (caps.color) fw.writeAll(output.Color.reset) catch return "";
+    return fbs.getWritten();
 }
 
 // --- Use ---
@@ -846,6 +1041,12 @@ fn runUse(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCa
         return;
     }
 
+    try output.printInfo(w, i18n.tr(lang, "Testing model call...", "正在测试模型调用...", "モデル呼び出しをテスト中..."), caps);
+    try w.flush();
+
+    const model = tool_model;
+    const call_result = check_mod.testModelCall(allocator, updated_site.base_url, updated_site.api_key, model, target_type);
+
     try output.printInfo(w, i18n.tr(lang, "Detecting models...", "正在检测模型...", "モデルを検出中..."), caps);
     try w.flush();
 
@@ -875,16 +1076,11 @@ fn runUse(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCa
                 .unknown => {},
             }
         }
+    } else if (call_result.success) {
+        try output.printInfo(w, i18n.tr(lang, "Model listing restricted, but model call verified", "模型列表受限，但模型调用已验证", "モデル一覧は制限されていますが、モデル呼び出しは確認済みです"), caps);
     } else {
         try output.printWarning(w, i18n.tr(lang, "Could not detect models (auth may be required)", "无法检测模型（可能需要认证）", "モデルを検出できません（認証が必要な場合があります）"), caps);
     }
-
-    // Model call test
-    const model = tool_model;
-    try output.printInfo(w, i18n.tr(lang, "Testing model call...", "正在测试模型调用...", "モデル呼び出しをテスト中..."), caps);
-    try w.flush();
-
-    const call_result = check_mod.testModelCall(allocator, updated_site.base_url, updated_site.api_key, model, target_type);
 
     // Report model list presence
     if (call_result.model_in_list) {
@@ -1101,6 +1297,484 @@ fn runModels(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.Ter
 
     try output.printSeparator(w, caps);
     try w.flush();
+}
+
+// --- Test (model call + benchmark) ---
+
+const ModelTestTask = struct {
+    site_alias: []const u8,
+    site_type: sites_mod.SiteType,
+    model: []const u8,
+    /// page_allocator-owned copies the worker can read after the main thread
+    /// returns control to the caller.
+    owned_url: []u8,
+    owned_key: []u8,
+    owned_model: []u8,
+    perf_mode: bool,
+    started_at_ms: i64 = 0,
+
+    /// Filled in by worker before signalling done.
+    call_result: check_mod.ModelCallResult = .{ .success = false, .error_msg = "Pending" },
+    bench_result: check_mod.BenchResult = .{ .success = false, .error_msg = "Pending" },
+
+    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    refs: std.atomic.Value(u32) = std.atomic.Value(u32).init(2),
+};
+
+fn releaseModelTestTask(t: *ModelTestTask) void {
+    if (t.refs.fetchSub(1, .acq_rel) == 1) {
+        std.heap.page_allocator.free(t.owned_url);
+        std.heap.page_allocator.free(t.owned_key);
+        std.heap.page_allocator.free(t.owned_model);
+        std.heap.page_allocator.destroy(t);
+    }
+}
+
+fn modelTestWorker(t: *ModelTestTask) void {
+    if (t.perf_mode) {
+        t.bench_result = check_mod.benchmarkModel(std.heap.page_allocator, t.owned_url, t.owned_key, t.owned_model, t.site_type);
+    } else {
+        t.call_result = check_mod.testModelCall(std.heap.page_allocator, t.owned_url, t.owned_key, t.owned_model, t.site_type);
+    }
+    t.done.store(true, .release);
+    releaseModelTestTask(t);
+}
+
+fn runModelTest(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCaps, lang: i18n.Language, args: cli.TestArgs) !void {
+    try output.printSectionHeader(w, if (args.perf)
+        i18n.tr(lang, "Model Benchmark", "模型基准测试", "モデルベンチマーク")
+    else
+        i18n.tr(lang, "Model Test", "模型调用测试", "モデル呼び出しテスト"), caps);
+
+    var store = try sites_mod.loadSites(allocator);
+    defer store.deinit(allocator);
+
+    if (store.count == 0) {
+        try output.printInfo(w, i18n.tr(lang, "No sites configured.", "未配置站点", "サイトが未設定です"), caps);
+        try w.flush();
+        return;
+    }
+
+    // Decide which sites to target
+    var target_indices: [sites_mod.MAX_SITES]usize = undefined;
+    var target_count: usize = 0;
+
+    if (args.alias) |alias| {
+        const found = blk: {
+            for (0..store.count) |i| {
+                if (std.mem.eql(u8, store.entries[i].alias, alias)) break :blk i;
+            }
+            break :blk null;
+        };
+        const idx = found orelse {
+            var err_buf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrint(&err_buf, "Site '{s}' not found", .{alias}) catch "Site not found";
+            try output.printError(w, msg, caps);
+            try w.flush();
+            return;
+        };
+        target_indices[0] = idx;
+        target_count = 1;
+    } else if (args.perf) {
+        target_count = try interactiveSelectSites(w, caps, lang, &store, &target_indices);
+        if (target_count == 0) {
+            try output.printInfo(w, i18n.tr(lang, "No sites selected.", "未选择任何站点", "サイトが選択されていません"), caps);
+            try w.flush();
+            return;
+        }
+    } else {
+        for (0..store.count) |i| {
+            if (store.entries[i].site.archived) continue;
+            target_indices[target_count] = i;
+            target_count += 1;
+        }
+        if (target_count == 0) {
+            try output.printInfo(w, i18n.tr(lang, "No active sites.", "无活跃站点", "アクティブなサイトがありません"), caps);
+            try w.flush();
+            return;
+        }
+    }
+
+    try runParallelModelTest(allocator, w, caps, lang, &store, target_indices[0..target_count], args.perf);
+}
+
+fn runParallelModelTest(
+    allocator: std.mem.Allocator,
+    w: *std.Io.Writer,
+    caps: terminal.TermCaps,
+    lang: i18n.Language,
+    store: *const sites_mod.SitesStore,
+    indices: []const usize,
+    perf_mode: bool,
+) !void {
+    _ = allocator;
+    const count = indices.len;
+
+    // Phase 1: print one pending row per site
+    for (indices, 0..) |idx, ci| {
+        const entry = store.entries[idx];
+        const model = entry.site.effectiveModelForTool(entry.site.site_type);
+        try printModelTestPendingRow(w, caps, entry.alias, entry.site.site_type, model, 0);
+        _ = ci;
+    }
+    try w.flush();
+
+    // Spawn one worker per site
+    var tasks: [sites_mod.MAX_SITES]?*ModelTestTask = [_]?*ModelTestTask{null} ** sites_mod.MAX_SITES;
+    defer for (tasks[0..count]) |maybe_t| {
+        if (maybe_t) |t| releaseModelTestTask(t);
+    };
+    var threads: [sites_mod.MAX_SITES]?std.Thread = [_]?std.Thread{null} ** sites_mod.MAX_SITES;
+    var rendered: [sites_mod.MAX_SITES]bool = [_]bool{false} ** sites_mod.MAX_SITES;
+
+    const launch_at_ms = std.time.milliTimestamp();
+    for (indices, 0..) |idx, ci| {
+        const entry = store.entries[idx];
+        const model = entry.site.effectiveModelForTool(entry.site.site_type);
+        const owned_url = std.heap.page_allocator.dupe(u8, entry.site.base_url) catch continue;
+        const owned_key = std.heap.page_allocator.dupe(u8, entry.site.api_key) catch {
+            std.heap.page_allocator.free(owned_url);
+            continue;
+        };
+        const owned_model = std.heap.page_allocator.dupe(u8, model) catch {
+            std.heap.page_allocator.free(owned_url);
+            std.heap.page_allocator.free(owned_key);
+            continue;
+        };
+        const task = std.heap.page_allocator.create(ModelTestTask) catch {
+            std.heap.page_allocator.free(owned_url);
+            std.heap.page_allocator.free(owned_key);
+            std.heap.page_allocator.free(owned_model);
+            continue;
+        };
+        task.* = .{
+            .site_alias = entry.alias,
+            .site_type = entry.site.site_type,
+            .model = entry.site.effectiveModelForTool(entry.site.site_type),
+            .owned_url = owned_url,
+            .owned_key = owned_key,
+            .owned_model = owned_model,
+            .perf_mode = perf_mode,
+            .started_at_ms = launch_at_ms,
+        };
+        tasks[ci] = task;
+        threads[ci] = std.Thread.spawn(.{}, modelTestWorker, .{task}) catch {
+            releaseModelTestTask(task);
+            tasks[ci] = null;
+            continue;
+        };
+    }
+
+    // Poll: repaint completed rows immediately, animate spinner on pending rows.
+    const poll_start = std.time.milliTimestamp();
+    const batch_timeout_ms: i64 = if (perf_mode) 65000 else 20000;
+    var done_count: usize = 0;
+    var spinner_idx: usize = 0;
+
+    while (done_count < count) {
+        for (indices, 0..) |idx, ci| {
+            if (rendered[ci]) continue;
+            const entry = store.entries[idx];
+            const model = entry.site.effectiveModelForTool(entry.site.site_type);
+            const t = tasks[ci];
+
+            if (t == null) {
+                try repaintModelTestRowFinal(w, caps, lang, ci, count, entry.alias, entry.site.site_type, model, perf_mode, .{ .success = false, .error_msg = "Spawn failed" }, .{ .success = false, .error_msg = "Spawn failed" });
+                rendered[ci] = true;
+                done_count += 1;
+                continue;
+            }
+            if (t.?.done.load(.acquire)) {
+                try repaintModelTestRowFinal(w, caps, lang, ci, count, entry.alias, entry.site.site_type, model, perf_mode, t.?.call_result, t.?.bench_result);
+                rendered[ci] = true;
+                done_count += 1;
+                continue;
+            }
+
+            const elapsed_ms = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - launch_at_ms)));
+            try repaintModelTestRowSpinner(w, caps, ci, count, entry.alias, entry.site.site_type, model, spinner_idx, elapsed_ms);
+        }
+
+        if (done_count >= count) break;
+        if (std.time.milliTimestamp() - poll_start > batch_timeout_ms) break;
+        try w.flush();
+        std.Thread.sleep(120 * std.time.ns_per_ms);
+        spinner_idx +%= 1;
+    }
+
+    // Render any remaining as timed out
+    for (indices, 0..) |idx, ci| {
+        if (rendered[ci]) continue;
+        const entry = store.entries[idx];
+        const model = entry.site.effectiveModelForTool(entry.site.site_type);
+        try repaintModelTestRowFinal(w, caps, lang, ci, count, entry.alias, entry.site.site_type, model, perf_mode, .{ .success = false, .error_msg = "Timeout" }, .{ .success = false, .error_msg = "Timeout" });
+        rendered[ci] = true;
+    }
+    try w.flush();
+
+    // Reap threads (join finished, detach stragglers; refcount keeps tasks alive)
+    for (0..count) |ci| {
+        const th = threads[ci] orelse continue;
+        const t = tasks[ci] orelse {
+            th.join();
+            continue;
+        };
+        if (t.done.load(.acquire)) th.join() else th.detach();
+    }
+
+    try output.printSeparator(w, caps);
+    try w.flush();
+}
+
+const SPINNER_FRAMES_UNICODE = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
+const SPINNER_FRAMES_ASCII = [_][]const u8{ "|", "/", "-", "\\" };
+
+fn spinnerChar(caps: terminal.TermCaps, idx: usize) []const u8 {
+    if (caps.unicode) return SPINNER_FRAMES_UNICODE[idx % SPINNER_FRAMES_UNICODE.len];
+    return SPINNER_FRAMES_ASCII[idx % SPINNER_FRAMES_ASCII.len];
+}
+
+fn printModelTestPendingRow(
+    w: *std.Io.Writer,
+    caps: terminal.TermCaps,
+    alias: []const u8,
+    site_type: sites_mod.SiteType,
+    model: []const u8,
+    spinner_idx: usize,
+) !void {
+    const spin = spinnerChar(caps, spinner_idx);
+    var line_buf: [512]u8 = undefined;
+    const line = std.fmt.bufPrint(&line_buf, "  {s}{s}{s} {s}{s}{s} ({s}) {s}[{s}]{s} {s}testing...{s}", .{
+        if (caps.color) output.Color.miku_cyan else "",
+        spin,
+        if (caps.color) output.Color.reset else "",
+        if (caps.color) output.Color.miku_white else "",
+        alias,
+        if (caps.color) output.Color.reset else "",
+        site_type.displayName(),
+        if (caps.color) output.Color.miku_gray else "",
+        model,
+        if (caps.color) output.Color.reset else "",
+        if (caps.color) output.Color.miku_gray else "",
+        if (caps.color) output.Color.reset else "",
+    }) catch "";
+    try w.print("{s}\n", .{line});
+}
+
+fn repaintModelTestRowSpinner(
+    w: *std.Io.Writer,
+    caps: terminal.TermCaps,
+    row_ci: usize,
+    total_rows: usize,
+    alias: []const u8,
+    site_type: sites_mod.SiteType,
+    model: []const u8,
+    spinner_idx: usize,
+    elapsed_ms: u64,
+) !void {
+    const spin = spinnerChar(caps, spinner_idx);
+    const lines_up = total_rows - row_ci;
+    var esc_buf: [32]u8 = undefined;
+    const esc = std.fmt.bufPrint(&esc_buf, "\x1b[{d}A\r\x1b[2K", .{lines_up}) catch "";
+    try w.print("{s}", .{esc});
+
+    var elapsed_buf: [32]u8 = undefined;
+    const elapsed_str = std.fmt.bufPrint(&elapsed_buf, "{d}.{d}s", .{ elapsed_ms / 1000, (elapsed_ms % 1000) / 100 }) catch "?s";
+
+    var line_buf: [512]u8 = undefined;
+    const line = std.fmt.bufPrint(&line_buf, "  {s}{s}{s} {s}{s}{s} ({s}) {s}[{s}]{s} {s}testing... {s}{s}", .{
+        if (caps.color) output.Color.miku_cyan else "",
+        spin,
+        if (caps.color) output.Color.reset else "",
+        if (caps.color) output.Color.miku_white else "",
+        alias,
+        if (caps.color) output.Color.reset else "",
+        site_type.displayName(),
+        if (caps.color) output.Color.miku_gray else "",
+        model,
+        if (caps.color) output.Color.reset else "",
+        if (caps.color) output.Color.miku_gray else "",
+        elapsed_str,
+        if (caps.color) output.Color.reset else "",
+    }) catch "";
+    try w.print("{s}", .{line});
+
+    var down_buf: [32]u8 = undefined;
+    const down = std.fmt.bufPrint(&down_buf, "\x1b[{d}B", .{lines_up}) catch "";
+    try w.print("{s}", .{down});
+}
+
+fn repaintModelTestRowFinal(
+    w: *std.Io.Writer,
+    caps: terminal.TermCaps,
+    lang: i18n.Language,
+    row_ci: usize,
+    total_rows: usize,
+    alias: []const u8,
+    site_type: sites_mod.SiteType,
+    model: []const u8,
+    perf_mode: bool,
+    call_result: check_mod.ModelCallResult,
+    bench_result: check_mod.BenchResult,
+) !void {
+    const lines_up = total_rows - row_ci;
+    var esc_buf: [32]u8 = undefined;
+    const esc = std.fmt.bufPrint(&esc_buf, "\x1b[{d}A\r\x1b[2K", .{lines_up}) catch "";
+    try w.print("{s}", .{esc});
+
+    const ok_sym = if (caps.unicode) "✓" else "[OK]";
+    const fail_sym = if (caps.unicode) "✗" else "[X]";
+    const success = if (perf_mode) bench_result.success else call_result.success;
+
+    var detail_buf: [256]u8 = undefined;
+    const detail: []const u8 = if (perf_mode) blk: {
+        if (success) {
+            break :blk std.fmt.bufPrint(&detail_buf, "{d}ms  {d:.1} tok/s  {d} tokens", .{
+                bench_result.total_ms,
+                bench_result.tokens_per_sec,
+                bench_result.output_tokens,
+            }) catch "ok";
+        } else {
+            const msg = bench_result.error_msg orelse i18n.tr(lang, "failed", "失败", "失敗");
+            break :blk std.fmt.bufPrint(&detail_buf, "{s}", .{msg}) catch "failed";
+        }
+    } else blk: {
+        if (success) {
+            const ms = call_result.latency_ms orelse 0;
+            break :blk std.fmt.bufPrint(&detail_buf, "{d}ms  callable", .{ms}) catch "ok";
+        } else {
+            const msg = call_result.error_msg orelse i18n.tr(lang, "failed", "失败", "失敗");
+            break :blk std.fmt.bufPrint(&detail_buf, "{s}", .{msg}) catch "failed";
+        }
+    };
+
+    var line_buf: [768]u8 = undefined;
+    const line = std.fmt.bufPrint(&line_buf, "  {s}{s}{s} {s}{s}{s} ({s}) {s}[{s}]{s} {s}{s}{s}", .{
+        if (caps.color) (if (success) output.Color.miku_green else output.Color.miku_red) else "",
+        if (success) ok_sym else fail_sym,
+        if (caps.color) output.Color.reset else "",
+        if (caps.color) output.Color.miku_white else "",
+        alias,
+        if (caps.color) output.Color.reset else "",
+        site_type.displayName(),
+        if (caps.color) output.Color.miku_gray else "",
+        model,
+        if (caps.color) output.Color.reset else "",
+        if (caps.color) (if (success) output.Color.miku_white else output.Color.miku_red) else "",
+        detail,
+        if (caps.color) output.Color.reset else "",
+    }) catch "";
+    try w.print("{s}", .{line});
+
+    var down_buf: [32]u8 = undefined;
+    const down = std.fmt.bufPrint(&down_buf, "\x1b[{d}B", .{lines_up}) catch "";
+    try w.print("{s}", .{down});
+}
+
+/// Interactive picker for `velora test --perf`. Prompts the user for an
+/// optional tool-type filter, then a comma-separated list of site indices
+/// (or "a"/"all" for everything in the filtered set).
+/// Writes selected indices into `out` (sliced from the store) and returns
+/// how many were chosen.
+fn interactiveSelectSites(
+    w: *std.Io.Writer,
+    caps: terminal.TermCaps,
+    lang: i18n.Language,
+    store: *const sites_mod.SitesStore,
+    out: *[sites_mod.MAX_SITES]usize,
+) !usize {
+    try output.printInfo(w, i18n.tr(lang, "Filter by tool type:", "按工具类型筛选:", "ツール種別で絞り込み:"), caps);
+    try output.printMenuItem(w, 1, "all", caps);
+    try output.printMenuItem(w, 2, "cx (Codex)", caps);
+    try output.printMenuItem(w, 3, "cc (Claude Code)", caps);
+    try output.printMenuItem(w, 4, "oc (OpenCode)", caps);
+    try output.printMenuItem(w, 5, "nb (Nanobot)", caps);
+    try output.printMenuItem(w, 6, "ow (OpenClaw)", caps);
+    try output.printPrompt(w, i18n.tr(lang, "[1-6, Enter=all]:", "[1-6, 回车=全部]:", "[1-6, Enter=全部]:"), caps);
+    try w.flush();
+
+    const filter_input = readLine();
+    const filter: ?sites_mod.SiteType = if (filter_input.len == 0 or std.mem.eql(u8, filter_input, "1") or std.mem.eql(u8, filter_input, "all"))
+        null
+    else if (std.mem.eql(u8, filter_input, "2") or std.mem.eql(u8, filter_input, "cx"))
+        .cx
+    else if (std.mem.eql(u8, filter_input, "3") or std.mem.eql(u8, filter_input, "cc"))
+        .cc
+    else if (std.mem.eql(u8, filter_input, "4") or std.mem.eql(u8, filter_input, "oc"))
+        .oc
+    else if (std.mem.eql(u8, filter_input, "5") or std.mem.eql(u8, filter_input, "nb"))
+        .nb
+    else if (std.mem.eql(u8, filter_input, "6") or std.mem.eql(u8, filter_input, "ow"))
+        .ow
+    else if (sites_mod.SiteType.fromString(filter_input)) |st|
+        st
+    else
+        null;
+
+    // Build candidate list (non-archived sites that pass the filter)
+    var candidates: [sites_mod.MAX_SITES]usize = undefined;
+    var cand_count: usize = 0;
+    for (0..store.count) |i| {
+        const e = store.entries[i];
+        if (e.site.archived) continue;
+        if (filter) |ft| {
+            if (!sites_mod.hasDefaultTool(e.site, ft) and e.site.site_type != ft) continue;
+        }
+        candidates[cand_count] = i;
+        cand_count += 1;
+    }
+
+    if (cand_count == 0) {
+        try output.printWarning(w, i18n.tr(lang, "No sites match the filter.", "没有匹配筛选的站点", "条件に一致するサイトがありません"), caps);
+        try w.flush();
+        return 0;
+    }
+
+    try output.printInfo(w, i18n.tr(lang, "Pick sites to benchmark:", "选择要基准测试的站点:", "ベンチマークするサイトを選択:"), caps);
+    for (candidates[0..cand_count], 0..) |idx, ci| {
+        const e = store.entries[idx];
+        const model = e.site.effectiveModelForTool(e.site.site_type);
+        var item_buf: [256]u8 = undefined;
+        const label = std.fmt.bufPrint(&item_buf, "{s}  ({s})  [{s}]", .{
+            e.alias, e.site.site_type.displayName(), model,
+        }) catch e.alias;
+        try output.printMenuItem(w, @intCast(ci + 1), label, caps);
+    }
+    try output.printPrompt(w, i18n.tr(lang, "Indices comma-separated, 'a' for all [a]:", "用逗号分隔索引,'a' 全选 [a]:", "インデックスをカンマ区切り、'a'=全部 [a]:"), caps);
+    try w.flush();
+
+    const sel_input = readLine();
+    var picked: usize = 0;
+
+    if (sel_input.len == 0 or std.mem.eql(u8, sel_input, "a") or std.mem.eql(u8, sel_input, "all")) {
+        for (candidates[0..cand_count]) |idx| {
+            out.*[picked] = idx;
+            picked += 1;
+        }
+        return picked;
+    }
+
+    var iter = std.mem.splitScalar(u8, sel_input, ',');
+    while (iter.next()) |part| {
+        const trimmed = std.mem.trim(u8, part, " \t");
+        if (trimmed.len == 0) continue;
+        const n = std.fmt.parseInt(usize, trimmed, 10) catch continue;
+        if (n == 0 or n > cand_count) continue;
+        const cand_idx = candidates[n - 1];
+        // Deduplicate
+        var already = false;
+        for (out.*[0..picked]) |existing| {
+            if (existing == cand_idx) {
+                already = true;
+                break;
+            }
+        }
+        if (!already) {
+            out.*[picked] = cand_idx;
+            picked += 1;
+        }
+    }
+    return picked;
 }
 
 // --- Install / Uninstall ---

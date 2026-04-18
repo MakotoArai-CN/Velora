@@ -103,7 +103,7 @@ pub fn checkConnectivity(allocator: std.mem.Allocator, base_url: []const u8) Con
     return .{ .reachable = false, .latency_ms = null };
 }
 
-fn checkConnectivityInner(allocator: std.mem.Allocator, base_url: []const u8) ConnectivityResult {
+pub fn checkConnectivityInner(allocator: std.mem.Allocator, base_url: []const u8) ConnectivityResult {
     const start = std.time.milliTimestamp();
 
     // Build URL: base_url + /models (or /v1/models)
@@ -921,6 +921,275 @@ fn buildUrl(buf: []u8, base_url: []const u8, path: []const u8) ?[]const u8 {
         return std.fmt.bufPrint(buf, "{s}{s}", .{ trimmed, path }) catch null;
     }
     return std.fmt.bufPrint(buf, "{s}/v1{s}", .{ std.mem.trimRight(u8, base_url, "/"), path }) catch null;
+}
+
+/// Result of a model benchmark call: success/error plus throughput numbers.
+pub const BenchResult = struct {
+    success: bool,
+    error_msg: ?[]const u8 = null,
+    /// Total wall-clock time of the POST round-trip, including connect + TLS.
+    total_ms: u64 = 0,
+    /// Output tokens reported by the response's `usage` block (best effort).
+    /// Falls back to 0 when the server omits usage info.
+    output_tokens: u32 = 0,
+    /// Convenience: output_tokens * 1000 / total_ms. 0 when either factor is 0.
+    tokens_per_sec: f64 = 0,
+};
+
+const BENCH_PROMPT: []const u8 = "Write a short paragraph (around 150 words) about how ocean currents shape coastal weather patterns. Be specific.";
+const BENCH_MAX_TOKENS: u32 = 256;
+
+/// Run a single benchmark POST against the model. Picks the right API
+/// surface (Anthropic vs OpenAI chat vs OpenAI responses) the same way
+/// `testModelCall` does. Returns a BenchResult with throughput numbers.
+/// Has its own thread+timeout so a hung endpoint cannot stall the caller.
+pub fn benchmarkModel(allocator: std.mem.Allocator, base_url: []const u8, api_key: []const u8, model: []const u8, site_type: sites_mod.SiteType) BenchResult {
+    const timeout_ms: i64 = 60000; // benchmarks request a real generation, allow up to 60s
+    const start = std.time.milliTimestamp();
+
+    const Context = struct {
+        allocator: std.mem.Allocator,
+        base_url: []u8,
+        api_key: []u8,
+        model: []u8,
+        site_type: sites_mod.SiteType,
+        result: BenchResult = .{ .success = false, .error_msg = "Timeout" },
+        done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        refs: std.atomic.Value(u32) = std.atomic.Value(u32).init(2),
+    };
+
+    const Impl = struct {
+        fn release(c: *Context) void {
+            if (c.refs.fetchSub(1, .acq_rel) == 1) {
+                std.heap.page_allocator.free(c.base_url);
+                std.heap.page_allocator.free(c.api_key);
+                std.heap.page_allocator.free(c.model);
+                std.heap.page_allocator.destroy(c);
+            }
+        }
+
+        fn run(c: *Context) void {
+            c.result = benchmarkModelInner(c.allocator, c.base_url, c.api_key, c.model, c.site_type);
+            c.done.store(true, .release);
+            release(c);
+        }
+    };
+
+    const owned_url = std.heap.page_allocator.dupe(u8, base_url) catch {
+        return benchmarkModelInner(allocator, base_url, api_key, model, site_type);
+    };
+    const owned_key = std.heap.page_allocator.dupe(u8, api_key) catch {
+        std.heap.page_allocator.free(owned_url);
+        return benchmarkModelInner(allocator, base_url, api_key, model, site_type);
+    };
+    const owned_model = std.heap.page_allocator.dupe(u8, model) catch {
+        std.heap.page_allocator.free(owned_url);
+        std.heap.page_allocator.free(owned_key);
+        return benchmarkModelInner(allocator, base_url, api_key, model, site_type);
+    };
+
+    const ctx = std.heap.page_allocator.create(Context) catch {
+        std.heap.page_allocator.free(owned_url);
+        std.heap.page_allocator.free(owned_key);
+        std.heap.page_allocator.free(owned_model);
+        return benchmarkModelInner(allocator, base_url, api_key, model, site_type);
+    };
+    ctx.* = .{
+        .allocator = std.heap.page_allocator,
+        .base_url = owned_url,
+        .api_key = owned_key,
+        .model = owned_model,
+        .site_type = site_type,
+    };
+
+    const thread = std.Thread.spawn(.{}, Impl.run, .{ctx}) catch {
+        Impl.release(ctx);
+        return benchmarkModelInner(allocator, base_url, api_key, model, site_type);
+    };
+
+    while (std.time.milliTimestamp() - start < timeout_ms) {
+        if (ctx.done.load(.acquire)) {
+            thread.join();
+            const result = ctx.result;
+            Impl.release(ctx);
+            return result;
+        }
+        std.Thread.sleep(80 * std.time.ns_per_ms);
+    }
+
+    thread.detach();
+    Impl.release(ctx);
+    const elapsed = @as(u64, @intCast(std.time.milliTimestamp() - start));
+    return .{ .success = false, .error_msg = "Request timeout (60s)", .total_ms = elapsed };
+}
+
+fn benchmarkModelInner(allocator: std.mem.Allocator, base_url: []const u8, api_key: []const u8, model: []const u8, site_type: sites_mod.SiteType) BenchResult {
+    const start = std.time.milliTimestamp();
+    const call_model = normalizeModelForApiCheck(model);
+
+    const Attempt = enum { responses, openai_chat, anthropic };
+    const attempts: [3]Attempt = switch (classifyModelFamily(call_model)) {
+        .openai => switch (site_type) {
+            .cx => .{ .responses, .openai_chat, .anthropic },
+            .cc, .oc, .nb, .ow => .{ .openai_chat, .responses, .anthropic },
+        },
+        .claude => .{ .anthropic, .openai_chat, .responses },
+        .unknown => switch (site_type) {
+            .cx => .{ .responses, .openai_chat, .anthropic },
+            .cc => .{ .anthropic, .openai_chat, .responses },
+            .oc, .nb, .ow => .{ .openai_chat, .responses, .anthropic },
+        },
+    };
+
+    var first_error: ?[]const u8 = null;
+    for (attempts) |attempt| {
+        const r = switch (attempt) {
+            .responses => benchResponsesCall(allocator, base_url, api_key, call_model),
+            .openai_chat => benchOpenAICall(allocator, base_url, api_key, call_model),
+            .anthropic => benchAnthropicCall(allocator, base_url, api_key, call_model),
+        };
+        if (r.success) {
+            const elapsed = @as(u64, @intCast(std.time.milliTimestamp() - start));
+            const tps: f64 = if (r.output_tokens > 0 and elapsed > 0)
+                @as(f64, @floatFromInt(r.output_tokens)) * 1000.0 / @as(f64, @floatFromInt(elapsed))
+            else
+                0;
+            return .{
+                .success = true,
+                .total_ms = elapsed,
+                .output_tokens = r.output_tokens,
+                .tokens_per_sec = tps,
+            };
+        }
+        if (first_error == null) first_error = r.error_msg;
+    }
+
+    const elapsed = @as(u64, @intCast(std.time.milliTimestamp() - start));
+    return .{ .success = false, .error_msg = first_error, .total_ms = elapsed };
+}
+
+const BenchAttempt = struct {
+    success: bool,
+    error_msg: ?[]const u8 = null,
+    output_tokens: u32 = 0,
+};
+
+fn benchResponsesCall(allocator: std.mem.Allocator, base_url: []const u8, api_key: []const u8, model: []const u8) BenchAttempt {
+    var url_buf: [1024]u8 = undefined;
+    const url = buildUrl(&url_buf, base_url, "/responses") orelse return .{ .success = false, .error_msg = "URL too long" };
+
+    var auth_buf: [256]u8 = undefined;
+    const auth_header = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{api_key}) catch return .{ .success = false, .error_msg = "Auth too long" };
+
+    var body_buf: [512]u8 = undefined;
+    const body = std.fmt.bufPrint(&body_buf,
+        \\{{"model":"{s}","input":"{s}","max_output_tokens":{d}}}
+    , .{ model, BENCH_PROMPT, BENCH_MAX_TOKENS }) catch return .{ .success = false, .error_msg = "Body too long" };
+
+    const extra_headers = [_]std.http.Header{
+        .{ .name = "authorization", .value = auth_header },
+        .{ .name = "content-type", .value = "application/json" },
+        .{ .name = "connection", .value = "close" },
+    };
+
+    return doBenchPost(allocator, url, &extra_headers, body);
+}
+
+fn benchOpenAICall(allocator: std.mem.Allocator, base_url: []const u8, api_key: []const u8, model: []const u8) BenchAttempt {
+    var url_buf: [1024]u8 = undefined;
+    const url = buildUrl(&url_buf, base_url, "/chat/completions") orelse return .{ .success = false, .error_msg = "URL too long" };
+
+    var auth_buf: [256]u8 = undefined;
+    const auth_header = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{api_key}) catch return .{ .success = false, .error_msg = "Auth too long" };
+
+    var body_buf: [512]u8 = undefined;
+    const body = std.fmt.bufPrint(&body_buf,
+        \\{{"model":"{s}","messages":[{{"role":"user","content":"{s}"}}],"max_tokens":{d}}}
+    , .{ model, BENCH_PROMPT, BENCH_MAX_TOKENS }) catch return .{ .success = false, .error_msg = "Body too long" };
+
+    const extra_headers = [_]std.http.Header{
+        .{ .name = "authorization", .value = auth_header },
+        .{ .name = "content-type", .value = "application/json" },
+        .{ .name = "connection", .value = "close" },
+    };
+
+    return doBenchPost(allocator, url, &extra_headers, body);
+}
+
+fn benchAnthropicCall(allocator: std.mem.Allocator, base_url: []const u8, api_key: []const u8, model: []const u8) BenchAttempt {
+    var url_buf: [1024]u8 = undefined;
+    const url = buildUrl(&url_buf, base_url, "/messages") orelse return .{ .success = false, .error_msg = "URL too long" };
+
+    var auth_buf: [256]u8 = undefined;
+    const bearer = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{api_key}) catch return .{ .success = false, .error_msg = "Auth too long" };
+
+    var body_buf: [512]u8 = undefined;
+    const body = std.fmt.bufPrint(&body_buf,
+        \\{{"model":"{s}","messages":[{{"role":"user","content":"{s}"}}],"max_tokens":{d}}}
+    , .{ model, BENCH_PROMPT, BENCH_MAX_TOKENS }) catch return .{ .success = false, .error_msg = "Body too long" };
+
+    const extra_headers = [_]std.http.Header{
+        .{ .name = "x-api-key", .value = api_key },
+        .{ .name = "authorization", .value = bearer },
+        .{ .name = "anthropic-version", .value = "2023-06-01" },
+        .{ .name = "content-type", .value = "application/json" },
+        .{ .name = "connection", .value = "close" },
+    };
+
+    return doBenchPost(allocator, url, &extra_headers, body);
+}
+
+fn doBenchPost(allocator: std.mem.Allocator, url: []const u8, extra_headers: []const std.http.Header, body: []const u8) BenchAttempt {
+    var client: std.http.Client = .{ .allocator = allocator };
+    defer client.deinit();
+
+    var response_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer response_writer.deinit();
+
+    const result = client.fetch(.{
+        .location = .{ .url = url },
+        .method = .POST,
+        .keep_alive = false,
+        .headers = defaultFetchHeaders(),
+        .extra_headers = extra_headers,
+        .payload = body,
+        .response_writer = &response_writer.writer,
+    }) catch return .{ .success = false, .error_msg = "Connection failed" };
+
+    const code = @intFromEnum(result.status);
+    const resp_body = response_writer.written();
+
+    if (code != 200 and code != 201) {
+        if (extractErrorMessage(resp_body)) |msg| {
+            if (std.mem.indexOf(u8, msg, "rate") != null or
+                std.mem.indexOf(u8, msg, "limit") != null or
+                std.mem.indexOf(u8, msg, "quota") != null or
+                std.mem.indexOf(u8, msg, "billing") != null)
+            {
+                return .{ .success = false, .error_msg = "Rate limited / billing" };
+            }
+        }
+        return .{ .success = false, .error_msg = httpStatusMessage(code) };
+    }
+
+    return .{ .success = true, .output_tokens = parseUsageOutputTokens(resp_body) };
+}
+
+/// Look for `"completion_tokens": N` (OpenAI) or `"output_tokens": N` (Anthropic)
+/// inside the JSON response. Returns 0 if neither field is present or parseable.
+fn parseUsageOutputTokens(body: []const u8) u32 {
+    const candidates = [_][]const u8{ "\"completion_tokens\"", "\"output_tokens\"" };
+    for (candidates) |key| {
+        const pos = std.mem.indexOf(u8, body, key) orelse continue;
+        const after = body[pos + key.len ..];
+        const colon = std.mem.indexOfScalar(u8, after, ':') orelse continue;
+        const after_colon = std.mem.trimLeft(u8, after[colon + 1 ..], " \t\r\n");
+        var end: usize = 0;
+        while (end < after_colon.len and std.ascii.isDigit(after_colon[end])) : (end += 1) {}
+        if (end == 0) continue;
+        if (std.fmt.parseInt(u32, after_colon[0..end], 10) catch null) |val| return val;
+    }
+    return 0;
 }
 
 /// Fetch all model IDs from /v1/models. Returns allocated slice of allocated strings.

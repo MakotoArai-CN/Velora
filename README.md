@@ -87,7 +87,7 @@ velora add <类型> <别名> <URL> <Key> [模型]
 velora edit <别名>
 velora del <别名>
 
-# 查看站点列表（含连通性检测）
+# 查看站点列表（并行连通性检测，并标记当前使用的工具）
 velora list          # 或 velora ls
 velora list -g       # 全局检测（包含已归档站点）
 velora list all
@@ -104,11 +104,20 @@ velora ow <别名> [模型]               # 应用到 OpenClaw
 # 浏览站点的全部模型
 velora models <别名>      # 或 velora m <别名>
 
+# 全自动模型调用测试 / 性能基准
+velora test                                 # 并行测试所有站点的模型可调用性
+velora test <别名>                          # 测试单个站点
+velora test --perf                          # 性能基准（交互式选站，按工具类型筛选）
+
 # 设置选项
 velora set model_check off                  # 或 velora s mc off
 velora set list_latency off                 # 或 velora s ll off
 velora set auto_archive on                  # 或 velora s aa on
 velora set auto_pick_compatible_model off   # 或 velora s ap off
+
+# 帮助 / 用法示例
+velora --help                               # 命令、选项、设置概览
+velora help examples                        # 完整用法示例（已从默认 help 中折叠）
 
 # 安装 / 卸载
 velora install
@@ -124,6 +133,7 @@ velora --update
 | --------- | ---- | ---- |
 | `set` | `s` | 设置选项 |
 | `models` | `m` | 浏览模型 |
+| `test` | `t` | 模型调用测试 / 性能基准 |
 | `list` | `ls` | 站点列表 |
 | `del` | `rm` | 删除站点 |
 
@@ -135,6 +145,7 @@ velora --update
 | `list_latency` | `ll` | list 时是否检测延迟（默认 on） |
 | `auto_archive` | `aa` | 是否自动归档不可用站点（默认 off） |
 | `auto_pick_compatible_model` | `ap` | 类型不匹配时是否自动选择兼容模型（默认 on） |
+| `list_sort` | `ls` | 默认列表排序: time / alpha / tool / model |
 
 ## 用法示例
 
@@ -148,9 +159,50 @@ velora oc openai claude-haiku-4-5-20251001
 velora nb openai
 velora ow openai
 velora m openai                              # 浏览 openai 站点的全部模型
+velora t                                     # 并行测试所有站点的模型
+velora t openai                              # 测试单个站点（带 spinner 进度）
+velora t --perf                              # 交互式选择站点 + 性能基准
 velora s mc off                              # 关闭模型检测，use 更快
 velora s ap off                              # 关闭类型不匹配时的自动兼容模型选择
+velora help examples                         # 完整示例（在默认 help 中已折叠）
 ```
+
+## 当前使用工具识别（list 中的 `[← cc, oc]` 标签）
+
+`velora list` 在每个站点行尾会显示一个加粗的标签，列出当前正指向该站点的工具，例如：
+
+```
+  ✓ openai (Claude Code) 234ms [← cc, oc]
+  ✓ relay  (OpenCode)    312ms [← nb]
+  ✓ gpt    (Codex)       128ms [← cx]
+```
+
+匹配规则：分别读取每个工具的真实配置文件 / 环境变量（Codex 读 `~/.codex/config.toml` 与对应 env_key；Claude Code 读 `~/.claude/settings.json` 中的 `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN`；OpenCode、Nanobot、OpenClaw 读各自的 JSON），然后用 `base_url` 或 `api_key` 任一匹配站点（解决了用户手动改 URL 后仍能识别的问题）。
+
+## 并行连通性检测
+
+`velora list` 的连通性检测会并行执行：每个站点独占一个工作线程，主线程轮询 `done` 标志并按到达顺序刷新对应行。整体耗时由"最慢的那个站点"决定（默认 15 秒超时上限），不再随站点数线性增长。
+
+## 模型调用测试与性能基准（v1.1.8 新增）
+
+```bash
+velora t              # 并行测试所有未归档站点的模型可调用性
+velora t openai       # 单站点测试（单行 spinner，结束后被结果替换）
+velora t --perf       # 性能基准模式：交互选择站点 → 并行 benchmark
+```
+
+- 默认模式调用 `testModelCall`，根据模型族（Claude / OpenAI / 未知）自动尝试 `/v1/messages`、`/v1/chat/completions`、`/v1/responses` 三种接口。
+- `--perf` 模式发送一个约 150 词的真实生成请求（`max_tokens=256`），从响应的 `usage.completion_tokens` / `usage.output_tokens` 解析输出 token 数，计算 `tokens/sec`。
+- 进度展示：每个站点一行，前缀 spinner（`⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`）+ 已用秒数；完成后该行被原地替换为最终结果（`✓` / `✗`）。
+- `--perf` 的交互式选择支持按工具类型筛选（cx / cc / oc / nb / ow / 全部），随后输入逗号分隔索引或 `a` 全选。
+
+## use 时的模型检测优化（v1.1.8）
+
+`velora use` 不再因为 `/v1/models` 端点受限而误报"无法检测模型（可能需要认证）"。新流程：
+
+1. 先做一次真实模型调用测试。
+2. 再尝试列出 `/v1/models`。
+3. 如果列模型失败但调用成功，输出友好提示"模型列表受限，但模型调用已验证"。
 
 ## 模型配置
 
