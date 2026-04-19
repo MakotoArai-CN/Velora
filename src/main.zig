@@ -1410,11 +1410,16 @@ fn runParallelModelTest(
     _ = allocator;
     const count = indices.len;
 
+    const layout = computeModelTestTableLayout(caps, store, indices);
+
+    // Phase 0: table header (printed once, not repainted)
+    try printModelTestTableHeader(w, caps, lang, layout);
+
     // Phase 1: print one pending row per site
     for (indices, 0..) |idx, ci| {
         const entry = store.entries[idx];
         const model = entry.site.effectiveModelForTool(entry.site.site_type);
-        try printModelTestPendingRow(w, caps, entry.alias, entry.site.site_type, model, 0);
+        try printModelTestPendingRow(w, caps, layout, lang, entry.alias, entry.site.site_type, model, 0);
         _ = ci;
     }
     try w.flush();
@@ -1466,8 +1471,9 @@ fn runParallelModelTest(
     }
 
     // Poll: repaint completed rows immediately, animate spinner on pending rows.
+    // Budget 18s for normal tests (just above the 15s per-site timeout); 65s for perf.
     const poll_start = std.time.milliTimestamp();
-    const batch_timeout_ms: i64 = if (perf_mode) 65000 else 20000;
+    const batch_timeout_ms: i64 = if (perf_mode) 65000 else 18000;
     var done_count: usize = 0;
     var spinner_idx: usize = 0;
 
@@ -1479,20 +1485,20 @@ fn runParallelModelTest(
             const t = tasks[ci];
 
             if (t == null) {
-                try repaintModelTestRowFinal(w, caps, lang, ci, count, entry.alias, entry.site.site_type, model, perf_mode, .{ .success = false, .error_msg = "Spawn failed" }, .{ .success = false, .error_msg = "Spawn failed" });
+                try repaintModelTestRowFinal(w, caps, layout, lang, ci, count, entry.alias, entry.site.site_type, model, perf_mode, .{ .success = false, .error_msg = "Spawn failed" }, .{ .success = false, .error_msg = "Spawn failed" });
                 rendered[ci] = true;
                 done_count += 1;
                 continue;
             }
             if (t.?.done.load(.acquire)) {
-                try repaintModelTestRowFinal(w, caps, lang, ci, count, entry.alias, entry.site.site_type, model, perf_mode, t.?.call_result, t.?.bench_result);
+                try repaintModelTestRowFinal(w, caps, layout, lang, ci, count, entry.alias, entry.site.site_type, model, perf_mode, t.?.call_result, t.?.bench_result);
                 rendered[ci] = true;
                 done_count += 1;
                 continue;
             }
 
             const elapsed_ms = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - launch_at_ms)));
-            try repaintModelTestRowSpinner(w, caps, ci, count, entry.alias, entry.site.site_type, model, spinner_idx, elapsed_ms);
+            try repaintModelTestRowSpinner(w, caps, layout, lang, ci, count, entry.alias, entry.site.site_type, model, spinner_idx, elapsed_ms);
         }
 
         if (done_count >= count) break;
@@ -1507,7 +1513,7 @@ fn runParallelModelTest(
         if (rendered[ci]) continue;
         const entry = store.entries[idx];
         const model = entry.site.effectiveModelForTool(entry.site.site_type);
-        try repaintModelTestRowFinal(w, caps, lang, ci, count, entry.alias, entry.site.site_type, model, perf_mode, .{ .success = false, .error_msg = "Timeout" }, .{ .success = false, .error_msg = "Timeout" });
+        try repaintModelTestRowFinal(w, caps, layout, lang, ci, count, entry.alias, entry.site.site_type, model, perf_mode, .{ .success = false, .error_msg = "Request timeout" }, .{ .success = false, .error_msg = "Request timeout" });
         rendered[ci] = true;
     }
     try w.flush();
@@ -1534,36 +1540,232 @@ fn spinnerChar(caps: terminal.TermCaps, idx: usize) []const u8 {
     return SPINNER_FRAMES_ASCII[idx % SPINNER_FRAMES_ASCII.len];
 }
 
+const ModelTestTableLayout = struct {
+    w_state: u32,
+    w_alias: u32,
+    w_tool: u32,
+    w_model: u32,
+    w_detail: u32,
+};
+
+/// Compute fixed column widths for the model-test table based on terminal width and
+/// the natural widths of the data. Long cells get truncated with ellipsis at render
+/// time; short ones get padded. Keeping the layout fixed for a run lets the repaint
+/// overwrite rows cleanly without residue.
+fn computeModelTestTableLayout(
+    caps: terminal.TermCaps,
+    store: *const sites_mod.SitesStore,
+    indices: []const usize,
+) ModelTestTableLayout {
+    const avail: u32 = if (caps.width > 4) caps.width - 4 else 60;
+    const separator_cells: u32 = 2 * 4; // four 2-space separators between 5 columns
+    const w_state: u32 = 5;
+
+    var natural_alias: u32 = 5; // header "Alias"
+    var natural_tool: u32 = 11; // "Claude Code" minimum
+    var natural_model: u32 = 5; // header "Model"
+
+    for (indices) |idx| {
+        const entry = store.entries[idx];
+        natural_alias = @max(natural_alias, output.displayWidth(entry.alias));
+        natural_tool = @max(natural_tool, output.displayWidth(entry.site.site_type.displayName()));
+        const m = entry.site.effectiveModelForTool(entry.site.site_type);
+        natural_model = @max(natural_model, output.displayWidth(m));
+    }
+
+    const max_alias_cap: u32 = 24;
+    const max_model_cap: u32 = 34;
+    const min_detail: u32 = 18;
+    const min_alias: u32 = 5;
+    const min_model: u32 = 8;
+
+    var w_alias: u32 = @min(natural_alias, max_alias_cap);
+    var w_tool: u32 = natural_tool;
+    var w_model: u32 = @min(natural_model, max_model_cap);
+
+    const total_fixed = w_state + separator_cells;
+    const total_wanted = total_fixed + w_alias + w_tool + w_model + min_detail;
+
+    if (total_wanted <= avail) {
+        const w_detail = avail - (total_fixed + w_alias + w_tool + w_model);
+        return .{
+            .w_state = w_state,
+            .w_alias = w_alias,
+            .w_tool = w_tool,
+            .w_model = w_model,
+            .w_detail = w_detail,
+        };
+    }
+
+    // Overflow: keep detail at its minimum, shrink alias and model proportionally.
+    // If still too tight, truncate tool as well.
+    const after_state_sep_detail = total_fixed + min_detail;
+    const budget_for_alias_tool_model: u32 = if (avail > after_state_sep_detail)
+        avail - after_state_sep_detail
+    else
+        @as(u32, 20);
+
+    if (budget_for_alias_tool_model < w_tool + min_alias + min_model) {
+        // Very narrow terminal — shrink tool first
+        const tool_budget: u32 = if (budget_for_alias_tool_model > min_alias + min_model)
+            budget_for_alias_tool_model - min_alias - min_model
+        else
+            @as(u32, 4);
+        w_tool = @min(w_tool, @max(tool_budget, @as(u32, 4)));
+        w_alias = min_alias;
+        w_model = if (budget_for_alias_tool_model > w_tool + w_alias)
+            budget_for_alias_tool_model - w_tool - w_alias
+        else
+            min_model;
+    } else {
+        const alias_model_budget = budget_for_alias_tool_model - w_tool;
+        const requested_total = w_alias + w_model;
+        if (requested_total > 0) {
+            const new_alias = (alias_model_budget * w_alias) / requested_total;
+            w_alias = @max(min_alias, new_alias);
+            w_model = if (alias_model_budget > w_alias)
+                @max(min_model, alias_model_budget - w_alias)
+            else
+                min_model;
+        } else {
+            w_alias = min_alias;
+            w_model = min_model;
+        }
+    }
+
+    const used = total_fixed + w_alias + w_tool + w_model;
+    const w_detail = if (avail > used) avail - used else min_detail;
+    return .{
+        .w_state = w_state,
+        .w_alias = w_alias,
+        .w_tool = w_tool,
+        .w_model = w_model,
+        .w_detail = w_detail,
+    };
+}
+
+fn renderModelTestDataRow(
+    w: *std.Io.Writer,
+    caps: terminal.TermCaps,
+    layout: ModelTestTableLayout,
+    state_color: []const u8,
+    state_text: []const u8,
+    alias: []const u8,
+    tool_name: []const u8,
+    model: []const u8,
+    detail: []const u8,
+    detail_color: []const u8,
+) !void {
+    var state_buf: [64]u8 = undefined;
+    var alias_buf: [256]u8 = undefined;
+    var tool_buf: [128]u8 = undefined;
+    var model_buf: [256]u8 = undefined;
+    var detail_buf: [384]u8 = undefined;
+
+    const s_fit = output.fitCell(&state_buf, state_text, layout.w_state, caps.unicode);
+    const a_fit = output.fitCell(&alias_buf, alias, layout.w_alias, caps.unicode);
+    const t_fit = output.fitCell(&tool_buf, tool_name, layout.w_tool, caps.unicode);
+    const m_fit = output.fitCell(&model_buf, model, layout.w_model, caps.unicode);
+    const d_fit = output.fitCell(&detail_buf, detail, layout.w_detail, caps.unicode);
+
+    const reset_c = if (caps.color) output.Color.reset else "";
+    const white = if (caps.color) output.Color.miku_white else "";
+    const gray = if (caps.color) output.Color.miku_gray else "";
+
+    try w.print("  {s}{s}{s}  {s}{s}{s}  {s}{s}{s}  {s}{s}{s}  {s}{s}{s}", .{
+        if (caps.color) state_color else "",
+        s_fit,
+        reset_c,
+        white,
+        a_fit,
+        reset_c,
+        gray,
+        t_fit,
+        reset_c,
+        gray,
+        m_fit,
+        reset_c,
+        if (caps.color) detail_color else "",
+        d_fit,
+        reset_c,
+    });
+}
+
+fn printModelTestTableHeader(
+    w: *std.Io.Writer,
+    caps: terminal.TermCaps,
+    lang: i18n.Language,
+    layout: ModelTestTableLayout,
+) !void {
+    const state_hdr = i18n.tr(lang, "State", "状态", "状態");
+    const alias_hdr = i18n.tr(lang, "Alias", "别名", "エイリアス");
+    const tool_hdr = i18n.tr(lang, "Tool", "工具", "ツール");
+    const model_hdr = i18n.tr(lang, "Model", "模型", "モデル");
+    const detail_hdr = i18n.tr(lang, "Result", "结果", "結果");
+
+    var state_buf: [64]u8 = undefined;
+    var alias_buf: [128]u8 = undefined;
+    var tool_buf: [64]u8 = undefined;
+    var model_buf: [128]u8 = undefined;
+    var detail_buf: [128]u8 = undefined;
+
+    const s_fit = output.fitCell(&state_buf, state_hdr, layout.w_state, caps.unicode);
+    const a_fit = output.fitCell(&alias_buf, alias_hdr, layout.w_alias, caps.unicode);
+    const t_fit = output.fitCell(&tool_buf, tool_hdr, layout.w_tool, caps.unicode);
+    const m_fit = output.fitCell(&model_buf, model_hdr, layout.w_model, caps.unicode);
+    const d_fit = output.fitCell(&detail_buf, detail_hdr, layout.w_detail, caps.unicode);
+
+    const cyan = if (caps.color) output.Color.miku_cyan else "";
+    const bold = if (caps.color) output.Color.bold else "";
+    const reset_c = if (caps.color) output.Color.reset else "";
+
+    try w.print("  {s}{s}{s}  {s}  {s}  {s}  {s}{s}\n", .{
+        cyan, bold, s_fit, a_fit, t_fit, m_fit, d_fit, reset_c,
+    });
+
+    const sep = if (caps.unicode) "─" else "-";
+    const gray = if (caps.color) output.Color.miku_gray else "";
+    const total_w = layout.w_state + 2 + layout.w_alias + 2 + layout.w_tool + 2 + layout.w_model + 2 + layout.w_detail;
+    try w.print("  {s}", .{gray});
+    var i: u32 = 0;
+    while (i < total_w) : (i += 1) {
+        try w.print("{s}", .{sep});
+    }
+    try w.print("{s}\n", .{reset_c});
+}
+
 fn printModelTestPendingRow(
     w: *std.Io.Writer,
     caps: terminal.TermCaps,
+    layout: ModelTestTableLayout,
+    lang: i18n.Language,
     alias: []const u8,
     site_type: sites_mod.SiteType,
     model: []const u8,
     spinner_idx: usize,
 ) !void {
     const spin = spinnerChar(caps, spinner_idx);
-    var line_buf: [512]u8 = undefined;
-    const line = std.fmt.bufPrint(&line_buf, "  {s}{s}{s} {s}{s}{s} ({s}) {s}[{s}]{s} {s}testing...{s}", .{
-        if (caps.color) output.Color.miku_cyan else "",
+    const detail = i18n.tr(lang, "testing...", "测试中...", "テスト中...");
+    try renderModelTestDataRow(
+        w,
+        caps,
+        layout,
+        output.Color.miku_cyan,
         spin,
-        if (caps.color) output.Color.reset else "",
-        if (caps.color) output.Color.miku_white else "",
         alias,
-        if (caps.color) output.Color.reset else "",
         site_type.displayName(),
-        if (caps.color) output.Color.miku_gray else "",
         model,
-        if (caps.color) output.Color.reset else "",
-        if (caps.color) output.Color.miku_gray else "",
-        if (caps.color) output.Color.reset else "",
-    }) catch "";
-    try w.print("{s}\n", .{line});
+        detail,
+        output.Color.miku_gray,
+    );
+    try w.print("\n", .{});
 }
 
 fn repaintModelTestRowSpinner(
     w: *std.Io.Writer,
     caps: terminal.TermCaps,
+    layout: ModelTestTableLayout,
+    lang: i18n.Language,
     row_ci: usize,
     total_rows: usize,
     alias: []const u8,
@@ -1578,35 +1780,32 @@ fn repaintModelTestRowSpinner(
     const esc = std.fmt.bufPrint(&esc_buf, "\x1b[{d}A\r\x1b[2K", .{lines_up}) catch "";
     try w.print("{s}", .{esc});
 
-    var elapsed_buf: [32]u8 = undefined;
-    const elapsed_str = std.fmt.bufPrint(&elapsed_buf, "{d}.{d}s", .{ elapsed_ms / 1000, (elapsed_ms % 1000) / 100 }) catch "?s";
+    const testing = i18n.tr(lang, "testing...", "测试中...", "テスト中...");
+    var detail_buf: [64]u8 = undefined;
+    const detail = std.fmt.bufPrint(&detail_buf, "{s} {d}.{d}s", .{ testing, elapsed_ms / 1000, (elapsed_ms % 1000) / 100 }) catch testing;
 
-    var line_buf: [512]u8 = undefined;
-    const line = std.fmt.bufPrint(&line_buf, "  {s}{s}{s} {s}{s}{s} ({s}) {s}[{s}]{s} {s}testing... {s}{s}", .{
-        if (caps.color) output.Color.miku_cyan else "",
+    try renderModelTestDataRow(
+        w,
+        caps,
+        layout,
+        output.Color.miku_cyan,
         spin,
-        if (caps.color) output.Color.reset else "",
-        if (caps.color) output.Color.miku_white else "",
         alias,
-        if (caps.color) output.Color.reset else "",
         site_type.displayName(),
-        if (caps.color) output.Color.miku_gray else "",
         model,
-        if (caps.color) output.Color.reset else "",
-        if (caps.color) output.Color.miku_gray else "",
-        elapsed_str,
-        if (caps.color) output.Color.reset else "",
-    }) catch "";
-    try w.print("{s}", .{line});
+        detail,
+        output.Color.miku_gray,
+    );
 
     var down_buf: [32]u8 = undefined;
-    const down = std.fmt.bufPrint(&down_buf, "\x1b[{d}B", .{lines_up}) catch "";
+    const down = std.fmt.bufPrint(&down_buf, "\x1b[{d}B\r", .{lines_up}) catch "";
     try w.print("{s}", .{down});
 }
 
 fn repaintModelTestRowFinal(
     w: *std.Io.Writer,
     caps: terminal.TermCaps,
+    layout: ModelTestTableLayout,
     lang: i18n.Language,
     row_ci: usize,
     total_rows: usize,
@@ -1626,10 +1825,10 @@ fn repaintModelTestRowFinal(
     const fail_sym = if (caps.unicode) "✗" else "[X]";
     const success = if (perf_mode) bench_result.success else call_result.success;
 
-    var detail_buf: [256]u8 = undefined;
+    var detail_buf: [384]u8 = undefined;
     const detail: []const u8 = if (perf_mode) blk: {
         if (success) {
-            break :blk std.fmt.bufPrint(&detail_buf, "{d}ms  {d:.1} tok/s  {d} tokens", .{
+            break :blk std.fmt.bufPrint(&detail_buf, "{d}ms  {d:.1} tok/s  {d} tok", .{
                 bench_result.total_ms,
                 bench_result.tokens_per_sec,
                 bench_result.output_tokens,
@@ -1641,33 +1840,32 @@ fn repaintModelTestRowFinal(
     } else blk: {
         if (success) {
             const ms = call_result.latency_ms orelse 0;
-            break :blk std.fmt.bufPrint(&detail_buf, "{d}ms  callable", .{ms}) catch "ok";
+            break :blk std.fmt.bufPrint(&detail_buf, "{d}ms  {s}", .{ ms, i18n.tr(lang, "callable", "可用", "使用可能") }) catch "ok";
         } else {
             const msg = call_result.error_msg orelse i18n.tr(lang, "failed", "失败", "失敗");
             break :blk std.fmt.bufPrint(&detail_buf, "{s}", .{msg}) catch "failed";
         }
     };
 
-    var line_buf: [768]u8 = undefined;
-    const line = std.fmt.bufPrint(&line_buf, "  {s}{s}{s} {s}{s}{s} ({s}) {s}[{s}]{s} {s}{s}{s}", .{
-        if (caps.color) (if (success) output.Color.miku_green else output.Color.miku_red) else "",
-        if (success) ok_sym else fail_sym,
-        if (caps.color) output.Color.reset else "",
-        if (caps.color) output.Color.miku_white else "",
+    const state_color = if (success) output.Color.miku_green else output.Color.miku_red;
+    const detail_color = if (success) output.Color.miku_white else output.Color.miku_red;
+    const state_text = if (success) ok_sym else fail_sym;
+
+    try renderModelTestDataRow(
+        w,
+        caps,
+        layout,
+        state_color,
+        state_text,
         alias,
-        if (caps.color) output.Color.reset else "",
         site_type.displayName(),
-        if (caps.color) output.Color.miku_gray else "",
         model,
-        if (caps.color) output.Color.reset else "",
-        if (caps.color) (if (success) output.Color.miku_white else output.Color.miku_red) else "",
         detail,
-        if (caps.color) output.Color.reset else "",
-    }) catch "";
-    try w.print("{s}", .{line});
+        detail_color,
+    );
 
     var down_buf: [32]u8 = undefined;
-    const down = std.fmt.bufPrint(&down_buf, "\x1b[{d}B", .{lines_up}) catch "";
+    const down = std.fmt.bufPrint(&down_buf, "\x1b[{d}B\r", .{lines_up}) catch "";
     try w.print("{s}", .{down});
 }
 

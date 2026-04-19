@@ -7,7 +7,8 @@
       "Bash(zig-out/bin/velora.exe t *)",
       "Bash(zig-out/bin/velora.exe --help)",
       "Bash(zig-out/bin/velora.exe help *)",
-      "Bash(zig-out/bin/velora.exe --version)"
+      "Bash(zig-out/bin/velora.exe --version)",
+      "Bash(zig-out/bin/velora-windows-x86_64.exe t *)"
     ]
   }
 }

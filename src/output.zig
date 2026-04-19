@@ -113,6 +113,97 @@ fn writePadded(w: *std.Io.Writer, s: []const u8, target_width: u32) !void {
     }
 }
 
+const Utf8Step = struct { seq_len: usize, width: u32 };
+
+fn readUtf8Step(s: []const u8, i: usize) ?Utf8Step {
+    if (i >= s.len) return null;
+    const byte = s[i];
+    const seq_len: usize = if (byte < 0x80)
+        1
+    else if (byte < 0xE0)
+        2
+    else if (byte < 0xF0)
+        3
+    else
+        4;
+    if (i + seq_len > s.len) return null;
+    if (seq_len == 1) return .{ .seq_len = 1, .width = 1 };
+    const cp: u21 = switch (seq_len) {
+        2 => @as(u21, byte & 0x1F) << 6 | @as(u21, s[i + 1] & 0x3F),
+        3 => @as(u21, byte & 0x0F) << 12 | @as(u21, s[i + 1] & 0x3F) << 6 | @as(u21, s[i + 2] & 0x3F),
+        4 => @as(u21, byte & 0x07) << 18 | @as(u21, s[i + 1] & 0x3F) << 12 | @as(u21, s[i + 2] & 0x3F) << 6 | @as(u21, s[i + 3] & 0x3F),
+        else => 0,
+    };
+    return .{ .seq_len = seq_len, .width = if (isCjkWide(cp)) 2 else 1 };
+}
+
+/// Fit `s` into exactly `target_width` display cells: truncate with an ellipsis when too
+/// long, pad with spaces when too short. The resulting byte slice always has
+/// `displayWidth == target_width`. Bytes are written into `out`; if `out` is too small the
+/// function writes as much as fits and returns that prefix.
+pub fn fitCell(out: []u8, s: []const u8, target_width: u32, unicode: bool) []const u8 {
+    if (target_width == 0 or out.len == 0) return out[0..0];
+
+    const full_w = displayWidth(s);
+
+    if (full_w <= target_width) {
+        var written: usize = 0;
+        const n = @min(s.len, out.len);
+        std.mem.copyForwards(u8, out[0..n], s[0..n]);
+        written = n;
+        var remaining: u32 = if (full_w < target_width) target_width - full_w else 0;
+        while (remaining > 0 and written < out.len) : ({
+            remaining -= 1;
+            written += 1;
+        }) {
+            out[written] = ' ';
+        }
+        return out[0..written];
+    }
+
+    const ellipsis: []const u8 = if (unicode) "…" else "...";
+    const ellipsis_w: u32 = if (unicode) 1 else 3;
+
+    var content_budget: u32 = 0;
+    var include_ellipsis = true;
+    if (target_width > ellipsis_w) {
+        content_budget = target_width - ellipsis_w;
+    } else {
+        include_ellipsis = false;
+        content_budget = target_width;
+    }
+
+    var i: usize = 0;
+    var w: u32 = 0;
+    while (i < s.len) {
+        const step = readUtf8Step(s, i) orelse break;
+        if (w + step.width > content_budget) break;
+        w += step.width;
+        i += step.seq_len;
+    }
+
+    var written: usize = 0;
+    const copy_n = @min(i, out.len);
+    std.mem.copyForwards(u8, out[0..copy_n], s[0..copy_n]);
+    written = copy_n;
+    var actual_w = w;
+
+    if (include_ellipsis and written + ellipsis.len <= out.len) {
+        std.mem.copyForwards(u8, out[written .. written + ellipsis.len], ellipsis);
+        written += ellipsis.len;
+        actual_w += ellipsis_w;
+    }
+
+    var remaining: u32 = if (actual_w < target_width) target_width - actual_w else 0;
+    while (remaining > 0 and written < out.len) : ({
+        remaining -= 1;
+        written += 1;
+    }) {
+        out[written] = ' ';
+    }
+    return out[0..written];
+}
+
 pub fn printBanner(w: *std.Io.Writer, caps: terminal.TermCaps, version: []const u8) !void {
     const inner = contentWidth(caps);
 

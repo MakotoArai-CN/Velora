@@ -442,10 +442,11 @@ pub const ModelCallResult = struct {
 pub fn testModelCall(allocator: std.mem.Allocator, base_url: []const u8, api_key: []const u8, model: []const u8, site_type: sites_mod.SiteType) ModelCallResult {
     const timeout_ms: i64 = 15000; // 15 second total timeout
     const start = std.time.milliTimestamp();
-    const check_model = normalizeModelForApiCheck(model);
-    const model_in_list = checkModelInList(allocator, base_url, api_key, check_model);
 
-    // Run in a thread so we can enforce a timeout.
+    // Run everything (model-list probe + call attempts) in a background thread so the
+    // 15s budget strictly bounds the total elapsed time. Previously the /v1/models
+    // probe ran on the caller thread with its own 10s timeout, which meant a dead
+    // endpoint could burn ~25s before returning.
     // Heap-allocate context so detached threads never touch a dead stack frame.
     const Context = struct {
         allocator: std.mem.Allocator,
@@ -469,22 +470,30 @@ pub fn testModelCall(allocator: std.mem.Allocator, base_url: []const u8, api_key
         }
 
         fn run(c: *Context) void {
-            c.result = testModelCallAttempts(c.allocator, c.base_url, c.api_key, c.model, c.site_type, c.result.model_in_list);
+            const check_model = normalizeModelForApiCheck(c.model);
+            const model_in_list = checkModelInList(c.allocator, c.base_url, c.api_key, check_model);
+            c.result = testModelCallAttempts(c.allocator, c.base_url, c.api_key, c.model, c.site_type, model_in_list);
             c.done.store(true, .release);
             release(c);
         }
     };
 
     const owned_url = std.heap.page_allocator.dupe(u8, base_url) catch {
+        const check_model = normalizeModelForApiCheck(model);
+        const model_in_list = checkModelInList(allocator, base_url, api_key, check_model);
         return testModelCallAttempts(allocator, base_url, api_key, model, site_type, model_in_list);
     };
     const owned_key = std.heap.page_allocator.dupe(u8, api_key) catch {
         std.heap.page_allocator.free(owned_url);
+        const check_model = normalizeModelForApiCheck(model);
+        const model_in_list = checkModelInList(allocator, base_url, api_key, check_model);
         return testModelCallAttempts(allocator, base_url, api_key, model, site_type, model_in_list);
     };
     const owned_model = std.heap.page_allocator.dupe(u8, model) catch {
         std.heap.page_allocator.free(owned_url);
         std.heap.page_allocator.free(owned_key);
+        const check_model = normalizeModelForApiCheck(model);
+        const model_in_list = checkModelInList(allocator, base_url, api_key, check_model);
         return testModelCallAttempts(allocator, base_url, api_key, model, site_type, model_in_list);
     };
 
@@ -492,6 +501,8 @@ pub fn testModelCall(allocator: std.mem.Allocator, base_url: []const u8, api_key
         std.heap.page_allocator.free(owned_url);
         std.heap.page_allocator.free(owned_key);
         std.heap.page_allocator.free(owned_model);
+        const check_model = normalizeModelForApiCheck(model);
+        const model_in_list = checkModelInList(allocator, base_url, api_key, check_model);
         return testModelCallAttempts(allocator, base_url, api_key, model, site_type, model_in_list);
     };
     ctx.* = .{
@@ -500,11 +511,13 @@ pub fn testModelCall(allocator: std.mem.Allocator, base_url: []const u8, api_key
         .api_key = owned_key,
         .model = owned_model,
         .site_type = site_type,
-        .result = .{ .success = false, .error_msg = "Timeout", .model_in_list = model_in_list },
+        .result = .{ .success = false, .error_msg = "Request timeout" },
     };
 
     const thread = std.Thread.spawn(.{}, Impl.run, .{ctx}) catch {
         Impl.release(ctx);
+        const check_model = normalizeModelForApiCheck(model);
+        const model_in_list = checkModelInList(allocator, base_url, api_key, check_model);
         return testModelCallAttempts(allocator, base_url, api_key, model, site_type, model_in_list);
     };
 
@@ -525,9 +538,9 @@ pub fn testModelCall(allocator: std.mem.Allocator, base_url: []const u8, api_key
     const elapsed = @as(u64, @intCast(std.time.milliTimestamp() - start));
     return .{
         .success = false,
-        .error_msg = "Request timeout (15s)",
+        .error_msg = "Request timeout",
         .latency_ms = elapsed,
-        .model_in_list = model_in_list,
+        .model_in_list = false,
     };
 }
 
@@ -1020,7 +1033,7 @@ pub fn benchmarkModel(allocator: std.mem.Allocator, base_url: []const u8, api_ke
     thread.detach();
     Impl.release(ctx);
     const elapsed = @as(u64, @intCast(std.time.milliTimestamp() - start));
-    return .{ .success = false, .error_msg = "Request timeout (60s)", .total_ms = elapsed };
+    return .{ .success = false, .error_msg = "Request timeout", .total_ms = elapsed };
 }
 
 fn benchmarkModelInner(allocator: std.mem.Allocator, base_url: []const u8, api_key: []const u8, model: []const u8, site_type: sites_mod.SiteType) BenchResult {
