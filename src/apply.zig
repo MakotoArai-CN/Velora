@@ -4,21 +4,25 @@ const config_mod = @import("config.zig");
 const app = @import("app.zig");
 const env_mod = @import("env.zig");
 const sites_mod = @import("sites.zig");
-const check_mod = @import("check.zig");
 const output = @import("output.zig");
 const terminal = @import("terminal.zig");
 const i18n = @import("i18n.zig");
 const io_compat = @import("io_compat.zig");
 
-fn prefixedModel(buf: *[512]u8, model: []const u8) []const u8 {
-    if (std.mem.indexOf(u8, model, "/") != null) return model;
-    const family = check_mod.classifyModelFamily(model);
-    const prefix: []const u8 = switch (family) {
-        .claude => "anthropic/",
-        .openai => "openai/",
-        .unknown => "openai/",
-    };
-    return std.fmt.bufPrint(buf, "{s}{s}", .{ prefix, model }) catch model;
+fn stripProviderPrefix(model: []const u8) []const u8 {
+    if (std.mem.indexOfScalar(u8, model, '/')) |slash| {
+        if (slash + 1 < model.len) return model[slash + 1 ..];
+    }
+    return model;
+}
+
+fn providerModelRef(buf: []u8, provider: []const u8, model: []const u8) []const u8 {
+    const raw_model = stripProviderPrefix(model);
+    return std.fmt.bufPrint(buf, "{s}/{s}", .{ provider, raw_model }) catch model;
+}
+
+fn openAiModelRef(buf: []u8, model: []const u8) []const u8 {
+    return providerModelRef(buf, "openai", model);
 }
 
 /// Read entire file into an ArrayListUnmanaged via chunked reads.
@@ -744,7 +748,7 @@ pub fn applyToNanobot(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: ter
     try w.flush();
 
     var pm_buf: [512]u8 = undefined;
-    const model = prefixedModel(&pm_buf, tool_model);
+    const model = openAiModelRef(&pm_buf, tool_model);
 
     updateNanobotConfig(allocator, site.api_key, site.base_url, model) catch |err| {
         try output.printError(w, i18n.tr(lang, "Failed to update Nanobot config", "更新 Nanobot 配置失败", "Nanobot 設定の更新に失敗しました"), caps);
@@ -858,15 +862,37 @@ fn updateNanobotConfig(allocator: std.mem.Allocator, api_key: []const u8, base_u
                 var indent_buf: [32]u8 = undefined;
                 const indent = indent_buf[0..@min(indent_count, 32)];
                 @memset(indent, ' ');
-                // Nanobot model format: "provider/<model>" (e.g. "openai/gpt-5.4", "anthropic/claude-opus-4-6")
+                // Nanobot is configured through the OpenAI-compatible provider.
                 var model_val_buf: [512]u8 = undefined;
-                const model_val = prefixedModel(&model_val_buf, model);
+                const model_val = openAiModelRef(&model_val_buf, model);
                 const new_line = std.fmt.bufPrint(&line_buf, "{s}\"model\": \"{s}\"{s}", .{
                     indent,
                     model_val,
                     if (trailing_comma) "," else "",
                 }) catch line;
                 try result.appendSlice(allocator, new_line);
+                if (line_iter.peek() != null) try result.append(allocator, '\n');
+                continue;
+            }
+        }
+
+        // Force agents.defaults.provider to openai so Nanobot does not auto-route
+        // Claude-looking model IDs through an Anthropic provider.
+        if (std.mem.indexOf(u8, trimmed, "\"provider\"") != null and std.mem.indexOf(u8, trimmed, ":") != null) {
+            var indent_count: usize = 0;
+            for (line) |ch| {
+                if (ch == ' ') {
+                    indent_count += 1;
+                } else break;
+            }
+            if (indent_count >= 6 and indent_count <= 8) {
+                const trailing_comma = trimmed.len > 0 and trimmed[trimmed.len - 1] == ',';
+                var indent_buf: [32]u8 = undefined;
+                const indent = indent_buf[0..@min(indent_count, 32)];
+                @memset(indent, ' ');
+                try result.appendSlice(allocator, indent);
+                try result.appendSlice(allocator, "\"provider\": \"openai\"");
+                if (trailing_comma) try result.append(allocator, ',');
                 if (line_iter.peek() != null) try result.append(allocator, '\n');
                 continue;
             }
@@ -883,13 +909,13 @@ fn writeNewNanobotConfig(allocator: std.mem.Allocator, path: []const u8, api_key
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(allocator);
 
-    // Build model value with provider prefix if needed
+    // Build model value through the OpenAI-compatible provider.
     var model_val_buf: [512]u8 = undefined;
-    const model_val = prefixedModel(&model_val_buf, model);
+    const model_val = openAiModelRef(&model_val_buf, model);
 
     try out.appendSlice(allocator, "{\n  \"agents\": {\n    \"defaults\": {\n      \"model\": \"");
     try out.appendSlice(allocator, model_val);
-    try out.appendSlice(allocator, "\",\n      \"provider\": \"auto\"\n    }\n  },\n  \"providers\": {\n    \"openai\": {\n      \"apiKey\": \"");
+    try out.appendSlice(allocator, "\",\n      \"provider\": \"openai\"\n    }\n  },\n  \"providers\": {\n    \"openai\": {\n      \"apiKey\": \"");
     try out.appendSlice(allocator, api_key);
     try out.appendSlice(allocator, "\",\n      \"apiBase\": \"");
     try out.appendSlice(allocator, base_url);
@@ -1002,8 +1028,8 @@ fn updateOpenClawConfig(allocator: std.mem.Allocator, api_key: []const u8, base_
             var indent_buf: [32]u8 = undefined;
             const indent = indent_buf[0..@min(indent_count, 32)];
             @memset(indent, ' ');
-            var model_val_buf: [256]u8 = undefined;
-            const model_val = std.fmt.bufPrint(&model_val_buf, "velora/{s}", .{model}) catch model;
+            var model_val_buf: [512]u8 = undefined;
+            const model_val = providerModelRef(&model_val_buf, "velora", model);
             var line_buf: [512]u8 = undefined;
             const new_line = std.fmt.bufPrint(&line_buf, "{s}\"primary\": \"{s}\"{s}", .{
                 indent, model_val, if (trailing_comma) "," else "",
@@ -1024,8 +1050,8 @@ fn writeNewOpenClawConfig(allocator: std.mem.Allocator, path: []const u8, api_ke
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(allocator);
 
-    var model_val_buf: [256]u8 = undefined;
-    const model_val = std.fmt.bufPrint(&model_val_buf, "velora/{s}", .{model}) catch model;
+    var model_val_buf: [512]u8 = undefined;
+    const model_val = providerModelRef(&model_val_buf, "velora", model);
 
     try out.appendSlice(allocator, "{\n" ++
         "  \"models\": {\n" ++

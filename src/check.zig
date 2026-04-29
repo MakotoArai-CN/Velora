@@ -347,7 +347,9 @@ fn fetchAndParseModels(allocator: std.mem.Allocator, url: []const u8, api_key: [
                 }
             },
             .oc, .nb, .ow => {
-                // OpenCode/Nanobot/OpenClaw support both openai and anthropic providers
+                // These targets can use OpenAI-compatible relays that expose both
+                // OpenAI and Claude-style model IDs. The apply layer decides the
+                // provider/channel syntax for each target tool.
                 if (std.mem.indexOf(u8, model_id, "gpt-5") != null or
                     std.mem.indexOf(u8, model_id, "claude") != null)
                 {
@@ -1605,9 +1607,9 @@ pub fn pickBestCompatibleModel(models: []const []const u8, target_type: sites_mo
 
 fn supportsModelFamily(target_type: sites_mod.SiteType, family: ModelFamily) bool {
     return switch (target_type) {
-        .cx, .ow => family == .openai,
+        .cx => family == .openai,
         .cc => family == .claude,
-        .oc, .nb => family == .openai or family == .claude,
+        .oc, .nb, .ow => family == .openai or family == .claude,
     };
 }
 
