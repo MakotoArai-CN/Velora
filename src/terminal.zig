@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const io_compat = @import("io_compat.zig");
 
 pub const TermCaps = struct {
     color: bool = false,
@@ -41,19 +42,19 @@ fn detectWindows(caps: *TermCaps) void {
 
     // Redirected stdout should stay plain ASCII/no-color.
     var mode: windows.DWORD = 0;
-    if (k32.GetConsoleMode(handle, &mode) == 0) return;
+    if (!k32.GetConsoleMode(handle, &mode).toBool()) return;
 
-    if (k32.SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0) {
+    if (k32.SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING).toBool()) {
         caps.color = true;
     }
 
     // Match Zenith: use UTF-8 code page so cmd.exe / older consoles don't garble UTF-8 output.
-    if (k32.SetConsoleOutputCP(65001) != 0) {
+    if (k32.SetConsoleOutputCP(65001).toBool()) {
         caps.unicode = true;
     }
 
     var csbi: k32.CONSOLE_SCREEN_BUFFER_INFO = undefined;
-    if (k32.GetConsoleScreenBufferInfo(handle, &csbi) != 0) {
+    if (k32.GetConsoleScreenBufferInfo(handle, &csbi).toBool()) {
         const w = csbi.srWindow.Right - csbi.srWindow.Left + 1;
         if (w > 0) caps.width = @intCast(w);
     }
@@ -61,14 +62,15 @@ fn detectWindows(caps: *TermCaps) void {
 
 fn detectPosix(caps: *TermCaps) void {
     const fd = std.posix.STDOUT_FILENO;
-    if (!std.posix.isatty(fd)) return;
+    const is_tty = std.Io.File.stdout().isTty(io_compat.io()) catch false;
+    if (!is_tty) return;
 
     caps.unicode = true;
 
-    const no_color = std.process.getEnvVarOwned(std.heap.page_allocator, "NO_COLOR") catch null;
+    const no_color = io_compat.getEnv(std.heap.page_allocator, "NO_COLOR");
     defer if (no_color) |s| std.heap.page_allocator.free(s);
 
-    const term = std.process.getEnvVarOwned(std.heap.page_allocator, "TERM") catch null;
+    const term = io_compat.getEnv(std.heap.page_allocator, "TERM");
     defer if (term) |s| std.heap.page_allocator.free(s);
 
     if (no_color == null and (term == null or !std.mem.eql(u8, term.?, "dumb"))) {
@@ -83,7 +85,7 @@ fn detectPosix(caps: *TermCaps) void {
         return;
     }
 
-    if (std.process.getEnvVarOwned(std.heap.page_allocator, "COLUMNS") catch null) |cols| {
+    if (io_compat.getEnv(std.heap.page_allocator, "COLUMNS")) |cols| {
         defer std.heap.page_allocator.free(cols);
         caps.width = std.fmt.parseInt(u32, cols, 10) catch 80;
     }

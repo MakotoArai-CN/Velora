@@ -4,25 +4,26 @@ const config_mod = @import("config.zig");
 const app = @import("app.zig");
 const env_mod = @import("env.zig");
 const sites_mod = @import("sites.zig");
+const check_mod = @import("check.zig");
 const output = @import("output.zig");
 const terminal = @import("terminal.zig");
 const i18n = @import("i18n.zig");
+const io_compat = @import("io_compat.zig");
 
-/// Read entire file into an ArrayListUnmanaged via chunked reads (no fixed-size cap).
-/// Returns true if the file was successfully read, false if it could not be opened.
+fn prefixedModel(buf: *[512]u8, model: []const u8) []const u8 {
+    if (std.mem.indexOf(u8, model, "/") != null) return model;
+    const family = check_mod.classifyModelFamily(model);
+    const prefix: []const u8 = switch (family) {
+        .claude => "anthropic/",
+        .openai => "openai/",
+        .unknown => "openai/",
+    };
+    return std.fmt.bufPrint(buf, "{s}{s}", .{ prefix, model }) catch model;
+}
+
+/// Read entire file into an ArrayListUnmanaged via chunked reads.
 fn readFileIntoList(allocator: std.mem.Allocator, path: []const u8, list: *std.ArrayListUnmanaged(u8)) bool {
-    const file = std.fs.openFileAbsolute(path, .{}) catch return false;
-    defer file.close();
-    const stat = file.stat() catch return false;
-    const file_size: usize = @intCast(@min(stat.size, 16 * 1024 * 1024)); // cap at 16 MB
-    list.ensureTotalCapacity(allocator, file_size + 1) catch return false;
-    var buf: [65536]u8 = undefined;
-    while (true) {
-        const n = file.read(&buf) catch return false;
-        if (n == 0) break;
-        list.appendSlice(allocator, buf[0..n]) catch return false;
-    }
-    return true;
+    return io_compat.readFileIntoList(allocator, path, list);
 }
 
 /// Apply a site's configuration to Codex.
@@ -204,9 +205,7 @@ fn updateCodexToml(allocator: std.mem.Allocator, new_base_url: []const u8, new_m
         try result.append(allocator, '\n');
     }
 
-    const file = try std.fs.createFileAbsolute(path, .{});
-    defer file.close();
-    try file.writeAll(result.items);
+    try io_compat.writeFileAll(path, result.items);
 
     return true;
 }
@@ -263,23 +262,7 @@ fn updateClaudeSettings(allocator: std.mem.Allocator, api_key: []const u8, base_
     var existing: std.ArrayListUnmanaged(u8) = .empty;
     defer existing.deinit(allocator);
 
-    const has_file = blk: {
-        const file = std.fs.openFileAbsolute(path, .{}) catch break :blk false;
-        defer file.close();
-        const stat = file.stat() catch break :blk false;
-        const file_size = @as(usize, @intCast(stat.size));
-        if (file_size == 0) break :blk false;
-        existing.ensureTotalCapacity(allocator, file_size) catch break :blk false;
-        var total_read: usize = 0;
-        while (total_read < file_size) {
-            var tmp_buf: [8192]u8 = undefined;
-            const n = file.read(&tmp_buf) catch break;
-            if (n == 0) break;
-            existing.appendSlice(allocator, tmp_buf[0..n]) catch break;
-            total_read += n;
-        }
-        break :blk existing.items.len > 0;
-    };
+    const has_file = io_compat.readFileIntoList(allocator, path, &existing) and existing.items.len > 0;
 
     if (!has_file) {
         // Create new settings file with just the env block
@@ -295,14 +278,9 @@ fn updateClaudeSettings(allocator: std.mem.Allocator, api_key: []const u8, base_
 
         // Ensure directory exists
         const dir_path = std.fs.path.dirname(path) orelse return error.InvalidPath;
-        std.fs.makeDirAbsolute(dir_path) catch |err| switch (err) {
-            error.PathAlreadyExists => {},
-            else => return err,
-        };
+        try io_compat.makeDirIfMissing(dir_path);
 
-        const file = try std.fs.createFileAbsolute(path, .{});
-        defer file.close();
-        try file.writeAll(result.items);
+        try io_compat.writeFileAll(path, result.items);
         return;
     }
 
@@ -401,9 +379,7 @@ fn updateClaudeSettings(allocator: std.mem.Allocator, api_key: []const u8, base_
     const updated = try upsertTopLevelJsonStringField(allocator, result.items, "model", model);
     defer allocator.free(updated);
 
-    const file = try std.fs.createFileAbsolute(path, .{});
-    defer file.close();
-    try file.writeAll(updated);
+    try io_compat.writeFileAll(path, updated);
 }
 
 /// Replace only the value portion of a JSON "key": "value" line, preserving indentation and trailing comma.
@@ -445,7 +421,13 @@ pub fn applyToOpenCode(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: te
     try output.printInfo(w, i18n.tr(lang, "Applying to OpenCode...", "正在应用到 OpenCode...", "OpenCodeに適用中..."), caps);
     try w.flush();
 
-    const model = tool_model;
+    // OpenCode model format: "provider_name/model_id". We always configure
+    // a provider named "openai" (openai-compatible), so prefix accordingly.
+    var pm_buf: [512]u8 = undefined;
+    const model = if (std.mem.indexOf(u8, tool_model, "/") != null)
+        tool_model
+    else
+        std.fmt.bufPrint(&pm_buf, "openai/{s}", .{tool_model}) catch tool_model;
 
     updateOpenCodeConfig(allocator, site.api_key, site.base_url, model) catch |err| {
         try output.printError(w, i18n.tr(lang, "Failed to update OpenCode config", "更新 OpenCode 配置失败", "OpenCode 設定の更新に失敗しました"), caps);
@@ -475,10 +457,7 @@ fn updateOpenCodeConfig(allocator: std.mem.Allocator, api_key: []const u8, base_
 
     // Ensure directory exists
     const dir_path = std.fs.path.dirname(path) orelse return error.InvalidPath;
-    std.fs.makeDirAbsolute(dir_path) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
-        else => return err,
-    };
+    try io_compat.makeDirIfMissing(dir_path);
 
     var existing: std.ArrayListUnmanaged(u8) = .empty;
     defer existing.deinit(allocator);
@@ -524,9 +503,18 @@ fn updateOpenCodeConfig(allocator: std.mem.Allocator, api_key: []const u8, base_
             var esc_s = false;
             var in_str = false;
             for (trimmed) |ch| {
-                if (esc_s) { esc_s = false; continue; }
-                if (ch == '\\' and in_str) { esc_s = true; continue; }
-                if (ch == '"') { in_str = !in_str; continue; }
+                if (esc_s) {
+                    esc_s = false;
+                    continue;
+                }
+                if (ch == '\\' and in_str) {
+                    esc_s = true;
+                    continue;
+                }
+                if (ch == '"') {
+                    in_str = !in_str;
+                    continue;
+                }
                 if (in_str) continue;
                 if (ch == '{') openai_depth += 1;
                 if (ch == '}') openai_depth -= 1;
@@ -560,9 +548,18 @@ fn updateOpenCodeConfig(allocator: std.mem.Allocator, api_key: []const u8, base_
             var esc_s = false;
             var in_str = false;
             for (trimmed) |ch| {
-                if (esc_s) { esc_s = false; continue; }
-                if (ch == '\\' and in_str) { esc_s = true; continue; }
-                if (ch == '"') { in_str = !in_str; continue; }
+                if (esc_s) {
+                    esc_s = false;
+                    continue;
+                }
+                if (ch == '\\' and in_str) {
+                    esc_s = true;
+                    continue;
+                }
+                if (ch == '"') {
+                    in_str = !in_str;
+                    continue;
+                }
                 if (in_str) continue;
                 if (ch == '{') options_depth += 1;
                 if (ch == '}') options_depth -= 1;
@@ -613,43 +610,33 @@ fn updateOpenCodeConfig(allocator: std.mem.Allocator, api_key: []const u8, base_
     const updated = try upsertTopLevelJsonStringField(allocator, result.items, "model", model);
     defer allocator.free(updated);
 
-    const file = try std.fs.createFileAbsolute(path, .{});
-    defer file.close();
-    try file.writeAll(updated);
+    try io_compat.writeFileAll(path, updated);
 }
 
 fn writeNewOpenCodeConfig(allocator: std.mem.Allocator, path: []const u8, api_key: []const u8, base_url: []const u8, model: []const u8) !void {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(allocator);
 
-    try out.appendSlice(allocator,
-        "{\n" ++
+    try out.appendSlice(allocator, "{\n" ++
         "  \"provider\": {\n" ++
         "    \"openai\": {\n" ++
-        "      \"options\": {\n"
-    );
+        "      \"options\": {\n");
     try out.appendSlice(allocator, "        \"baseURL\": \"");
     try out.appendSlice(allocator, base_url);
     try out.appendSlice(allocator, "\",\n");
     try out.appendSlice(allocator, "        \"apiKey\": \"");
     try out.appendSlice(allocator, api_key);
     try out.appendSlice(allocator, "\"\n");
-    try out.appendSlice(allocator,
-        "      }\n" ++
+    try out.appendSlice(allocator, "      }\n" ++
         "    }\n" ++
         "  },\n" ++
-        "  \"model\": \""
-    );
+        "  \"model\": \"");
     try out.appendSlice(allocator, model);
-    try out.appendSlice(allocator,
-        "\",\n" ++
+    try out.appendSlice(allocator, "\",\n" ++
         "  \"$schema\": \"https://opencode.ai/config.json\"\n" ++
-        "}\n"
-    );
+        "}\n");
 
-    const file = try std.fs.createFileAbsolute(path, .{});
-    defer file.close();
-    try file.writeAll(out.items);
+    try io_compat.writeFileAll(path, out.items);
 }
 
 fn upsertTopLevelJsonStringField(allocator: std.mem.Allocator, content: []const u8, field: []const u8, value: []const u8) ![]u8 {
@@ -756,7 +743,8 @@ pub fn applyToNanobot(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: ter
     try output.printInfo(w, i18n.tr(lang, "Applying to Nanobot...", "正在应用到 Nanobot...", "Nanobotに適用中..."), caps);
     try w.flush();
 
-    const model = tool_model;
+    var pm_buf: [512]u8 = undefined;
+    const model = prefixedModel(&pm_buf, tool_model);
 
     updateNanobotConfig(allocator, site.api_key, site.base_url, model) catch |err| {
         try output.printError(w, i18n.tr(lang, "Failed to update Nanobot config", "更新 Nanobot 配置失败", "Nanobot 設定の更新に失敗しました"), caps);
@@ -786,10 +774,7 @@ fn updateNanobotConfig(allocator: std.mem.Allocator, api_key: []const u8, base_u
 
     // Ensure directory exists
     const dir_path = std.fs.path.dirname(path) orelse return error.InvalidPath;
-    std.fs.makeDirAbsolute(dir_path) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
-        else => return err,
-    };
+    try io_compat.makeDirIfMissing(dir_path);
 
     var existing: std.ArrayListUnmanaged(u8) = .empty;
     defer existing.deinit(allocator);
@@ -873,12 +858,9 @@ fn updateNanobotConfig(allocator: std.mem.Allocator, api_key: []const u8, base_u
                 var indent_buf: [32]u8 = undefined;
                 const indent = indent_buf[0..@min(indent_count, 32)];
                 @memset(indent, ' ');
-                // Nanobot model format: "openai/<model>" or just the model name
-                var model_val_buf: [256]u8 = undefined;
-                const model_val = if (std.mem.indexOf(u8, model, "/") != null)
-                    model
-                else
-                    std.fmt.bufPrint(&model_val_buf, "openai/{s}", .{model}) catch model;
+                // Nanobot model format: "provider/<model>" (e.g. "openai/gpt-5.4", "anthropic/claude-opus-4-6")
+                var model_val_buf: [512]u8 = undefined;
+                const model_val = prefixedModel(&model_val_buf, model);
                 const new_line = std.fmt.bufPrint(&line_buf, "{s}\"model\": \"{s}\"{s}", .{
                     indent,
                     model_val,
@@ -894,21 +876,16 @@ fn updateNanobotConfig(allocator: std.mem.Allocator, api_key: []const u8, base_u
         if (line_iter.peek() != null) try result.append(allocator, '\n');
     }
 
-    const file = try std.fs.createFileAbsolute(path, .{});
-    defer file.close();
-    try file.writeAll(result.items);
+    try io_compat.writeFileAll(path, result.items);
 }
 
 fn writeNewNanobotConfig(allocator: std.mem.Allocator, path: []const u8, api_key: []const u8, base_url: []const u8, model: []const u8) !void {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(allocator);
 
-    // Build model value with openai/ prefix if needed
-    var model_val_buf: [256]u8 = undefined;
-    const model_val = if (std.mem.indexOf(u8, model, "/") != null)
-        model
-    else
-        std.fmt.bufPrint(&model_val_buf, "openai/{s}", .{model}) catch model;
+    // Build model value with provider prefix if needed
+    var model_val_buf: [512]u8 = undefined;
+    const model_val = prefixedModel(&model_val_buf, model);
 
     try out.appendSlice(allocator, "{\n  \"agents\": {\n    \"defaults\": {\n      \"model\": \"");
     try out.appendSlice(allocator, model_val);
@@ -918,9 +895,7 @@ fn writeNewNanobotConfig(allocator: std.mem.Allocator, path: []const u8, api_key
     try out.appendSlice(allocator, base_url);
     try out.appendSlice(allocator, "\",\n      \"extraHeaders\": null\n    }\n  }\n}\n");
 
-    const file = try std.fs.createFileAbsolute(path, .{});
-    defer file.close();
-    try file.writeAll(out.items);
+    try io_compat.writeFileAll(path, out.items);
 }
 
 // --- OpenClaw JSON editing ---
@@ -961,10 +936,7 @@ fn updateOpenClawConfig(allocator: std.mem.Allocator, api_key: []const u8, base_
 
     // Ensure directory exists
     const dir_path = std.fs.path.dirname(path) orelse return error.InvalidPath;
-    std.fs.makeDirAbsolute(dir_path) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
-        else => return err,
-    };
+    try io_compat.makeDirIfMissing(dir_path);
 
     var existing: std.ArrayListUnmanaged(u8) = .empty;
     defer existing.deinit(allocator);
@@ -1045,9 +1017,7 @@ fn updateOpenClawConfig(allocator: std.mem.Allocator, api_key: []const u8, base_
         if (line_iter.peek() != null) try result.append(allocator, '\n');
     }
 
-    const file = try std.fs.createFileAbsolute(path, .{});
-    defer file.close();
-    try file.writeAll(result.items);
+    try io_compat.writeFileAll(path, result.items);
 }
 
 fn writeNewOpenClawConfig(allocator: std.mem.Allocator, path: []const u8, api_key: []const u8, base_url: []const u8, model: []const u8) !void {
@@ -1057,38 +1027,30 @@ fn writeNewOpenClawConfig(allocator: std.mem.Allocator, path: []const u8, api_ke
     var model_val_buf: [256]u8 = undefined;
     const model_val = std.fmt.bufPrint(&model_val_buf, "velora/{s}", .{model}) catch model;
 
-    try out.appendSlice(allocator,
-        "{\n" ++
+    try out.appendSlice(allocator, "{\n" ++
         "  \"models\": {\n" ++
         "    \"providers\": {\n" ++
-        "      \"velora\": {\n"
-    );
+        "      \"velora\": {\n");
     try out.appendSlice(allocator, "        \"baseUrl\": \"");
     try out.appendSlice(allocator, base_url);
     try out.appendSlice(allocator, "\",\n");
     try out.appendSlice(allocator, "        \"apiKey\": \"");
     try out.appendSlice(allocator, api_key);
     try out.appendSlice(allocator, "\",\n");
-    try out.appendSlice(allocator,
-        "        \"api\": \"openai-completions\"\n" ++
+    try out.appendSlice(allocator, "        \"api\": \"openai-completions\"\n" ++
         "      }\n" ++
         "    }\n" ++
         "  },\n" ++
         "  \"agents\": {\n" ++
         "    \"defaults\": {\n" ++
         "      \"model\": {\n" ++
-        "        \"primary\": \""
-    );
+        "        \"primary\": \"");
     try out.appendSlice(allocator, model_val);
-    try out.appendSlice(allocator,
-        "\"\n" ++
+    try out.appendSlice(allocator, "\"\n" ++
         "      }\n" ++
         "    }\n" ++
         "  }\n" ++
-        "}\n"
-    );
+        "}\n");
 
-    const file = try std.fs.createFileAbsolute(path, .{});
-    defer file.close();
-    try file.writeAll(out.items);
+    try io_compat.writeFileAll(path, out.items);
 }

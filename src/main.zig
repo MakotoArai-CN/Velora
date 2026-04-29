@@ -12,11 +12,16 @@ const current_mod = @import("current.zig");
 const install_mod = @import("install.zig");
 const update_mod = @import("update.zig");
 const app = @import("app.zig");
+const io_compat = @import("io_compat.zig");
 
 const build_options = @import("build_options");
 pub const version = build_options.version;
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
+    // Wire startup state so io_compat can serve std.Io and env lookups.
+    io_compat.setIo(init.io);
+    io_compat.setEnvironMap(init.environ_map);
+
     var gpa_impl: std.heap.DebugAllocator(.{}) = .init;
     const gpa, const is_debug = gpa: {
         break :gpa switch (builtin.mode) {
@@ -28,21 +33,24 @@ pub fn main() !void {
         _ = gpa_impl.deinit();
     };
 
-    const config = cli.parseArgs(gpa) catch |err| {
+    // Args: source from init.minimal.args, allocate in init.arena (auto-freed at exit).
+    const argv = init.minimal.args.toSlice(init.arena.allocator()) catch &[_][:0]const u8{};
+
+    const config = cli.parseArgs(gpa, argv) catch |err| {
         switch (err) {
             error.HelpRequested, error.VersionRequested => return,
             error.InvalidArgument => {
                 var stderr_buffer: [512]u8 = undefined;
-                var stderr_writer = std.fs.File.stderr().writer(&stderr_buffer);
-                const w = &stderr_writer.interface;
+                var stderr_writer: std.Io.File.Writer = undefined;
+                const w = io_compat.stderrWriter(&stderr_buffer, &stderr_writer);
                 w.print("Invalid argument. Use 'velora --help' for usage.\n", .{}) catch {};
                 w.flush() catch {};
                 return;
             },
             error.OutOfMemory => {
                 var stderr_buffer: [512]u8 = undefined;
-                var stderr_writer = std.fs.File.stderr().writer(&stderr_buffer);
-                const w = &stderr_writer.interface;
+                var stderr_writer: std.Io.File.Writer = undefined;
+                const w = io_compat.stderrWriter(&stderr_buffer, &stderr_writer);
                 w.print("Out of memory.\n", .{}) catch {};
                 w.flush() catch {};
                 return;
@@ -51,8 +59,8 @@ pub fn main() !void {
     };
 
     var stdout_buffer: [8192]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
-    const w: *std.Io.Writer = &stdout_writer.interface;
+    var stdout_writer: std.Io.File.Writer = undefined;
+    const w = io_compat.stdoutWriter(&stdout_buffer, &stdout_writer);
     const caps = terminal.TermCaps.detect();
     const lang = config.language;
 
@@ -152,7 +160,6 @@ fn runAdd(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCa
         try w.flush();
         return;
     }
-
 
     // Interactive mode
     if (existing) |ex| {
@@ -340,6 +347,29 @@ fn runEdit(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermC
 
     try output.printSuccess(w, i18n.tr(lang, "Site updated", "站点已更新", "サイトを更新しました"), caps);
     try w.flush();
+
+    // Auto-reapply: if any tools were using this site (matched by old config), re-apply with updated values
+    var current = current_mod.CurrentTools.load(allocator);
+    defer current.deinit(allocator);
+    const in_use_mask = current.matchSite(saved_url, saved_key);
+
+    if (in_use_mask != 0) {
+        const updated_site = store.getSite(args.alias) orelse return;
+
+        inline for ([_]sites_mod.SiteType{ .cx, .cc, .oc, .nb, .ow }) |tool| {
+            if ((in_use_mask & sites_mod.toolMask(tool)) != 0) {
+                const tool_model = updated_site.effectiveModelForTool(tool);
+                try output.printSeparator(w, caps);
+                switch (tool) {
+                    .cx => try apply_mod.applyToCodex(allocator, w, caps, lang, updated_site, tool_model),
+                    .cc => try apply_mod.applyToClaudeCode(allocator, w, caps, lang, updated_site, tool_model),
+                    .oc => try apply_mod.applyToOpenCode(allocator, w, caps, lang, updated_site, tool_model),
+                    .nb => try apply_mod.applyToNanobot(allocator, w, caps, lang, updated_site, tool_model),
+                    .ow => try apply_mod.applyToOpenClaw(allocator, w, caps, lang, updated_site, tool_model),
+                }
+            }
+        }
+    }
 }
 
 // --- Del ---
@@ -558,7 +588,7 @@ fn runList(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermC
     // Poll for completions, repaint each newly-finished row.
     // Batch timeout is slightly above the 10s-per-request HTTP timeout
     // embedded inside checkConnectivityInner via std.http.Client defaults.
-    const batch_start = std.time.milliTimestamp();
+    const batch_start = io_compat.milliTimestamp();
     const batch_timeout_ms: i64 = 15000;
     var done_count: usize = 0;
 
@@ -591,10 +621,10 @@ fn runList(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermC
         }
 
         if (done_count >= check_count) break;
-        if (std.time.milliTimestamp() - batch_start > batch_timeout_ms) break;
+        if (io_compat.milliTimestamp() - batch_start > batch_timeout_ms) break;
         if (!progress) {
             try w.flush();
-            std.Thread.sleep(50 * std.time.ns_per_ms);
+            io_compat.sleepNs(50 * std.time.ns_per_ms);
         }
     }
 
@@ -817,8 +847,7 @@ fn printSiteStatusLine(w: *std.Io.Writer, caps: terminal.TermCaps, status: check
 /// supported, the whole tag renders in bold accent to stand out from the row.
 fn formatInUseTag(buf: []u8, mask: u8, caps: terminal.TermCaps) []const u8 {
     if (mask == 0) return "";
-    var fbs = std.io.fixedBufferStream(buf);
-    const fw = fbs.writer();
+    var fw: std.Io.Writer = .fixed(buf);
     fw.writeAll(" ") catch return "";
     if (caps.color) {
         fw.writeAll(output.Color.bold) catch return "";
@@ -864,7 +893,7 @@ fn formatInUseTag(buf: []u8, mask: u8, caps: terminal.TermCaps) []const u8 {
     }
     fw.writeAll("]") catch return "";
     if (caps.color) fw.writeAll(output.Color.reset) catch return "";
-    return fbs.getWritten();
+    return fw.buffered();
 }
 
 // --- Use ---
@@ -1045,7 +1074,7 @@ fn runUse(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCa
     try w.flush();
 
     const model = tool_model;
-    const call_result = check_mod.testModelCall(allocator, updated_site.base_url, updated_site.api_key, model, target_type);
+    const call_result = check_mod.testModelCall(allocator, updated_site.base_url, updated_site.api_key, model, target_type, settings.model_call_timeout_ms);
 
     try output.printInfo(w, i18n.tr(lang, "Detecting models...", "正在检测模型...", "モデルを検出中..."), caps);
     try w.flush();
@@ -1082,7 +1111,9 @@ fn runUse(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCa
         try output.printWarning(w, i18n.tr(lang, "Could not detect models (auth may be required)", "无法检测模型（可能需要认证）", "モデルを検出できません（認証が必要な場合があります）"), caps);
     }
 
-    // Report model list presence
+    // Report model list presence. Suppress the "not in list" warning when the call
+    // succeeded — many relay/proxy sites omit the model from /v1/models even though
+    // it is fully usable, and the warning is misleading in that case.
     if (call_result.model_in_list) {
         var list_buf: [128]u8 = undefined;
         const list_msg = std.fmt.bufPrint(&list_buf, "{s} '{s}' {s}", .{
@@ -1091,7 +1122,7 @@ fn runUse(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCa
             i18n.tr(lang, "found in model list", "在模型列表中", "はモデルリストに存在"),
         }) catch "Model in list";
         try output.printSuccess(w, list_msg, caps);
-    } else {
+    } else if (!call_result.success) {
         var list_buf: [128]u8 = undefined;
         const list_msg = std.fmt.bufPrint(&list_buf, "{s} '{s}' {s}", .{
             i18n.tr(lang, "Model", "模型", "モデル"),
@@ -1140,7 +1171,7 @@ fn runSet(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCa
     const key = args.key;
     const value = args.value;
 
-    // Handle list_sort separately (string value, not boolean)
+    // Handle string settings separately
     if (std.mem.eql(u8, key, "list_sort")) {
         if (sites_mod.SortMode.fromString(value)) |mode| {
             settings.list_sort = mode;
@@ -1154,6 +1185,35 @@ fn runSet(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCa
             try w.flush();
             return;
         }
+    } else if (std.mem.eql(u8, key, "model_select_mode")) {
+        if (sites_mod.ModelSelectMode.fromString(value)) |mode| {
+            settings.model_select_mode = mode;
+            try sites_mod.saveSettings(allocator, settings);
+
+            var msg_buf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrint(&msg_buf, "{s} = {s}", .{ key, mode.toString() }) catch "Updated";
+            try output.printSuccess(w, msg, caps);
+        } else {
+            try output.printError(w, i18n.tr(lang, "Invalid model select mode. Use: number, keyboard", "无效模型选择方式，请使用: number, keyboard", "無効なモデル選択モードです。number, keyboard を使用してください"), caps);
+            try w.flush();
+            return;
+        }
+    } else if (std.mem.eql(u8, key, "model_call_timeout_ms")) {
+        const parsed = std.fmt.parseInt(u32, value, 10) catch {
+            try output.printError(w, i18n.tr(lang, "Invalid number. Range: 3000-600000 (ms)", "无效数字，范围: 3000-600000 (毫秒)", "無効な数値です。範囲: 3000-600000 (ミリ秒)"), caps);
+            try w.flush();
+            return;
+        };
+        if (parsed < 3000 or parsed > 600000) {
+            try output.printError(w, i18n.tr(lang, "Out of range. Use 3000-600000 (ms)", "超出范围，请使用 3000-600000 (毫秒)", "範囲外です。3000-600000 (ミリ秒) を使用してください"), caps);
+            try w.flush();
+            return;
+        }
+        settings.model_call_timeout_ms = parsed;
+        try sites_mod.saveSettings(allocator, settings);
+        var msg_buf: [128]u8 = undefined;
+        const msg = std.fmt.bufPrint(&msg_buf, "{s} = {d}", .{ key, parsed }) catch "Updated";
+        try output.printSuccess(w, msg, caps);
     } else {
         // Parse boolean value for other settings
         const bool_val = if (std.mem.eql(u8, value, "on") or std.mem.eql(u8, value, "true") or std.mem.eql(u8, value, "1"))
@@ -1174,9 +1234,11 @@ fn runSet(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCa
             settings.auto_archive = bool_val;
         } else if (std.mem.eql(u8, key, "auto_pick_compatible_model")) {
             settings.auto_pick_compatible_model = bool_val;
+        } else if (std.mem.eql(u8, key, "auto_load_models")) {
+            settings.auto_load_models = bool_val;
         } else {
             var err_buf: [256]u8 = undefined;
-            const err_msg = std.fmt.bufPrint(&err_buf, "{s}: '{s}'. {s}: model_check, list_latency, auto_archive, auto_pick_compatible_model, list_sort", .{
+            const err_msg = std.fmt.bufPrint(&err_buf, "{s}: '{s}'. {s}: model_check, list_latency, auto_archive, auto_pick_compatible_model, auto_load_models, list_sort, model_select_mode, model_call_timeout_ms", .{
                 i18n.tr(lang, "Unknown setting", "未知设置项", "不明な設定"),
                 key,
                 i18n.tr(lang, "Available", "可用", "利用可能"),
@@ -1201,7 +1263,12 @@ fn runSet(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCa
     try output.printKeyValue(w, "  list_latency:", if (settings.list_latency) "on" else "off", caps);
     try output.printKeyValue(w, "  auto_archive:", if (settings.auto_archive) "on" else "off", caps);
     try output.printKeyValue(w, "  auto_pick_compatible_model:", if (settings.auto_pick_compatible_model) "on" else "off", caps);
+    try output.printKeyValue(w, "  auto_load_models:", if (settings.auto_load_models) "on" else "off", caps);
     try output.printKeyValue(w, "  list_sort:", settings.list_sort.toString(), caps);
+    try output.printKeyValue(w, "  model_select_mode:", settings.model_select_mode.toString(), caps);
+    var to_buf: [32]u8 = undefined;
+    const to_str = std.fmt.bufPrint(&to_buf, "{d}", .{settings.model_call_timeout_ms}) catch "30000";
+    try output.printKeyValue(w, "  model_call_timeout_ms:", to_str, caps);
     try w.flush();
 }
 
@@ -1311,6 +1378,7 @@ const ModelTestTask = struct {
     owned_key: []u8,
     owned_model: []u8,
     perf_mode: bool,
+    timeout_ms: u32 = 30000,
     started_at_ms: i64 = 0,
 
     /// Filled in by worker before signalling done.
@@ -1334,7 +1402,7 @@ fn modelTestWorker(t: *ModelTestTask) void {
     if (t.perf_mode) {
         t.bench_result = check_mod.benchmarkModel(std.heap.page_allocator, t.owned_url, t.owned_key, t.owned_model, t.site_type);
     } else {
-        t.call_result = check_mod.testModelCall(std.heap.page_allocator, t.owned_url, t.owned_key, t.owned_model, t.site_type);
+        t.call_result = check_mod.testModelCall(std.heap.page_allocator, t.owned_url, t.owned_key, t.owned_model, t.site_type, t.timeout_ms);
     }
     t.done.store(true, .release);
     releaseModelTestTask(t);
@@ -1395,7 +1463,7 @@ fn runModelTest(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.
         }
     }
 
-    try runParallelModelTest(allocator, w, caps, lang, &store, target_indices[0..target_count], args.perf);
+    try runParallelModelTest(allocator, w, caps, lang, &store, target_indices[0..target_count], args.perf, sites_mod.loadSettings(allocator).model_call_timeout_ms);
 }
 
 fn runParallelModelTest(
@@ -1406,6 +1474,7 @@ fn runParallelModelTest(
     store: *const sites_mod.SitesStore,
     indices: []const usize,
     perf_mode: bool,
+    timeout_ms: u32,
 ) !void {
     _ = allocator;
     const count = indices.len;
@@ -1432,7 +1501,7 @@ fn runParallelModelTest(
     var threads: [sites_mod.MAX_SITES]?std.Thread = [_]?std.Thread{null} ** sites_mod.MAX_SITES;
     var rendered: [sites_mod.MAX_SITES]bool = [_]bool{false} ** sites_mod.MAX_SITES;
 
-    const launch_at_ms = std.time.milliTimestamp();
+    const launch_at_ms = io_compat.milliTimestamp();
     for (indices, 0..) |idx, ci| {
         const entry = store.entries[idx];
         const model = entry.site.effectiveModelForTool(entry.site.site_type);
@@ -1460,6 +1529,7 @@ fn runParallelModelTest(
             .owned_key = owned_key,
             .owned_model = owned_model,
             .perf_mode = perf_mode,
+            .timeout_ms = timeout_ms,
             .started_at_ms = launch_at_ms,
         };
         tasks[ci] = task;
@@ -1471,9 +1541,10 @@ fn runParallelModelTest(
     }
 
     // Poll: repaint completed rows immediately, animate spinner on pending rows.
-    // Budget 18s for normal tests (just above the 15s per-site timeout); 65s for perf.
-    const poll_start = std.time.milliTimestamp();
-    const batch_timeout_ms: i64 = if (perf_mode) 65000 else 18000;
+    // Add a small grace margin on top of the per-site timeout so the inner thread can
+    // settle before the outer batch declares timeout.
+    const poll_start = io_compat.milliTimestamp();
+    const batch_timeout_ms: i64 = if (perf_mode) 65000 else @as(i64, @intCast(timeout_ms)) + 3000;
     var done_count: usize = 0;
     var spinner_idx: usize = 0;
 
@@ -1497,14 +1568,14 @@ fn runParallelModelTest(
                 continue;
             }
 
-            const elapsed_ms = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - launch_at_ms)));
+            const elapsed_ms = @as(u64, @intCast(@max(0, io_compat.milliTimestamp() - launch_at_ms)));
             try repaintModelTestRowSpinner(w, caps, layout, lang, ci, count, entry.alias, entry.site.site_type, model, spinner_idx, elapsed_ms);
         }
 
         if (done_count >= count) break;
-        if (std.time.milliTimestamp() - poll_start > batch_timeout_ms) break;
+        if (io_compat.milliTimestamp() - poll_start > batch_timeout_ms) break;
         try w.flush();
-        std.Thread.sleep(120 * std.time.ns_per_ms);
+        io_compat.sleepNs(120 * std.time.ns_per_ms);
         spinner_idx +%= 1;
     }
 
@@ -2125,11 +2196,13 @@ fn readLine() []const u8 {
 }
 
 fn readLineInto(buf: *[512]u8) []const u8 {
-    var stdin = std.fs.File.stdin();
+    const io = io_compat.io();
+    const stdin = std.Io.File.stdin();
     var len: usize = 0;
     while (len < buf.len) {
         var byte_buf: [1]u8 = undefined;
-        const n = stdin.read(&byte_buf) catch 0;
+        const iovecs = [_][]u8{&byte_buf};
+        const n = stdin.readStreaming(io, &iovecs) catch 0;
         if (n == 0) break;
         const ch = byte_buf[0];
         if (ch == '\n') break;

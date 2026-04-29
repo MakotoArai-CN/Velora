@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const app = @import("app.zig");
 const config_mod = @import("config.zig");
+const io_compat = @import("io_compat.zig");
 
 pub const InstallStatus = enum {
     installed,
@@ -84,7 +85,7 @@ pub fn uninstall(allocator: std.mem.Allocator) !UninstallStatus {
             return .scheduled_cleanup;
         }
 
-        std.fs.deleteFileAbsolute(exe_path) catch |err| switch (err) {
+        io_compat.deleteFileAbsolute(exe_path) catch |err| switch (err) {
             error.FileNotFound => {},
             error.AccessDenied => {
                 if (builtin.os.tag == .windows) {
@@ -97,52 +98,58 @@ pub fn uninstall(allocator: std.mem.Allocator) !UninstallStatus {
         };
     }
 
-    std.fs.deleteTreeAbsolute(path) catch |err| switch (err) {
-        error.FileNotFound => return .already_removed,
-        else => return err,
-    };
+    if (!io_compat.pathExists(path)) return .already_removed;
+    try io_compat.deleteTreeAbsolute(path);
 
     return .removed;
 }
 
 fn replaceInstalledExecutable(source_path: []const u8, installed_path: []const u8) !void {
-    std.fs.deleteFileAbsolute(installed_path) catch |err| switch (err) {
+    io_compat.deleteFileAbsolute(installed_path) catch |err| switch (err) {
         error.FileNotFound => {},
         else => return err,
     };
-    try std.fs.copyFileAbsolute(source_path, installed_path, .{});
+    try io_compat.copyFileAbsolute(source_path, installed_path);
 }
 
 fn filesEqualAbsolute(a_path: []const u8, b_path: []const u8) !bool {
-    const a_file = try std.fs.openFileAbsolute(a_path, .{});
-    defer a_file.close();
-    const b_file = try std.fs.openFileAbsolute(b_path, .{});
-    defer b_file.close();
+    const io = io_compat.io();
+    const a_file = try std.Io.Dir.openFileAbsolute(io, a_path, .{});
+    defer a_file.close(io);
+    const b_file = try std.Io.Dir.openFileAbsolute(io, b_path, .{});
+    defer b_file.close(io);
 
-    const a_stat = try a_file.stat();
-    const b_stat = try b_file.stat();
-    if (a_stat.size != b_stat.size) return false;
+    const a_len = try a_file.length(io);
+    const b_len = try b_file.length(io);
+    if (a_len != b_len) return false;
 
     var a_buf: [8192]u8 = undefined;
     var b_buf: [8192]u8 = undefined;
+    var a_reader = a_file.reader(io, &a_buf);
+    var b_reader = b_file.reader(io, &b_buf);
+    const a_iface = &a_reader.interface;
+    const b_iface = &b_reader.interface;
 
     while (true) {
-        const a_read = try a_file.read(&a_buf);
-        const b_read = try b_file.read(&b_buf);
-        if (a_read != b_read) return false;
-        if (a_read == 0) return true;
-        if (!std.mem.eql(u8, a_buf[0..a_read], b_buf[0..b_read])) return false;
+        const a_slice = a_iface.peekGreedy(1) catch |err| switch (err) {
+            error.EndOfStream => return true,
+            else => return err,
+        };
+        const b_slice = b_iface.peekGreedy(1) catch return false;
+        const n = @min(a_slice.len, b_slice.len);
+        if (!std.mem.eql(u8, a_slice[0..n], b_slice[0..n])) return false;
+        a_iface.toss(n);
+        b_iface.toss(n);
     }
 }
 
 fn pathExistsAbsolute(path: []const u8) bool {
-    std.fs.accessAbsolute(path, .{}) catch return false;
-    return true;
+    return io_compat.pathExists(path);
 }
 
 fn getSelfExePath(allocator: std.mem.Allocator) ![]u8 {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try std.fs.selfExePath(&path_buf);
+    const path = try io_compat.selfExePath(&path_buf);
     return try allocator.dupe(u8, path);
 }
 
@@ -216,12 +223,7 @@ fn ensureCommandOnPathPosix(allocator: std.mem.Allocator, bin_dir: []const u8) !
         const path = try std.fs.path.join(allocator, &.{ home, fname });
         defer allocator.free(path);
 
-        const exists = blk: {
-            std.fs.accessAbsolute(path, .{}) catch break :blk false;
-            break :blk true;
-        };
-
-        if (exists) {
+        if (io_compat.pathExists(path)) {
             try updatePathShellFile(allocator, path, bin_dir, true);
             written = true;
         }
@@ -250,21 +252,14 @@ fn updatePathShellFile(allocator: std.mem.Allocator, path: []const u8, bin_dir: 
     var content: std.ArrayListUnmanaged(u8) = .empty;
     defer content.deinit(allocator);
 
-    {
-        const file = std.fs.openFileAbsolute(path, .{}) catch {
-            if (add) {
-                const out_file = try std.fs.createFileAbsolute(path, .{});
-                defer out_file.close();
-                const export_line = try std.fmt.allocPrint(allocator, "{s}\nexport PATH=\"{s}:$PATH\"\n", .{ app.path_marker, bin_dir });
-                defer allocator.free(export_line);
-                try out_file.writeAll(export_line);
-            }
-            return;
-        };
-        defer file.close();
-        var buf: [65536]u8 = undefined;
-        const bytes_read = file.readAll(&buf) catch return;
-        try content.appendSlice(allocator, buf[0..bytes_read]);
+    const has_file = io_compat.readFileIntoList(allocator, path, &content);
+    if (!has_file) {
+        if (add) {
+            const export_line = try std.fmt.allocPrint(allocator, "{s}\nexport PATH=\"{s}:$PATH\"\n", .{ app.path_marker, bin_dir });
+            defer allocator.free(export_line);
+            try io_compat.writeFileAll(path, export_line);
+        }
+        return;
     }
 
     const export_line = try std.fmt.allocPrint(allocator, "export PATH=\"{s}:$PATH\"", .{bin_dir});
@@ -297,9 +292,7 @@ fn updatePathShellFile(allocator: std.mem.Allocator, path: []const u8, bin_dir: 
         try new_content.append(allocator, '\n');
     }
 
-    const file = try std.fs.createFileAbsolute(path, .{});
-    defer file.close();
-    try file.writeAll(new_content.items);
+    try io_compat.writeFileAll(path, new_content.items);
 }
 
 fn pathContainsWindows(path_value: []const u8, segment: []const u8) bool {
@@ -332,37 +325,25 @@ fn removePathSegment(allocator: std.mem.Allocator, path_value: []const u8, delim
 }
 
 fn runAndCaptureStdout(allocator: std.mem.Allocator, argv: []const []const u8) ![]u8 {
-    var stdout_data: std.ArrayListUnmanaged(u8) = .empty;
-    defer stdout_data.deinit(allocator);
-    var stderr_data: std.ArrayListUnmanaged(u8) = .empty;
-    defer stderr_data.deinit(allocator);
+    const result = std.process.run(allocator, io_compat.io(), .{ .argv = argv }) catch return error.CommandFailed;
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
 
-    var child = std.process.Child.init(argv, allocator);
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-
-    try child.spawn();
-    try child.collectOutput(allocator, &stdout_data, &stderr_data, 65536);
-    const term = try child.wait();
-
-    switch (term) {
-        .Exited => |code| if (code != 0) return error.CommandFailed,
+    switch (result.term) {
+        .exited => |code| if (code != 0) return error.CommandFailed,
         else => return error.CommandFailed,
     }
 
-    return try allocator.dupe(u8, std.mem.trim(u8, stdout_data.items, " \t\r\n"));
+    return try allocator.dupe(u8, std.mem.trim(u8, result.stdout, " \t\r\n"));
 }
 
 fn run(allocator: std.mem.Allocator, argv: []const []const u8) !void {
-    var child = std.process.Child.init(argv, allocator);
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
+    const result = std.process.run(allocator, io_compat.io(), .{ .argv = argv }) catch return error.CommandFailed;
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
 
-    try child.spawn();
-    const term = try child.wait();
-
-    switch (term) {
-        .Exited => |code| if (code != 0) return error.CommandFailed,
+    switch (result.term) {
+        .exited => |code| if (code != 0) return error.CommandFailed,
         else => return error.CommandFailed,
     }
 }
@@ -381,9 +362,13 @@ fn scheduleWindowsCleanup(allocator: std.mem.Allocator, exe_path: ?[]const u8, a
     defer allocator.free(script);
 
     const args = [_][]const u8{ "powershell.exe", "-NoProfile", "-WindowStyle", "Hidden", "-Command", script };
-    var child = std.process.Child.init(&args, allocator);
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-    try child.spawn();
+    // Fire-and-forget: the current process must exit before the cleanup script
+    // can delete the running executable on Windows.
+    _ = std.process.spawn(io_compat.io(), .{
+        .argv = &args,
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+        .create_no_window = true,
+    }) catch return;
 }

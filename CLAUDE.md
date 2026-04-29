@@ -19,7 +19,7 @@ The build system cross-compiles for 18 targets (Linux, Alpine/musl, Windows, mac
 
 ## Architecture
 
-- **Entry point**: `src/main.zig` — wires CLI parsing to command handlers (`runAdd`, `runEdit`, `runDel`, `runList`, `runUse`, `runModels`, `runModelTest`, `runInstall`, `runUpdate`). Also contains interactive input helpers and the version constant. `runList` runs connectivity checks in parallel via heap-allocated `CheckTask` (refcount-2) workers and repaints rows in place. `runModelTest` does the same with `ModelTestTask` workers and a spinner animation.
+- **Entry point**: `src/main.zig` — wires CLI parsing to command handlers (`runAdd`, `runEdit`, `runDel`, `runList`, `runUse`, `runModels`, `runModelTest`, `runInstall`, `runUpdate`). Also contains interactive input helpers and the version constant. `runList` runs connectivity checks in parallel via heap-allocated `CheckTask` (refcount-2) workers and repaints rows in place. `runModelTest` does the same with `ModelTestTask` workers and a spinner animation. `runEdit` after saving will load `CurrentTools`, match the *old* `base_url`/`api_key` against live tool configs, and auto-reapply the updated site to every matching tool (no separate `use` needed). The match runs against pre-edit values so URL/key changes still find the right tools.
 - **`src/cli.zig`** — Argument parsing. Produces a `Config` struct with a `Command` tagged union. No external arg-parsing library. Help is split: `printHelp` shows commands/options + a hint, `printExamples` (invoked via `velora help examples` or `--examples`) shows the full usage examples.
 - **`src/app.zig`** — Compile-time constants: app name, config paths, GitHub repo URL, default models per tool type.
 - **`src/sites.zig`** — `SitesStore` (fixed-capacity array of up to 64 sites), JSON load/save for `~/.velora/sites.json`. Manual JSON parsing (no std.json). Per-site multi-tool defaults (`default_tools_mask`), per-tool model overrides (`models_cx`/`cc`/`oc`/`nb`/`ow`), selection mode, and settings management.
@@ -47,4 +47,18 @@ The build system cross-compiles for 18 targets (Linux, Alpine/musl, Windows, mac
 
 ## Zig Version
 
-Minimum Zig version: **0.15.1** (specified in `build.zig.zon`).
+Minimum Zig version: **0.16.0** (specified in `build.zig.zon`).
+
+### 0.16 migration notes
+
+The 0.16 "I/O as an Interface" rework moved file I/O, environment variables, process spawning, sleep, and timestamps into the `std.Io` namespace. Velora wraps these in `src/io_compat.zig`, which stores the `init.io` instance passed to `main` and exposes helpers (`readFileIntoList`, `writeFileAll`, `makeDirIfMissing`, `pathExists`, `getEnv`, `selfExePath`, `milliTimestamp`, `sleepNs`, `stdoutWriter`/`stderrWriter`, etc). Most modules call the helpers rather than `std.Io` directly to keep call sites short.
+
+Notable cascading changes:
+- `pub fn main` now takes `init: std.process.Init` so Zig 0.16 can hand env vars, args, and the application `Io` explicitly. `main` calls `io_compat.setIo(init.io)` and `io_compat.setEnvironMap(init.environ_map)` once at startup so helpers can resolve I/O and env lookups.
+- CLI args come from `init.minimal.args.toSlice(init.arena.allocator())` — `cli.parseArgs` accepts the slice as a parameter rather than fetching it itself.
+- `std.io.fixedBufferStream(buf).writer()` → `std.Io.Writer.fixed(buf)`. `getWritten()` → `buffered()`.
+- `std.mem.trimRight` / `trimLeft` → `trimEnd` / `trimStart`.
+- `std.time.milliTimestamp()` / `std.Thread.sleep(ns)` → `io_compat.milliTimestamp()` / `io_compat.sleepNs(ns)`.
+- Windows BOOL became a wrapped enum (`Bool(c_int)`) — comparisons use `.toBool()`.
+- `std.process.Child.Term` enum tags lowercased (`.Exited` → `.exited`).
+- `std.process.Child.init`/`spawn`/`collectOutput` removed; use `std.process.run(allocator, io, .{ .argv = ... })`.

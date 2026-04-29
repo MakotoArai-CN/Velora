@@ -1,17 +1,17 @@
 const std = @import("std");
 const app = @import("app.zig");
 const builtin = @import("builtin");
+const io_compat = @import("io_compat.zig");
 
 pub const UpdateInfo = struct {
     has_update: bool,
-    latest_version: ?[]u8, // allocated, caller frees
-    download_url: ?[]u8,   // allocated, caller frees
+    latest_version: ?[]u8,
+    download_url: ?[]u8,
 };
 
 /// Check GitHub releases API for latest version.
-/// Returns UpdateInfo; caller must free latest_version and download_url if non-null.
 pub fn checkLatestVersion(allocator: std.mem.Allocator, current_version: []const u8) !UpdateInfo {
-    var client: std.http.Client = .{ .allocator = allocator };
+    var client = io_compat.httpClient(allocator);
     defer client.deinit();
 
     var response_writer: std.Io.Writer.Allocating = .init(allocator);
@@ -31,11 +31,9 @@ pub fn checkLatestVersion(allocator: std.mem.Allocator, current_version: []const
 
     const body = response_writer.written();
 
-    // Extract tag_name from JSON: "tag_name": "v2.0.0"
     const latest_tag = extractJsonStr(allocator, body, "tag_name") catch return error.ParseError;
     defer allocator.free(latest_tag);
 
-    // Strip leading 'v' if present
     const latest = if (latest_tag.len > 0 and latest_tag[0] == 'v')
         latest_tag[1..]
     else
@@ -46,7 +44,6 @@ pub fn checkLatestVersion(allocator: std.mem.Allocator, current_version: []const
 
     const latest_copy = try allocator.dupe(u8, latest);
 
-    // Extract download URL for current platform
     const download_url = extractDownloadUrl(allocator, body) catch null;
 
     return .{
@@ -58,7 +55,7 @@ pub fn checkLatestVersion(allocator: std.mem.Allocator, current_version: []const
 
 /// Download and replace the current binary with the latest version.
 pub fn performUpdate(allocator: std.mem.Allocator, download_url: []const u8) !void {
-    var client: std.http.Client = .{ .allocator = allocator };
+    var client = io_compat.httpClient(allocator);
     defer client.deinit();
 
     var response_writer: std.Io.Writer.Allocating = .init(allocator);
@@ -79,30 +76,28 @@ pub fn performUpdate(allocator: std.mem.Allocator, download_url: []const u8) !vo
     const exe_data = response_writer.written();
     if (exe_data.len == 0) return error.DownloadFailed;
 
-    // Write to a temp file next to the current binary, then replace
     var self_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const self_path = std.fs.selfExePath(&self_buf) catch return error.SelfPathError;
+    const self_path = io_compat.selfExePath(&self_buf) catch return error.SelfPathError;
 
     var tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
     const tmp_path = std.fmt.bufPrint(&tmp_buf, "{s}.new", .{self_path}) catch return error.PathError;
 
     {
-        const tmp_file = try std.fs.createFileAbsolute(tmp_path, .{ .mode = 0o755 });
-        defer tmp_file.close();
-        try tmp_file.writeAll(exe_data);
+        const tmp_file = try io_compat.createFileExecutable(tmp_path);
+        defer io_compat.closeFile(tmp_file);
+        try tmp_file.writeStreamingAll(io_compat.io(), exe_data);
     }
 
     // Replace current binary
     switch (builtin.os.tag) {
         .windows => {
-            // On Windows: rename current to .old, rename new to current
             var old_buf: [std.fs.max_path_bytes]u8 = undefined;
             const old_path = std.fmt.bufPrint(&old_buf, "{s}.old", .{self_path}) catch return error.PathError;
-            std.fs.renameAbsolute(self_path, old_path) catch {};
-            try std.fs.renameAbsolute(tmp_path, self_path);
+            io_compat.renameAbsolute(self_path, old_path) catch {};
+            try io_compat.renameAbsolute(tmp_path, self_path);
         },
         else => {
-            try std.fs.renameAbsolute(tmp_path, self_path);
+            try io_compat.renameAbsolute(tmp_path, self_path);
         },
     }
 }
@@ -124,7 +119,6 @@ fn extractJsonStr(allocator: std.mem.Allocator, content: []const u8, field: []co
 }
 
 fn extractDownloadUrl(allocator: std.mem.Allocator, body: []const u8) ![]u8 {
-    // Look for browser_download_url matching current platform
     const platform_suffix = comptime platformSuffix();
 
     var search_pos: usize = 0;
@@ -162,8 +156,6 @@ fn platformSuffix() []const u8 {
     };
 }
 
-/// Simple semver comparison: returns true if a > b.
-/// Only handles X.Y.Z format.
 fn versionGt(a: []const u8, b: []const u8) bool {
     var a_parts = std.mem.splitScalar(u8, a, '.');
     var b_parts = std.mem.splitScalar(u8, b, '.');

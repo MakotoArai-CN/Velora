@@ -3,6 +3,7 @@ const i18n = @import("i18n.zig");
 const output = @import("output.zig");
 const terminal = @import("terminal.zig");
 const sites = @import("sites.zig");
+const io_compat = @import("io_compat.zig");
 const main_mod = @import("main.zig");
 
 pub const SiteType = sites.SiteType;
@@ -77,21 +78,15 @@ pub const ParseError = error{
     OutOfMemory,
 };
 
-pub fn parseArgs(_: std.mem.Allocator) ParseError!Config {
-    // Use page_allocator for args to avoid debug leak reports.
-    // These tiny allocations live for the entire program lifetime anyway.
-    const alloc = std.heap.page_allocator;
-    var raw_args = std.process.argsWithAllocator(alloc) catch return error.OutOfMemory;
-    // Do not deinit: returned Config holds slices into the args buffer.
-    // page_allocator is not tracked by DebugAllocator so no leak reports.
+pub fn parseArgs(_: std.mem.Allocator, raw_argv: []const [:0]const u8) ParseError!Config {
+    // Caller (main) supplies argv from `init.minimal.args.toSlice(arena)`.
+    // Skip argv[0] (program name).
+    const args_slice: []const [:0]const u8 = if (raw_argv.len > 0) raw_argv[1..] else raw_argv;
 
-    _ = raw_args.skip(); // skip program name
-
-    // Collect all args into a buffer. Since we use page_allocator for the
-    // args iterator, the slices remain valid without explicit duping.
+    // Collect all args into a buffer.
     var args_buf: [32][]const u8 = undefined;
     var arg_count: usize = 0;
-    while (raw_args.next()) |arg| {
+    for (args_slice) |arg| {
         if (arg_count >= 32) break;
         args_buf[arg_count] = arg;
         arg_count += 1;
@@ -351,14 +346,17 @@ fn expandSettingKey(s: []const u8) []const u8 {
     if (eql(s, "ll")) return "list_latency";
     if (eql(s, "aa")) return "auto_archive";
     if (eql(s, "ap")) return "auto_pick_compatible_model";
+    if (eql(s, "alm") or eql(s, "am")) return "auto_load_models";
     if (eql(s, "ls") or eql(s, "sort")) return "list_sort";
+    if (eql(s, "msm") or eql(s, "select")) return "model_select_mode";
+    if (eql(s, "mt") or eql(s, "timeout")) return "model_call_timeout_ms";
     return s;
 }
 
 fn printHelp(lang: i18n.Language) void {
     var stdout_buffer: [8192]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
-    const w = &stdout_writer.interface;
+    var stdout_writer: std.Io.File.Writer = undefined;
+    const w = io_compat.stdoutWriter(&stdout_buffer, &stdout_writer);
     const caps = terminal.TermCaps.detect();
 
     const cyan = if (caps.color) output.Color.miku_cyan else "";
@@ -402,7 +400,10 @@ fn printHelp(lang: i18n.Language) void {
         \\  list_latency (ll)                  列表延迟检测 (默认: on)
         \\  auto_archive (aa)                  自动归档不可用站点 (默认: off)
         \\  auto_pick_compatible_model (ap)    类型不匹配时自动选择兼容模型 (默认: on)
+        \\  auto_load_models (alm)             添加/编辑时自动加载模型列表 (默认: on)
         \\  list_sort (ls)                     列表排序: time, alpha, tool, model (默认: time)
+        \\  model_select_mode (msm)            模型选择方式: number, keyboard (默认: number)
+        \\  model_call_timeout_ms (mt)         模型调用超时(毫秒) 范围 3000-600000 (默认: 30000)
         \\
         \\类型:
         \\  cx    Codex (OPENAI_API_KEY)
@@ -448,7 +449,10 @@ fn printHelp(lang: i18n.Language) void {
         \\  list_latency (ll)                     リスト遅延チェック (デフォルト: on)
         \\  auto_archive (aa)                     不可用サイト自動アーカイブ (デフォルト: off)
         \\  auto_pick_compatible_model (ap)       タイプ不一致時に互換モデルを自動選択 (デフォルト: on)
+        \\  auto_load_models (alm)                追加/編集時にモデル一覧を自動取得 (デフォルト: on)
         \\  list_sort (ls)                        リストソート: time, alpha, tool, model (デフォルト: time)
+        \\  model_select_mode (msm)               モデル選択: number, keyboard (デフォルト: number)
+        \\  model_call_timeout_ms (mt)            モデル呼び出しタイムアウト(ms) 3000-600000 (デフォルト: 30000)
         \\
         \\タイプ:
         \\  cx    Codex (OPENAI_API_KEY)
@@ -494,7 +498,10 @@ fn printHelp(lang: i18n.Language) void {
         \\  list_latency (ll)                  Latency check on list (default: on)
         \\  auto_archive (aa)                  Auto-archive unreachable sites (default: off)
         \\  auto_pick_compatible_model (ap)    Auto-pick compatible model on type mismatch (default: on)
+        \\  auto_load_models (alm)             Auto-load model list on add/edit (default: on)
         \\  list_sort (ls)                     List sort: time, alpha, tool, model (default: time)
+        \\  model_select_mode (msm)            Model picker mode: number, keyboard (default: number)
+        \\  model_call_timeout_ms (mt)         Model call timeout in ms, 3000-600000 (default: 30000)
         \\
         \\Types:
         \\  cx    Codex (OPENAI_API_KEY)
@@ -527,8 +534,8 @@ fn printHelp(lang: i18n.Language) void {
 
 fn printExamples(lang: i18n.Language) void {
     var stdout_buffer: [8192]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
-    const w = &stdout_writer.interface;
+    var stdout_writer: std.Io.File.Writer = undefined;
+    const w = io_compat.stdoutWriter(&stdout_buffer, &stdout_writer);
     const caps = terminal.TermCaps.detect();
 
     const cyan = if (caps.color) output.Color.miku_cyan else "";
@@ -577,6 +584,8 @@ fn printExamples(lang: i18n.Language) void {
         \\  velora s ll off                                # 关闭 list 时延迟检测
         \\  velora s aa on                                 # 开启自动归档
         \\  velora s ap off                                # 关闭类型不匹配时的自动兼容模型选择
+        \\  velora s alm off                               # 关闭添加/编辑时自动加载模型列表
+        \\  velora s msm keyboard                          # 使用方向键选择模型
         \\  velora s ls alpha                              # 默认列表排序按 alpha
         \\
         ,
@@ -615,6 +624,8 @@ fn printExamples(lang: i18n.Language) void {
         \\  velora s ll off                                # list 時の遅延チェックを無効
         \\  velora s aa on                                 # 自動アーカイブを有効
         \\  velora s ap off                                # 互換モデル自動選択を無効
+        \\  velora s alm off                               # 追加/編集時のモデル一覧自動取得を無効
+        \\  velora s msm keyboard                          # 矢印キーでモデル選択
         \\  velora s ls alpha                              # 既定ソートを alpha に
         \\
         ,
@@ -653,6 +664,8 @@ fn printExamples(lang: i18n.Language) void {
         \\  velora s ll off                                # disable latency check on list
         \\  velora s aa on                                 # enable auto-archive
         \\  velora s ap off                                # disable compatible-model auto-pick
+        \\  velora s alm off                               # disable model-list picker on add/edit
+        \\  velora s msm keyboard                          # choose models with arrow keys
         \\  velora s ls alpha                              # default list sort to alpha
         \\
         ,
@@ -665,8 +678,8 @@ fn printExamples(lang: i18n.Language) void {
 
 fn printVersion(lang: i18n.Language) void {
     var stdout_buffer: [256]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
-    const w = &stdout_writer.interface;
+    var stdout_writer: std.Io.File.Writer = undefined;
+    const w = io_compat.stdoutWriter(&stdout_buffer, &stdout_writer);
 
     switch (lang) {
         .zh => w.print("VELORAv{s} - 多站点 API Key 管理器\n", .{main_mod.version}) catch {},

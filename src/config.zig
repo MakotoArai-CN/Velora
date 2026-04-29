@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const app = @import("app.zig");
+const io_compat = @import("io_compat.zig");
 
 pub const display_sites_path = app.display_sites_path;
 pub const display_install_bin_path = app.display_install_bin_path;
@@ -11,7 +12,7 @@ pub fn getHomeDir(allocator: std.mem.Allocator) ?[]u8 {
         else => "HOME",
     };
 
-    return std.process.getEnvVarOwned(allocator, env_name) catch null;
+    return io_compat.getEnv(allocator, env_name);
 }
 
 pub fn getAppDir(allocator: std.mem.Allocator) ![]u8 {
@@ -24,10 +25,7 @@ pub fn ensureAppDir(allocator: std.mem.Allocator) ![]u8 {
     const app_dir = try getAppDir(allocator);
     errdefer allocator.free(app_dir);
 
-    std.fs.makeDirAbsolute(app_dir) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
-        else => return err,
-    };
+    try io_compat.makeDirIfMissing(app_dir);
     return app_dir;
 }
 
@@ -82,9 +80,6 @@ fn makeNestedDir(path: []const u8) !void {
         @memcpy(built[pos .. pos + comp.len], comp);
         pos += comp.len;
 
-        std.fs.makeDirAbsolute(built[0..pos]) catch |err| switch (err) {
-            error.PathAlreadyExists => {},
-            else => return err,
-        };
+        try io_compat.makeDirIfMissing(built[0..pos]);
     }
 }

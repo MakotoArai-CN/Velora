@@ -2,6 +2,7 @@ const std = @import("std");
 const config_mod = @import("config.zig");
 const app = @import("app.zig");
 const env_mod = @import("env.zig");
+const io_compat = @import("io_compat.zig");
 
 pub const SiteType = enum {
     cx, // Codex
@@ -95,6 +96,24 @@ pub const SortMode = enum {
     }
 };
 
+pub const ModelSelectMode = enum {
+    number,
+    keyboard,
+
+    pub fn toString(self: ModelSelectMode) []const u8 {
+        return switch (self) {
+            .number => "number",
+            .keyboard => "keyboard",
+        };
+    }
+
+    pub fn fromString(s: []const u8) ?ModelSelectMode {
+        if (std.mem.eql(u8, s, "number") or std.mem.eql(u8, s, "num")) return .number;
+        if (std.mem.eql(u8, s, "keyboard") or std.mem.eql(u8, s, "key") or std.mem.eql(u8, s, "arrow") or std.mem.eql(u8, s, "arrows")) return .keyboard;
+        return null;
+    }
+};
+
 pub const Site = struct {
     site_type: SiteType,
     base_url: []const u8,
@@ -182,8 +201,7 @@ pub fn setDefaultTool(site: *Site, tool_type: SiteType, enabled: bool) void {
 }
 
 pub fn defaultToolsSummary(site: Site, buf: []u8) []const u8 {
-    var fbs = std.io.fixedBufferStream(buf);
-    const w = fbs.writer();
+    var w: std.Io.Writer = .fixed(buf);
     var first = true;
     for ([_]SiteType{ .cx, .cc, .oc, .nb, .ow }) |tool| {
         if (!hasDefaultTool(site, tool)) continue;
@@ -192,7 +210,7 @@ pub fn defaultToolsSummary(site: Site, buf: []u8) []const u8 {
         first = false;
     }
     if (first) return site.site_type.toString();
-    return fbs.getWritten();
+    return w.buffered();
 }
 
 pub fn availableDefaultTools(site: Site, buf: *[5]SiteType) []const SiteType {
@@ -314,7 +332,10 @@ pub const Settings = struct {
     list_latency: bool = true, // enable latency check on 'list'
     auto_archive: bool = false, // enable auto-archive of unreachable sites
     auto_pick_compatible_model: bool = true, // auto-pick compatible model on target mismatch
+    auto_load_models: bool = true, // enable interactive model list loading on add/edit
     list_sort: SortMode = .time, // default sort mode for 'list'
+    model_select_mode: ModelSelectMode = .number, // interactive model picker mode
+    model_call_timeout_ms: u32 = 30000, // total budget for model call test on 'use'
 };
 
 pub const SitesStore = struct {
@@ -460,10 +481,7 @@ pub fn getSitesFilePath(allocator: std.mem.Allocator) ![]u8 {
     defer allocator.free(dir);
 
     // Ensure directory exists
-    std.fs.makeDirAbsolute(dir) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
-        else => return err,
-    };
+    try io_compat.makeDirIfMissing(dir);
 
     return try std.fs.path.join(allocator, &.{ dir, app.sites_filename });
 }
@@ -474,12 +492,10 @@ pub fn loadSettings(allocator: std.mem.Allocator) Settings {
     const path = getSitesFilePath(allocator) catch return settings;
     defer allocator.free(path);
 
-    const file = std.fs.openFileAbsolute(path, .{}) catch return settings;
-    defer file.close();
-
-    var buf: [65536]u8 = undefined;
-    const bytes_read = file.readAll(&buf) catch return settings;
-    const content = buf[0..bytes_read];
+    var content_list: std.ArrayListUnmanaged(u8) = .empty;
+    defer content_list.deinit(allocator);
+    if (!io_compat.readFileIntoList(allocator, path, &content_list)) return settings;
+    const content = content_list.items;
 
     const settings_key = "\"settings\"";
     const settings_pos = std.mem.indexOf(u8, content, settings_key) orelse return settings;
@@ -512,10 +528,29 @@ pub fn loadSettings(allocator: std.mem.Allocator) Settings {
         if (std.mem.eql(u8, v, "false")) settings.auto_pick_compatible_model = false;
     }
 
+    const alm = env_mod.extractJsonValue(allocator, body[0 .. inner.len + 1], "auto_load_models") catch null;
+    defer if (alm) |s| allocator.free(s);
+    if (alm) |v| {
+        if (std.mem.eql(u8, v, "false")) settings.auto_load_models = false;
+    }
+
     const ls = env_mod.extractJsonValue(allocator, body[0 .. inner.len + 1], "list_sort") catch null;
     defer if (ls) |s| allocator.free(s);
     if (ls) |v| {
         if (SortMode.fromString(v)) |mode| settings.list_sort = mode;
+    }
+
+    const msm = env_mod.extractJsonValue(allocator, body[0 .. inner.len + 1], "model_select_mode") catch null;
+    defer if (msm) |s| allocator.free(s);
+    if (msm) |v| {
+        if (ModelSelectMode.fromString(v)) |mode| settings.model_select_mode = mode;
+    }
+
+    const tm = env_mod.extractJsonValue(allocator, body[0 .. inner.len + 1], "model_call_timeout_ms") catch null;
+    defer if (tm) |s| allocator.free(s);
+    if (tm) |v| {
+        const parsed = std.fmt.parseInt(u32, v, 10) catch 0;
+        if (parsed >= 3000 and parsed <= 600000) settings.model_call_timeout_ms = parsed;
     }
 
     return settings;
@@ -529,14 +564,7 @@ pub fn saveSettings(allocator: std.mem.Allocator, settings: Settings) !void {
     var existing: std.ArrayListUnmanaged(u8) = .empty;
     defer existing.deinit(allocator);
 
-    const has_file = blk: {
-        const file = std.fs.openFileAbsolute(path, .{}) catch break :blk false;
-        defer file.close();
-        var buf: [65536]u8 = undefined;
-        const bytes_read = file.readAll(&buf) catch break :blk false;
-        existing.appendSlice(allocator, buf[0..bytes_read]) catch break :blk false;
-        break :blk true;
-    };
+    const has_file = io_compat.readFileIntoList(allocator, path, &existing);
 
     if (!has_file or existing.items.len == 0) {
         // Write new file with just settings
@@ -550,33 +578,45 @@ pub fn saveSettings(allocator: std.mem.Allocator, settings: Settings) !void {
         try out.appendSlice(allocator, if (settings.auto_archive) "true" else "false");
         try out.appendSlice(allocator, ",\n    \"auto_pick_compatible_model\": ");
         try out.appendSlice(allocator, if (settings.auto_pick_compatible_model) "true" else "false");
+        try out.appendSlice(allocator, ",\n    \"auto_load_models\": ");
+        try out.appendSlice(allocator, if (settings.auto_load_models) "true" else "false");
         try out.appendSlice(allocator, ",\n    \"list_sort\": \"");
         try out.appendSlice(allocator, settings.list_sort.toString());
-        try out.appendSlice(allocator, "\"\n  },\n  \"sites\": {}\n}\n");
-        const file = try std.fs.createFileAbsolute(path, .{});
-        defer file.close();
-        try file.writeAll(out.items);
+        try out.appendSlice(allocator, "\",\n    \"model_select_mode\": \"");
+        try out.appendSlice(allocator, settings.model_select_mode.toString());
+        try out.appendSlice(allocator, "\",\n    \"model_call_timeout_ms\": ");
+        var num_buf: [16]u8 = undefined;
+        const num_str = std.fmt.bufPrint(&num_buf, "{d}", .{settings.model_call_timeout_ms}) catch "30000";
+        try out.appendSlice(allocator, num_str);
+        try out.appendSlice(allocator, "\n  },\n  \"sites\": {}\n}\n");
+        try io_compat.writeFileAll(path, out.items);
         return;
     }
 
     const content = existing.items;
 
     // Build new settings block text
-    var settings_text_buf: [640]u8 = undefined;
+    var settings_text_buf: [1024]u8 = undefined;
     const settings_text = std.fmt.bufPrint(&settings_text_buf,
         \\  "settings": {{
         \\    "model_check": {s},
         \\    "list_latency": {s},
         \\    "auto_archive": {s},
         \\    "auto_pick_compatible_model": {s},
-        \\    "list_sort": "{s}"
+        \\    "auto_load_models": {s},
+        \\    "list_sort": "{s}",
+        \\    "model_select_mode": "{s}",
+        \\    "model_call_timeout_ms": {d}
         \\  }}
     , .{
         if (settings.model_check) "true" else "false",
         if (settings.list_latency) "true" else "false",
         if (settings.auto_archive) "true" else "false",
         if (settings.auto_pick_compatible_model) "true" else "false",
+        if (settings.auto_load_models) "true" else "false",
         settings.list_sort.toString(),
+        settings.model_select_mode.toString(),
+        settings.model_call_timeout_ms,
     }) catch return;
 
     // Try to find and replace existing settings block
@@ -602,9 +642,7 @@ pub fn saveSettings(allocator: std.mem.Allocator, settings: Settings) !void {
         try out.appendSlice(allocator, settings_text);
         try out.appendSlice(allocator, content[block_end..]);
 
-        const file = try std.fs.createFileAbsolute(path, .{});
-        defer file.close();
-        try file.writeAll(out.items);
+        try io_compat.writeFileAll(path, out.items);
     } else {
         // No settings block yet - insert after opening {
         const first_brace = std.mem.indexOfScalar(u8, content, '{') orelse return;
@@ -616,9 +654,7 @@ pub fn saveSettings(allocator: std.mem.Allocator, settings: Settings) !void {
         try out.appendSlice(allocator, ",\n");
         try out.appendSlice(allocator, content[first_brace + 1 ..]);
 
-        const file = try std.fs.createFileAbsolute(path, .{});
-        defer file.close();
-        try file.writeAll(out.items);
+        try io_compat.writeFileAll(path, out.items);
     }
 }
 
@@ -704,12 +740,10 @@ pub fn loadSites(allocator: std.mem.Allocator) !SitesStore {
     const path = getSitesFilePath(allocator) catch return store;
     defer allocator.free(path);
 
-    const file = std.fs.openFileAbsolute(path, .{}) catch return store;
-    defer file.close();
-
-    var buf: [65536]u8 = undefined;
-    const bytes_read = file.readAll(&buf) catch return store;
-    const content = buf[0..bytes_read];
+    var content_list: std.ArrayListUnmanaged(u8) = .empty;
+    defer content_list.deinit(allocator);
+    if (!io_compat.readFileIntoList(allocator, path, &content_list)) return store;
+    const content = content_list.items;
 
     if (content.len == 0) return store;
 
@@ -870,12 +904,10 @@ pub fn saveSites(allocator: std.mem.Allocator, store: *const SitesStore) !void {
     var settings_block: std.ArrayListUnmanaged(u8) = .empty;
     defer settings_block.deinit(allocator);
     {
-        const file = std.fs.openFileAbsolute(path, .{}) catch null;
-        if (file) |f| {
-            defer f.close();
-            var buf: [65536]u8 = undefined;
-            const bytes_read = f.readAll(&buf) catch 0;
-            const content = buf[0..bytes_read];
+        var content_list: std.ArrayListUnmanaged(u8) = .empty;
+        defer content_list.deinit(allocator);
+        if (io_compat.readFileIntoList(allocator, path, &content_list)) {
+            const content = content_list.items;
             const settings_key = "\"settings\"";
             if (std.mem.indexOf(u8, content, settings_key)) |sk_pos| {
                 // Find the line start
@@ -1002,9 +1034,7 @@ pub fn saveSites(allocator: std.mem.Allocator, store: *const SitesStore) !void {
     }
     try out.appendSlice(allocator, "}\n}\n");
 
-    const file = try std.fs.createFileAbsolute(path, .{});
-    defer file.close();
-    try file.writeAll(out.items);
+    try io_compat.writeFileAll(path, out.items);
 }
 
 fn findMatchingBrace(content: []const u8) ?[]const u8 {

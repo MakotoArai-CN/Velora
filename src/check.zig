@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const sites_mod = @import("sites.zig");
 const config_mod = @import("config.zig");
 const app = @import("app.zig");
+const io_compat = @import("io_compat.zig");
 
 pub const ConnectivityResult = struct {
     reachable: bool,
@@ -44,7 +45,7 @@ pub const SiteStatus = struct {
 /// Has a 10-second timeout to prevent hanging.
 pub fn checkConnectivity(allocator: std.mem.Allocator, base_url: []const u8) ConnectivityResult {
     const timeout_ms: i64 = 10000;
-    const start = std.time.milliTimestamp();
+    const start = io_compat.milliTimestamp();
 
     const Context = struct {
         allocator: std.mem.Allocator,
@@ -88,14 +89,14 @@ pub fn checkConnectivity(allocator: std.mem.Allocator, base_url: []const u8) Con
         return checkConnectivityInner(allocator, base_url);
     };
 
-    while (std.time.milliTimestamp() - start < timeout_ms) {
+    while (io_compat.milliTimestamp() - start < timeout_ms) {
         if (ctx.done.load(.acquire)) {
             thread.join();
             const result = ctx.result;
             Impl.release(ctx);
             return result;
         }
-        std.Thread.sleep(50 * std.time.ns_per_ms);
+        io_compat.sleepNs(50 * std.time.ns_per_ms);
     }
 
     thread.detach();
@@ -104,20 +105,20 @@ pub fn checkConnectivity(allocator: std.mem.Allocator, base_url: []const u8) Con
 }
 
 pub fn checkConnectivityInner(allocator: std.mem.Allocator, base_url: []const u8) ConnectivityResult {
-    const start = std.time.milliTimestamp();
+    const start = io_compat.milliTimestamp();
 
     // Build URL: base_url + /models (or /v1/models)
     var url_buf: [1024]u8 = undefined;
     const url = blk: {
         // If base_url already ends with /v1, just append /models
         if (std.mem.endsWith(u8, base_url, "/v1") or std.mem.endsWith(u8, base_url, "/v1/")) {
-            const trimmed = std.mem.trimRight(u8, base_url, "/");
+            const trimmed = std.mem.trimEnd(u8, base_url, "/");
             break :blk std.fmt.bufPrint(&url_buf, "{s}/models", .{trimmed}) catch return .{ .reachable = false, .latency_ms = null };
         }
-        break :blk std.fmt.bufPrint(&url_buf, "{s}/v1/models", .{std.mem.trimRight(u8, base_url, "/")}) catch return .{ .reachable = false, .latency_ms = null };
+        break :blk std.fmt.bufPrint(&url_buf, "{s}/v1/models", .{std.mem.trimEnd(u8, base_url, "/")}) catch return .{ .reachable = false, .latency_ms = null };
     };
 
-    var client: std.http.Client = .{ .allocator = allocator };
+    var client = io_compat.httpClient(allocator);
     defer client.deinit();
 
     var response_writer: std.Io.Writer.Allocating = .init(allocator);
@@ -133,7 +134,7 @@ pub fn checkConnectivityInner(allocator: std.mem.Allocator, base_url: []const u8
         .response_writer = &response_writer.writer,
     }) catch return .{ .reachable = false, .latency_ms = null };
 
-    const elapsed = @as(u64, @intCast(std.time.milliTimestamp() - start));
+    const elapsed = @as(u64, @intCast(io_compat.milliTimestamp() - start));
     const code = @intFromEnum(result.status);
 
     // 200, 401, 403 all mean the server is reachable
@@ -177,7 +178,7 @@ pub fn checkAllSites(allocator: std.mem.Allocator, store: *const sites_mod.Sites
 /// Detect models available at the endpoint. Has a 10-second timeout.
 pub fn detectModels(allocator: std.mem.Allocator, base_url: []const u8, api_key: []const u8, site_type: sites_mod.SiteType) ModelInfo {
     const timeout_ms: i64 = 10000;
-    const start = std.time.milliTimestamp();
+    const start = io_compat.milliTimestamp();
 
     const Context = struct {
         allocator: std.mem.Allocator,
@@ -230,14 +231,14 @@ pub fn detectModels(allocator: std.mem.Allocator, base_url: []const u8, api_key:
         return detectModelsInner(allocator, base_url, api_key, site_type);
     };
 
-    while (std.time.milliTimestamp() - start < timeout_ms) {
+    while (io_compat.milliTimestamp() - start < timeout_ms) {
         if (ctx.done.load(.acquire)) {
             thread.join();
             const result = ctx.result;
             Impl.release(ctx);
             return result;
         }
-        std.Thread.sleep(50 * std.time.ns_per_ms);
+        io_compat.sleepNs(50 * std.time.ns_per_ms);
     }
 
     thread.detach();
@@ -246,22 +247,35 @@ pub fn detectModels(allocator: std.mem.Allocator, base_url: []const u8, api_key:
 }
 
 fn detectModelsInner(allocator: std.mem.Allocator, base_url: []const u8, api_key: []const u8, site_type: sites_mod.SiteType) ModelInfo {
-    // Step 1: Check domain for official/reverse-engineered indicators
     const domain_type = classifyDomain(base_url);
 
     var url_buf: [1024]u8 = undefined;
     const url = blk: {
         if (std.mem.endsWith(u8, base_url, "/v1") or std.mem.endsWith(u8, base_url, "/v1/")) {
-            const trimmed = std.mem.trimRight(u8, base_url, "/");
+            const trimmed = std.mem.trimEnd(u8, base_url, "/");
             break :blk std.fmt.bufPrint(&url_buf, "{s}/models", .{trimmed}) catch return .{ .models_found = 0, .has_expected = false, .provider_type = .unknown };
         }
-        break :blk std.fmt.bufPrint(&url_buf, "{s}/v1/models", .{std.mem.trimRight(u8, base_url, "/")}) catch return .{ .models_found = 0, .has_expected = false, .provider_type = .unknown };
+        break :blk std.fmt.bufPrint(&url_buf, "{s}/v1/models", .{std.mem.trimEnd(u8, base_url, "/")}) catch return .{ .models_found = 0, .has_expected = false, .provider_type = .unknown };
     };
 
+    const info = fetchAndParseModels(allocator, url, api_key, site_type, domain_type);
+    if (info.models_found > 0) return info;
+
+    // For cc targets, retry without /v1 prefix (Anthropic-native proxies)
+    if (site_type == .cc and !std.mem.endsWith(u8, base_url, "/v1") and !std.mem.endsWith(u8, base_url, "/v1/")) {
+        var url_buf2: [1024]u8 = undefined;
+        const url2 = buildUrlDirect(&url_buf2, base_url, "/models") orelse return info;
+        const info2 = fetchAndParseModels(allocator, url2, api_key, site_type, domain_type);
+        if (info2.models_found > 0) return info2;
+    }
+    return info;
+}
+
+fn fetchAndParseModels(allocator: std.mem.Allocator, url: []const u8, api_key: []const u8, site_type: sites_mod.SiteType, domain_type: ProviderType) ModelInfo {
     var auth_buf: [256]u8 = undefined;
     const auth_header = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{api_key}) catch return .{ .models_found = 0, .has_expected = false, .provider_type = .unknown };
 
-    var client: std.http.Client = .{ .allocator = allocator };
+    var client = io_compat.httpClient(allocator);
     defer client.deinit();
 
     var response_writer: std.Io.Writer.Allocating = .init(allocator);
@@ -439,21 +453,33 @@ pub const ModelCallResult = struct {
 /// 2. Try calling the model with the appropriate API format (OpenAI or Anthropic)
 /// 3. Also try alternative endpoint if the primary one fails (reverse proxy support)
 /// Uses a background thread with polling to avoid hanging indefinitely.
-pub fn testModelCall(allocator: std.mem.Allocator, base_url: []const u8, api_key: []const u8, model: []const u8, site_type: sites_mod.SiteType) ModelCallResult {
-    const timeout_ms: i64 = 15000; // 15 second total timeout
-    const start = std.time.milliTimestamp();
+pub fn testModelCall(allocator: std.mem.Allocator, base_url: []const u8, api_key: []const u8, model: []const u8, site_type: sites_mod.SiteType, total_timeout_ms: u32) ModelCallResult {
+    const timeout_ms: i64 = @intCast(total_timeout_ms);
+    const start = io_compat.milliTimestamp();
+
+    // Per-attempt budget. Three attempts run serially inside the worker, so divide
+    // the total budget by 3 with a sensible floor so single requests aren't cut off
+    // before the model can respond.
+    const per_attempt_primary: i64 = blk: {
+        const calc = @divTrunc(timeout_ms, 3);
+        break :blk if (calc < 8000) 8000 else calc;
+    };
+    const per_attempt_fallback: i64 = blk: {
+        const calc = @divTrunc(timeout_ms, 4);
+        break :blk if (calc < 5000) 5000 else calc;
+    };
 
     // Run everything (model-list probe + call attempts) in a background thread so the
-    // 15s budget strictly bounds the total elapsed time. Previously the /v1/models
-    // probe ran on the caller thread with its own 10s timeout, which meant a dead
-    // endpoint could burn ~25s before returning.
-    // Heap-allocate context so detached threads never touch a dead stack frame.
+    // total budget strictly bounds the elapsed time. Heap-allocate context so detached
+    // threads never touch a dead stack frame.
     const Context = struct {
         allocator: std.mem.Allocator,
         base_url: []u8,
         api_key: []u8,
         model: []u8,
         site_type: sites_mod.SiteType,
+        primary_ms: i64,
+        fallback_ms: i64,
         result: ModelCallResult,
         done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
         refs: std.atomic.Value(u32) = std.atomic.Value(u32).init(2),
@@ -471,8 +497,8 @@ pub fn testModelCall(allocator: std.mem.Allocator, base_url: []const u8, api_key
 
         fn run(c: *Context) void {
             const check_model = normalizeModelForApiCheck(c.model);
-            const model_in_list = checkModelInList(c.allocator, c.base_url, c.api_key, check_model);
-            c.result = testModelCallAttempts(c.allocator, c.base_url, c.api_key, c.model, c.site_type, model_in_list);
+            const model_in_list = checkModelInList(c.allocator, c.base_url, c.api_key, check_model, c.site_type);
+            c.result = testModelCallAttempts(c.allocator, c.base_url, c.api_key, c.model, c.site_type, model_in_list, c.primary_ms, c.fallback_ms);
             c.done.store(true, .release);
             release(c);
         }
@@ -480,21 +506,21 @@ pub fn testModelCall(allocator: std.mem.Allocator, base_url: []const u8, api_key
 
     const owned_url = std.heap.page_allocator.dupe(u8, base_url) catch {
         const check_model = normalizeModelForApiCheck(model);
-        const model_in_list = checkModelInList(allocator, base_url, api_key, check_model);
-        return testModelCallAttempts(allocator, base_url, api_key, model, site_type, model_in_list);
+        const model_in_list = checkModelInList(allocator, base_url, api_key, check_model, site_type);
+        return testModelCallAttempts(allocator, base_url, api_key, model, site_type, model_in_list, per_attempt_primary, per_attempt_fallback);
     };
     const owned_key = std.heap.page_allocator.dupe(u8, api_key) catch {
         std.heap.page_allocator.free(owned_url);
         const check_model = normalizeModelForApiCheck(model);
-        const model_in_list = checkModelInList(allocator, base_url, api_key, check_model);
-        return testModelCallAttempts(allocator, base_url, api_key, model, site_type, model_in_list);
+        const model_in_list = checkModelInList(allocator, base_url, api_key, check_model, site_type);
+        return testModelCallAttempts(allocator, base_url, api_key, model, site_type, model_in_list, per_attempt_primary, per_attempt_fallback);
     };
     const owned_model = std.heap.page_allocator.dupe(u8, model) catch {
         std.heap.page_allocator.free(owned_url);
         std.heap.page_allocator.free(owned_key);
         const check_model = normalizeModelForApiCheck(model);
-        const model_in_list = checkModelInList(allocator, base_url, api_key, check_model);
-        return testModelCallAttempts(allocator, base_url, api_key, model, site_type, model_in_list);
+        const model_in_list = checkModelInList(allocator, base_url, api_key, check_model, site_type);
+        return testModelCallAttempts(allocator, base_url, api_key, model, site_type, model_in_list, per_attempt_primary, per_attempt_fallback);
     };
 
     const ctx = std.heap.page_allocator.create(Context) catch {
@@ -502,8 +528,8 @@ pub fn testModelCall(allocator: std.mem.Allocator, base_url: []const u8, api_key
         std.heap.page_allocator.free(owned_key);
         std.heap.page_allocator.free(owned_model);
         const check_model = normalizeModelForApiCheck(model);
-        const model_in_list = checkModelInList(allocator, base_url, api_key, check_model);
-        return testModelCallAttempts(allocator, base_url, api_key, model, site_type, model_in_list);
+        const model_in_list = checkModelInList(allocator, base_url, api_key, check_model, site_type);
+        return testModelCallAttempts(allocator, base_url, api_key, model, site_type, model_in_list, per_attempt_primary, per_attempt_fallback);
     };
     ctx.* = .{
         .allocator = std.heap.page_allocator,
@@ -511,31 +537,33 @@ pub fn testModelCall(allocator: std.mem.Allocator, base_url: []const u8, api_key
         .api_key = owned_key,
         .model = owned_model,
         .site_type = site_type,
+        .primary_ms = per_attempt_primary,
+        .fallback_ms = per_attempt_fallback,
         .result = .{ .success = false, .error_msg = "Request timeout" },
     };
 
     const thread = std.Thread.spawn(.{}, Impl.run, .{ctx}) catch {
         Impl.release(ctx);
         const check_model = normalizeModelForApiCheck(model);
-        const model_in_list = checkModelInList(allocator, base_url, api_key, check_model);
-        return testModelCallAttempts(allocator, base_url, api_key, model, site_type, model_in_list);
+        const model_in_list = checkModelInList(allocator, base_url, api_key, check_model, site_type);
+        return testModelCallAttempts(allocator, base_url, api_key, model, site_type, model_in_list, per_attempt_primary, per_attempt_fallback);
     };
 
     // Poll until done or timeout
-    while (std.time.milliTimestamp() - start < timeout_ms) {
+    while (io_compat.milliTimestamp() - start < timeout_ms) {
         if (ctx.done.load(.acquire)) {
             thread.join();
             const result = ctx.result;
             Impl.release(ctx);
             return result;
         }
-        std.Thread.sleep(50 * std.time.ns_per_ms);
+        io_compat.sleepNs(50 * std.time.ns_per_ms);
     }
 
     // Timeout reached - detach thread and return timeout result
     thread.detach();
     Impl.release(ctx);
-    const elapsed = @as(u64, @intCast(std.time.milliTimestamp() - start));
+    const elapsed = @as(u64, @intCast(io_compat.milliTimestamp() - start));
     return .{
         .success = false,
         .error_msg = "Request timeout",
@@ -545,40 +573,56 @@ pub fn testModelCall(allocator: std.mem.Allocator, base_url: []const u8, api_key
 }
 
 /// Inner implementation without timeout (runs in thread).
-fn testModelCallAttempts(allocator: std.mem.Allocator, base_url: []const u8, api_key: []const u8, model: []const u8, site_type: sites_mod.SiteType, model_in_list: bool) ModelCallResult {
-    const start = std.time.milliTimestamp();
+fn testModelCallAttempts(allocator: std.mem.Allocator, base_url: []const u8, api_key: []const u8, model: []const u8, site_type: sites_mod.SiteType, model_in_list: bool, primary_attempt_ms: i64, fallback_attempt_ms: i64) ModelCallResult {
+    const start = io_compat.milliTimestamp();
     const call_model = normalizeModelForApiCheck(model);
     const attempts = callAttemptOrder(site_type, call_model);
 
-    var first_error: ?[]const u8 = null;
+    // Track the most informative error so a quick "Request timeout" from the first
+    // attempt doesn't mask a later, more specific failure (e.g. 404 model not found).
+    var best_error: ?[]const u8 = null;
     for (attempts) |attempt_fn| {
-        const r = runAttemptWithTimeout(attempt_fn, allocator, base_url, api_key, call_model, 4500);
+        const r = runAttemptWithTimeout(attempt_fn, allocator, base_url, api_key, call_model, primary_attempt_ms);
         if (r.success) {
-            const elapsed = @as(u64, @intCast(std.time.milliTimestamp() - start));
+            const elapsed = @as(u64, @intCast(io_compat.milliTimestamp() - start));
             return .{ .success = true, .latency_ms = elapsed, .model_in_list = model_in_list };
         }
-        if (first_error == null) first_error = r.error_msg;
+        best_error = preferError(best_error, r.error_msg);
     }
 
     if (!std.mem.eql(u8, call_model, model)) {
         const original_attempts = callAttemptOrder(site_type, model);
         for (original_attempts) |attempt_fn| {
-            const r = runAttemptWithTimeout(attempt_fn, allocator, base_url, api_key, model, 3000);
+            const r = runAttemptWithTimeout(attempt_fn, allocator, base_url, api_key, model, fallback_attempt_ms);
             if (r.success) {
-                const elapsed = @as(u64, @intCast(std.time.milliTimestamp() - start));
+                const elapsed = @as(u64, @intCast(io_compat.milliTimestamp() - start));
                 return .{ .success = true, .latency_ms = elapsed, .model_in_list = model_in_list };
             }
-            if (first_error == null) first_error = r.error_msg;
+            best_error = preferError(best_error, r.error_msg);
         }
     }
 
-    const elapsed = @as(u64, @intCast(std.time.milliTimestamp() - start));
+    const elapsed = @as(u64, @intCast(io_compat.milliTimestamp() - start));
     return .{
         .success = false,
-        .error_msg = first_error,
+        .error_msg = best_error,
         .latency_ms = elapsed,
         .model_in_list = model_in_list,
     };
+}
+
+/// Pick the more informative of two error messages. Anything beats "Request timeout"
+/// since real HTTP errors tell the user the model truly is missing/invalid, while a
+/// timeout could just be a slow first attempt.
+fn preferError(current: ?[]const u8, candidate: ?[]const u8) ?[]const u8 {
+    if (candidate == null) return current;
+    if (current == null) return candidate;
+    const cur = current.?;
+    const cand = candidate.?;
+    const cur_is_timeout = std.mem.eql(u8, cur, "Request timeout");
+    const cand_is_timeout = std.mem.eql(u8, cand, "Request timeout");
+    if (cur_is_timeout and !cand_is_timeout) return candidate;
+    return current;
 }
 
 const AttemptFn = *const fn (std.mem.Allocator, []const u8, []const u8, []const u8) CallAttemptResult;
@@ -600,7 +644,7 @@ fn callAttemptOrder(site_type: sites_mod.SiteType, model: []const u8) [3]Attempt
 
 fn runAttemptWithTimeout(attempt_fn: AttemptFn, allocator: std.mem.Allocator, base_url: []const u8, api_key: []const u8, model: []const u8, timeout_ms: i64) CallAttemptResult {
     _ = allocator;
-    const start = std.time.milliTimestamp();
+    const start = io_compat.milliTimestamp();
 
     const Context = struct {
         attempt_fn: AttemptFn,
@@ -643,14 +687,14 @@ fn runAttemptWithTimeout(attempt_fn: AttemptFn, allocator: std.mem.Allocator, ba
         return attempt_fn(std.heap.page_allocator, base_url, api_key, model);
     };
 
-    while (std.time.milliTimestamp() - start < timeout_ms) {
+    while (io_compat.milliTimestamp() - start < timeout_ms) {
         if (ctx.done.load(.acquire)) {
             thread.join();
             const result = ctx.result;
             Impl.release(ctx);
             return result;
         }
-        std.Thread.sleep(50 * std.time.ns_per_ms);
+        io_compat.sleepNs(50 * std.time.ns_per_ms);
     }
 
     thread.detach();
@@ -667,16 +711,28 @@ fn normalizeModelForApiCheck(model: []const u8) []const u8 {
     return model;
 }
 
-/// Check if a specific model exists in the /v1/models endpoint.
-fn checkModelInList(allocator: std.mem.Allocator, base_url: []const u8, api_key: []const u8, model: []const u8) bool {
+/// Check if a specific model exists in the models endpoint.
+/// For cc targets, tries both /v1/models and /models (Anthropic proxies may not use /v1).
+fn checkModelInList(allocator: std.mem.Allocator, base_url: []const u8, api_key: []const u8, model: []const u8, site_type: sites_mod.SiteType) bool {
     const check_model = normalizeModelForApiCheck(model);
     var url_buf: [1024]u8 = undefined;
     const url = buildUrl(&url_buf, base_url, "/models") orelse return false;
 
+    if (checkModelInListAt(allocator, url, api_key, check_model)) return true;
+
+    if (site_type == .cc and !std.mem.endsWith(u8, base_url, "/v1") and !std.mem.endsWith(u8, base_url, "/v1/")) {
+        var url_buf2: [1024]u8 = undefined;
+        const url2 = buildUrlDirect(&url_buf2, base_url, "/models") orelse return false;
+        return checkModelInListAt(allocator, url2, api_key, check_model);
+    }
+    return false;
+}
+
+fn checkModelInListAt(allocator: std.mem.Allocator, url: []const u8, api_key: []const u8, check_model: []const u8) bool {
     var auth_buf: [256]u8 = undefined;
     const auth_header = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{api_key}) catch return false;
 
-    var client: std.http.Client = .{ .allocator = allocator };
+    var client = io_compat.httpClient(allocator);
     defer client.deinit();
 
     var response_writer: std.Io.Writer.Allocating = .init(allocator);
@@ -802,7 +858,7 @@ fn tryAnthropicCall(allocator: std.mem.Allocator, base_url: []const u8, api_key:
     // e.g. base_url = "https://proxy.example.com" -> try /messages directly
     if (!std.mem.endsWith(u8, base_url, "/v1") and !std.mem.endsWith(u8, base_url, "/v1/")) {
         var url_buf2: [1024]u8 = undefined;
-        const trimmed = std.mem.trimRight(u8, base_url, "/");
+        const trimmed = std.mem.trimEnd(u8, base_url, "/");
         const url2 = std.fmt.bufPrint(&url_buf2, "{s}/messages", .{trimmed}) catch return result;
         const result2 = doAnthropicPost(allocator, url2, api_key, model);
         if (result2.success) return result2;
@@ -833,7 +889,7 @@ fn doAnthropicPost(allocator: std.mem.Allocator, url: []const u8, api_key: []con
 }
 
 fn doPost(allocator: std.mem.Allocator, url: []const u8, extra_headers: []const std.http.Header, body: []const u8) CallAttemptResult {
-    var client: std.http.Client = .{ .allocator = allocator };
+    var client = io_compat.httpClient(allocator);
     defer client.deinit();
 
     var response_writer: std.Io.Writer.Allocating = .init(allocator);
@@ -930,10 +986,15 @@ fn extractErrorMessage(body: []const u8) ?[]const u8 {
 /// Build a URL by appending a path to base_url, handling /v1 suffix.
 fn buildUrl(buf: []u8, base_url: []const u8, path: []const u8) ?[]const u8 {
     if (std.mem.endsWith(u8, base_url, "/v1") or std.mem.endsWith(u8, base_url, "/v1/")) {
-        const trimmed = std.mem.trimRight(u8, base_url, "/");
+        const trimmed = std.mem.trimEnd(u8, base_url, "/");
         return std.fmt.bufPrint(buf, "{s}{s}", .{ trimmed, path }) catch null;
     }
-    return std.fmt.bufPrint(buf, "{s}/v1{s}", .{ std.mem.trimRight(u8, base_url, "/"), path }) catch null;
+    return std.fmt.bufPrint(buf, "{s}/v1{s}", .{ std.mem.trimEnd(u8, base_url, "/"), path }) catch null;
+}
+
+/// Build a URL by appending path directly to base_url, without inserting /v1.
+fn buildUrlDirect(buf: []u8, base_url: []const u8, path: []const u8) ?[]const u8 {
+    return std.fmt.bufPrint(buf, "{s}{s}", .{ std.mem.trimEnd(u8, base_url, "/"), path }) catch null;
 }
 
 /// Result of a model benchmark call: success/error plus throughput numbers.
@@ -958,7 +1019,7 @@ const BENCH_MAX_TOKENS: u32 = 256;
 /// Has its own thread+timeout so a hung endpoint cannot stall the caller.
 pub fn benchmarkModel(allocator: std.mem.Allocator, base_url: []const u8, api_key: []const u8, model: []const u8, site_type: sites_mod.SiteType) BenchResult {
     const timeout_ms: i64 = 60000; // benchmarks request a real generation, allow up to 60s
-    const start = std.time.milliTimestamp();
+    const start = io_compat.milliTimestamp();
 
     const Context = struct {
         allocator: std.mem.Allocator,
@@ -1020,24 +1081,24 @@ pub fn benchmarkModel(allocator: std.mem.Allocator, base_url: []const u8, api_ke
         return benchmarkModelInner(allocator, base_url, api_key, model, site_type);
     };
 
-    while (std.time.milliTimestamp() - start < timeout_ms) {
+    while (io_compat.milliTimestamp() - start < timeout_ms) {
         if (ctx.done.load(.acquire)) {
             thread.join();
             const result = ctx.result;
             Impl.release(ctx);
             return result;
         }
-        std.Thread.sleep(80 * std.time.ns_per_ms);
+        io_compat.sleepNs(80 * std.time.ns_per_ms);
     }
 
     thread.detach();
     Impl.release(ctx);
-    const elapsed = @as(u64, @intCast(std.time.milliTimestamp() - start));
+    const elapsed = @as(u64, @intCast(io_compat.milliTimestamp() - start));
     return .{ .success = false, .error_msg = "Request timeout", .total_ms = elapsed };
 }
 
 fn benchmarkModelInner(allocator: std.mem.Allocator, base_url: []const u8, api_key: []const u8, model: []const u8, site_type: sites_mod.SiteType) BenchResult {
-    const start = std.time.milliTimestamp();
+    const start = io_compat.milliTimestamp();
     const call_model = normalizeModelForApiCheck(model);
 
     const Attempt = enum { responses, openai_chat, anthropic };
@@ -1062,7 +1123,7 @@ fn benchmarkModelInner(allocator: std.mem.Allocator, base_url: []const u8, api_k
             .anthropic => benchAnthropicCall(allocator, base_url, api_key, call_model),
         };
         if (r.success) {
-            const elapsed = @as(u64, @intCast(std.time.milliTimestamp() - start));
+            const elapsed = @as(u64, @intCast(io_compat.milliTimestamp() - start));
             const tps: f64 = if (r.output_tokens > 0 and elapsed > 0)
                 @as(f64, @floatFromInt(r.output_tokens)) * 1000.0 / @as(f64, @floatFromInt(elapsed))
             else
@@ -1077,7 +1138,7 @@ fn benchmarkModelInner(allocator: std.mem.Allocator, base_url: []const u8, api_k
         if (first_error == null) first_error = r.error_msg;
     }
 
-    const elapsed = @as(u64, @intCast(std.time.milliTimestamp() - start));
+    const elapsed = @as(u64, @intCast(io_compat.milliTimestamp() - start));
     return .{ .success = false, .error_msg = first_error, .total_ms = elapsed };
 }
 
@@ -1149,11 +1210,19 @@ fn benchAnthropicCall(allocator: std.mem.Allocator, base_url: []const u8, api_ke
         .{ .name = "connection", .value = "close" },
     };
 
-    return doBenchPost(allocator, url, &extra_headers, body);
+    const result = doBenchPost(allocator, url, &extra_headers, body);
+    if (result.success) return result;
+
+    if (!std.mem.endsWith(u8, base_url, "/v1") and !std.mem.endsWith(u8, base_url, "/v1/")) {
+        var url_buf2: [1024]u8 = undefined;
+        const url2 = buildUrlDirect(&url_buf2, base_url, "/messages") orelse return result;
+        return doBenchPost(allocator, url2, &extra_headers, body);
+    }
+    return result;
 }
 
 fn doBenchPost(allocator: std.mem.Allocator, url: []const u8, extra_headers: []const std.http.Header, body: []const u8) BenchAttempt {
-    var client: std.http.Client = .{ .allocator = allocator };
+    var client = io_compat.httpClient(allocator);
     defer client.deinit();
 
     var response_writer: std.Io.Writer.Allocating = .init(allocator);
@@ -1196,7 +1265,7 @@ fn parseUsageOutputTokens(body: []const u8) u32 {
         const pos = std.mem.indexOf(u8, body, key) orelse continue;
         const after = body[pos + key.len ..];
         const colon = std.mem.indexOfScalar(u8, after, ':') orelse continue;
-        const after_colon = std.mem.trimLeft(u8, after[colon + 1 ..], " \t\r\n");
+        const after_colon = std.mem.trimStart(u8, after[colon + 1 ..], " \t\r\n");
         var end: usize = 0;
         while (end < after_colon.len and std.ascii.isDigit(after_colon[end])) : (end += 1) {}
         if (end == 0) continue;
@@ -1205,16 +1274,28 @@ fn parseUsageOutputTokens(body: []const u8) u32 {
     return 0;
 }
 
-/// Fetch all model IDs from /v1/models. Returns allocated slice of allocated strings.
+/// Fetch all model IDs from the models endpoint. Returns allocated slice of allocated strings.
 /// Caller must free each string and the slice itself.
+/// Tries /v1/models first; if that fails, retries without /v1 prefix.
 pub fn fetchModelList(allocator: std.mem.Allocator, base_url: []const u8, api_key: []const u8) ![][]const u8 {
     var url_buf: [1024]u8 = undefined;
     const url = buildUrl(&url_buf, base_url, "/models") orelse return error.InvalidUrl;
 
+    if (fetchModelListAt(allocator, url, api_key)) |models| return models else |_| {}
+
+    if (!std.mem.endsWith(u8, base_url, "/v1") and !std.mem.endsWith(u8, base_url, "/v1/")) {
+        var url_buf2: [1024]u8 = undefined;
+        const url2 = buildUrlDirect(&url_buf2, base_url, "/models") orelse return error.InvalidUrl;
+        return fetchModelListAt(allocator, url2, api_key);
+    }
+    return error.HttpError;
+}
+
+fn fetchModelListAt(allocator: std.mem.Allocator, url: []const u8, api_key: []const u8) ![][]const u8 {
     var auth_buf: [256]u8 = undefined;
     const auth_header = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{api_key}) catch return error.InvalidUrl;
 
-    var client: std.http.Client = .{ .allocator = allocator };
+    var client = io_compat.httpClient(allocator);
     defer client.deinit();
 
     var response_writer: std.Io.Writer.Allocating = .init(allocator);
@@ -1239,7 +1320,6 @@ pub fn fetchModelList(allocator: std.mem.Allocator, base_url: []const u8, api_ke
 
     const body = response_writer.written();
 
-    // Collect all model IDs
     var list: std.ArrayListUnmanaged([]const u8) = .empty;
     errdefer {
         for (list.items) |item| allocator.free(item);
@@ -1265,7 +1345,6 @@ pub fn fetchModelList(allocator: std.mem.Allocator, base_url: []const u8, api_ke
 
     return list.toOwnedSlice(allocator);
 }
-
 
 pub const ModelFamily = enum {
     openai,
@@ -1294,7 +1373,7 @@ pub const AddProbeResult = struct {
 };
 
 pub fn normalizeBaseUrlForProbe(allocator: std.mem.Allocator, base_url: []const u8) ![]u8 {
-    const trimmed = std.mem.trimRight(u8, base_url, "/");
+    const trimmed = std.mem.trimEnd(u8, base_url, "/");
     if (trimmed.len == 0) return allocator.dupe(u8, base_url);
     if (std.mem.endsWith(u8, trimmed, "/v1") or
         std.mem.endsWith(u8, trimmed, "/v1/messages") or
@@ -1385,7 +1464,7 @@ pub fn probeSupportsTool(result: AddProbeResult, tool_type: sites_mod.SiteType) 
 
 pub fn testRecommendedModelCall(allocator: std.mem.Allocator, result: AddProbeResult, api_key: []const u8, tool_type: sites_mod.SiteType) bool {
     const model = recommendedModelForProbe(result, tool_type) orelse return false;
-    const call = testModelCall(allocator, result.normalized_base_url, api_key, model, tool_type);
+    const call = testModelCall(allocator, result.normalized_base_url, api_key, model, tool_type, 30000);
     return call.success;
 }
 
@@ -1420,7 +1499,7 @@ pub fn recommendedPrimaryType(result: AddProbeResult) sites_mod.SiteType {
 }
 
 pub fn normalizeBaseUrlDisplayChanged(original: []const u8, normalized: []const u8) bool {
-    return !std.mem.eql(u8, std.mem.trimRight(u8, original, "/"), normalized);
+    return !std.mem.eql(u8, std.mem.trimEnd(u8, original, "/"), normalized);
 }
 
 pub fn defaultProbeModel(tool_type: sites_mod.SiteType) []const u8 {
@@ -1526,9 +1605,9 @@ pub fn pickBestCompatibleModel(models: []const []const u8, target_type: sites_mo
 
 fn supportsModelFamily(target_type: sites_mod.SiteType, family: ModelFamily) bool {
     return switch (target_type) {
-        .cx, .nb, .ow => family == .openai,
+        .cx, .ow => family == .openai,
         .cc => family == .claude,
-        .oc => family == .openai or family == .claude,
+        .oc, .nb => family == .openai or family == .claude,
     };
 }
 
@@ -1606,10 +1685,10 @@ test "pick best compatible model" {
 pub fn isToolInstalled(tool_type: sites_mod.SiteType) bool {
     const names: []const []const u8 = switch (tool_type) {
         .cx => &.{ "codex", "cx" },
-        .cc => &.{ "claude" },
-        .oc => &.{ "opencode" },
-        .nb => &.{ "nanobot" },
-        .ow => &.{ "openclaw" },
+        .cc => &.{"claude"},
+        .oc => &.{"opencode"},
+        .nb => &.{"nanobot"},
+        .ow => &.{"openclaw"},
     };
     for (names) |name| {
         if (findExecutableInPath(name)) return true;
@@ -1619,7 +1698,7 @@ pub fn isToolInstalled(tool_type: sites_mod.SiteType) bool {
 
 fn findExecutableInPath(exe_name: []const u8) bool {
     const path_sep: u8 = if (builtin.os.tag == .windows) ';' else ':';
-    const path_env = std.process.getEnvVarOwned(std.heap.page_allocator, "PATH") catch return false;
+    const path_env = io_compat.getEnv(std.heap.page_allocator, "PATH") orelse return false;
     defer std.heap.page_allocator.free(path_env);
 
     var iter = std.mem.splitScalar(u8, path_env, path_sep);
@@ -1632,13 +1711,11 @@ fn findExecutableInPath(exe_name: []const u8) bool {
             const suffixes = [_][]const u8{ ".exe", ".cmd", "" };
             for (suffixes) |suffix| {
                 const full = std.fmt.bufPrint(&full_buf, "{s}\\{s}{s}", .{ dir, exe_name, suffix }) catch continue;
-                std.fs.accessAbsolute(full, .{}) catch continue;
-                return true;
+                if (io_compat.pathExists(full)) return true;
             }
         } else {
             const full = std.fmt.bufPrint(&full_buf, "{s}/{s}", .{ dir, exe_name }) catch continue;
-            std.fs.accessAbsolute(full, .{}) catch continue;
-            return true;
+            if (io_compat.pathExists(full)) return true;
         }
     }
     return false;
@@ -1657,6 +1734,5 @@ fn hasToolConfigFile(tool_type: sites_mod.SiteType) bool {
     };
     defer std.heap.page_allocator.free(path);
 
-    std.fs.accessAbsolute(path, .{}) catch return false;
-    return true;
+    return io_compat.pathExists(path);
 }

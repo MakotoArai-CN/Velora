@@ -4,26 +4,16 @@ const config_mod = @import("config.zig");
 const app = @import("app.zig");
 const env_mod = @import("env.zig");
 const sites_mod = @import("sites.zig");
+const io_compat = @import("io_compat.zig");
 
 /// Read entire file into an ArrayListUnmanaged via chunked reads.
 /// Returns false if the file could not be opened or read.
 fn readFileIntoList(allocator: std.mem.Allocator, path: []const u8, list: *std.ArrayListUnmanaged(u8)) bool {
-    const file = std.fs.openFileAbsolute(path, .{}) catch return false;
-    defer file.close();
-    const stat = file.stat() catch return false;
-    const file_size: usize = @intCast(@min(stat.size, 16 * 1024 * 1024));
-    list.ensureTotalCapacity(allocator, file_size + 1) catch return false;
-    var buf: [65536]u8 = undefined;
-    while (true) {
-        const n = file.read(&buf) catch return false;
-        if (n == 0) break;
-        list.appendSlice(allocator, buf[0..n]) catch return false;
-    }
-    return true;
+    return io_compat.readFileIntoList(allocator, path, list);
 }
 
 fn normalizeBaseUrl(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
-    const trimmed = std.mem.trimRight(u8, raw, "/ \t\r\n");
+    const trimmed = std.mem.trimEnd(u8, raw, "/ \t\r\n");
     return try allocator.dupe(u8, trimmed);
 }
 
@@ -36,7 +26,7 @@ fn dupeTrimmed(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
 /// (default `OPENAI_API_KEY`) rather than in the TOML file. Returns the
 /// currently-set value of that env var, or null if not set.
 fn readCodexApiKeyFromEnv(allocator: std.mem.Allocator, env_key_name: []const u8) ?[]u8 {
-    const val = std.process.getEnvVarOwned(allocator, env_key_name) catch return null;
+    const val = io_compat.getEnv(allocator, env_key_name) orelse return null;
     if (val.len == 0) {
         allocator.free(val);
         return null;
@@ -171,7 +161,7 @@ fn readClaudeConfig(allocator: std.mem.Allocator) ClaudeConfigFields {
 
 fn fillClaudeFromEnv(allocator: std.mem.Allocator, result: *ClaudeConfigFields) void {
     if (result.base_url == null) {
-        if (std.process.getEnvVarOwned(allocator, "ANTHROPIC_BASE_URL") catch null) |val| {
+        if (io_compat.getEnv(allocator, "ANTHROPIC_BASE_URL")) |val| {
             if (val.len > 0) {
                 result.base_url = normalizeBaseUrl(allocator, val) catch null;
             }
@@ -179,7 +169,7 @@ fn fillClaudeFromEnv(allocator: std.mem.Allocator, result: *ClaudeConfigFields) 
         }
     }
     if (result.api_key == null) {
-        if (std.process.getEnvVarOwned(allocator, "ANTHROPIC_AUTH_TOKEN") catch null) |val| {
+        if (io_compat.getEnv(allocator, "ANTHROPIC_AUTH_TOKEN")) |val| {
             if (val.len > 0) {
                 result.api_key = dupeTrimmed(allocator, val) catch null;
             }
@@ -428,7 +418,7 @@ pub const CurrentTools = struct {
     /// we cannot read the tool's key (Codex stores it only in env vars).
     pub fn matchSite(self: CurrentTools, base_url: []const u8, api_key: []const u8) u8 {
         var mask: u8 = 0;
-        const norm_url = std.mem.trimRight(u8, base_url, "/ \t\r\n");
+        const norm_url = std.mem.trimEnd(u8, base_url, "/ \t\r\n");
         const norm_key = std.mem.trim(u8, api_key, " \t\r\n");
         inline for ([_]struct { t: sites_mod.SiteType, s: ToolState }{
             .{ .t = .cx, .s = self.cx },

@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const io_compat = @import("io_compat.zig");
 
 pub const Language = enum {
     en,
@@ -17,7 +18,7 @@ pub fn detect() Language {
 fn detectPosix() Language {
     const env_vars = [_][]const u8{ "LC_ALL", "LC_MESSAGES", "LANG" };
     for (env_vars) |name| {
-        const val = std.process.getEnvVarOwned(std.heap.page_allocator, name) catch continue;
+        const val = io_compat.getEnv(std.heap.page_allocator, name) orelse continue;
         defer std.heap.page_allocator.free(val);
 
         if (fromLocale(val)) |lang| return lang;

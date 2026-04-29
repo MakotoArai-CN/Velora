@@ -105,9 +105,6 @@ pub fn build(b: *std.Build) void {
         .name = app_name,
         .root_module = native_module,
     });
-    if (previous_compile_step) |prev| {
-        native_exe.step.dependOn(prev);
-    }
 
     const native_install = b.addInstallArtifact(native_exe, .{});
     if (previous_install_step) |prev| {
@@ -116,7 +113,6 @@ pub fn build(b: *std.Build) void {
     b.getInstallStep().dependOn(&native_install.step);
 
     const run_cmd = b.addRunArtifact(native_exe);
-    run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| {
         run_cmd.addArgs(args);
     }
@@ -134,7 +130,6 @@ pub fn build(b: *std.Build) void {
         .name = "velora-test",
         .root_module = test_module,
     });
-    exe_unit_tests.step.dependOn(&native_exe.step);
 
     const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
     const test_step = b.step("test", "Run unit tests");

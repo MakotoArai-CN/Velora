@@ -23,14 +23,14 @@
 ## 构建
 
 ```bash
-# 构建 Debug 版
-zig build -Doptimize=Debug
+# 构建 Debug 版（默认）
+zig build
 # 构建最小版本
-zig build -Doptimize=ReleaseSmall
+zig build --release=small
 # 构建安全版本
-zig build -Doptimize=ReleaseSafe
+zig build --release=safe
 # 构建性能版本
-zig build -Doptimize=ReleaseFast
+zig build --release=fast
 
 # 测试
 zig build test
@@ -114,6 +114,9 @@ velora set model_check off                  # 或 velora s mc off
 velora set list_latency off                 # 或 velora s ll off
 velora set auto_archive on                  # 或 velora s aa on
 velora set auto_pick_compatible_model off   # 或 velora s ap off
+velora set auto_load_models off             # 或 velora s alm off
+velora set model_select_mode keyboard       # 或 velora s msm keyboard
+velora set model_call_timeout_ms 60000      # 或 velora s mt 60000
 
 # 帮助 / 用法示例
 velora --help                               # 命令、选项、设置概览
@@ -145,7 +148,10 @@ velora --update
 | `list_latency` | `ll` | list 时是否检测延迟（默认 on） |
 | `auto_archive` | `aa` | 是否自动归档不可用站点（默认 off） |
 | `auto_pick_compatible_model` | `ap` | 类型不匹配时是否自动选择兼容模型（默认 on） |
+| `auto_load_models` | `alm` | 添加 / 编辑时是否自动加载模型列表（默认 on） |
 | `list_sort` | `ls` | 默认列表排序: time / alpha / tool / model |
+| `model_select_mode` | `msm` | 交互式模型选择方式: number / keyboard |
+| `model_call_timeout_ms` | `mt` | 模型调用测试总超时，单位毫秒，范围 3000-600000 |
 
 ## 用法示例
 
@@ -164,6 +170,9 @@ velora t openai                              # 测试单个站点（带 spinner 
 velora t --perf                              # 交互式选择站点 + 性能基准
 velora s mc off                              # 关闭模型检测，use 更快
 velora s ap off                              # 关闭类型不匹配时的自动兼容模型选择
+velora s alm off                             # 关闭添加/编辑时自动加载模型列表
+velora s msm keyboard                        # 使用方向键选择模型
+velora s mt 60000                            # 将模型调用测试超时设为 60 秒
 velora help examples                         # 完整示例（在默认 help 中已折叠）
 ```
 
@@ -203,6 +212,23 @@ velora t --perf       # 性能基准模式：交互选择站点 → 并行 bench
 1. 先做一次真实模型调用测试。
 2. 再尝试列出 `/v1/models`。
 3. 如果列模型失败但调用成功，输出友好提示"模型列表受限，但模型调用已验证"。
+
+## 编辑后自动重新应用
+
+`velora edit <别名>` 修改站点配置（URL / Key / 模型 / 类型）后，会自动检测当前哪些工具正在使用该站点（基于编辑前的 `base_url` / `api_key` 与各工具配置文件 / 环境变量的匹配），并将更新后的配置实时写回这些工具的配置文件。**无需在 edit 之后再手动执行 `use`。**
+
+例如：当前 `cx` 正在使用 `yuchen` 站点，执行 `velora edit yuchen` 修改 URL 或 Key 之后，`~/.codex/config.toml` 与 `OPENAI_API_KEY` 环境变量会被同步刷新。如果同一个站点同时被多个工具使用（例如 `cx` 与 `cc` 同时指向 `yuchen`），所有匹配工具都会被一并更新。
+
+匹配逻辑与 `velora list` 中的 `[← cc, oc]` 标签完全一致——通过 `base_url` 或 `api_key` 任一命中即视为匹配（兼容用户手动改 URL 后仍能识别的情况）。
+
+## 单站点应用到多个工具
+
+同一个站点可以同时配置为多个工具的默认目标（站点结构中的 `default_tools_mask` 是位掩码，覆盖 `cx` / `cc` / `oc` / `nb` / `ow`）。
+
+- 当一个站点的 `default_tools_mask` 包含多个工具时，运行 `velora use <别名>`（不指定具体工具）会依次将该站点应用到所有勾选的工具
+- 显式 `velora cx <别名>` / `velora cc <别名>` 等命令仍可单独应用到指定工具
+- 每个工具可单独保存模型覆盖（`models_cx` / `models_cc` / `models_oc` / `models_nb` / `models_ow`），auto-reapply 时会按工具读取各自的模型
+- `velora list` 中 `[← cx, cc]` 这类标签会同时列出所有正在使用该站点的工具
 
 ## 模型配置
 

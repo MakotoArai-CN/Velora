@@ -1,9 +1,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const config_mod = @import("config.zig");
+const io_compat = @import("io_compat.zig");
 
 /// Write an environment variable to persistent storage (Windows registry / POSIX shell rc files).
-/// This is the main public API for the new multi-site manager.
 pub fn writeEnvVar(allocator: std.mem.Allocator, env_name: []const u8, value: []const u8) !void {
     switch (builtin.os.tag) {
         .windows => try writeEnvVarWindows(allocator, env_name, value),
@@ -30,7 +30,7 @@ pub fn clearEnvVar(allocator: std.mem.Allocator, env_name: []const u8) !void {
 // --- POSIX Implementation ---
 
 fn readEnvVarPosix(allocator: std.mem.Allocator, env_name: []const u8) !?[]u8 {
-    if (std.process.getEnvVarOwned(allocator, env_name) catch null) |val| {
+    if (io_compat.getEnv(allocator, env_name)) |val| {
         errdefer allocator.free(val);
         if (val.len > 0) {
             return val;
@@ -54,12 +54,9 @@ fn readEnvVarPosix(allocator: std.mem.Allocator, env_name: []const u8) !?[]u8 {
 }
 
 fn readKeyFromShellFile(allocator: std.mem.Allocator, path: []const u8, env_name: []const u8) !?[]u8 {
-    const file = std.fs.openFileAbsolute(path, .{}) catch return null;
-    defer file.close();
-
-    var buf: [32768]u8 = undefined;
-    const bytes_read = file.readAll(&buf) catch return null;
-    const content = buf[0..bytes_read];
+    var content: std.ArrayListUnmanaged(u8) = .empty;
+    defer content.deinit(allocator);
+    if (!io_compat.readFileIntoList(allocator, path, &content)) return null;
 
     // Build dynamic prefixes
     var export_prefix_buf: [256]u8 = undefined;
@@ -67,7 +64,7 @@ fn readKeyFromShellFile(allocator: std.mem.Allocator, path: []const u8, env_name
     var plain_prefix_buf: [256]u8 = undefined;
     const plain_prefix = std.fmt.bufPrint(&plain_prefix_buf, "{s}=", .{env_name}) catch return null;
 
-    var line_iter = std.mem.splitScalar(u8, content, '\n');
+    var line_iter = std.mem.splitScalar(u8, content.items, '\n');
     while (line_iter.next()) |line| {
         const trimmed = std.mem.trim(u8, line, " \t\r");
         if (trimmed.len == 0 or trimmed[0] == '#') continue;
@@ -101,12 +98,7 @@ fn writeEnvVarPosix(allocator: std.mem.Allocator, env_name: []const u8, value: [
         const path = try std.fs.path.join(allocator, &.{ home, fname });
         defer allocator.free(path);
 
-        const exists = blk: {
-            std.fs.accessAbsolute(path, .{}) catch break :blk false;
-            break :blk true;
-        };
-
-        if (exists) {
+        if (io_compat.pathExists(path)) {
             try updateShellFile(allocator, path, env_name, value);
             written = true;
         }
@@ -123,20 +115,12 @@ fn updateShellFile(allocator: std.mem.Allocator, path: []const u8, env_name: []c
     var content: std.ArrayListUnmanaged(u8) = .empty;
     defer content.deinit(allocator);
 
-    {
-        const file = std.fs.openFileAbsolute(path, .{}) catch {
-            // File doesn't exist yet, will create
-            const out_file = try std.fs.createFileAbsolute(path, .{});
-            defer out_file.close();
-            var line_buf: [512]u8 = undefined;
-            const new_line = std.fmt.bufPrint(&line_buf, "export {s}={s}\n", .{ env_name, new_value }) catch return error.FormatError;
-            try out_file.writeAll(new_line);
-            return;
-        };
-        defer file.close();
-        var buf: [65536]u8 = undefined;
-        const bytes_read = file.readAll(&buf) catch return error.ReadError;
-        try content.appendSlice(allocator, buf[0..bytes_read]);
+    if (!io_compat.readFileIntoList(allocator, path, &content)) {
+        // File doesn't exist yet, create
+        var line_buf: [512]u8 = undefined;
+        const new_line = std.fmt.bufPrint(&line_buf, "export {s}={s}\n", .{ env_name, new_value }) catch return error.FormatError;
+        try io_compat.writeFileAll(path, new_line);
+        return;
     }
 
     // Build dynamic prefixes
@@ -155,7 +139,6 @@ fn updateShellFile(allocator: std.mem.Allocator, path: []const u8, env_name: []c
         if (std.mem.startsWith(u8, trimmed, export_prefix) or
             std.mem.startsWith(u8, trimmed, plain_prefix))
         {
-            // Write without quotes - the value is written bare
             var line_buf: [512]u8 = undefined;
             const new_line = std.fmt.bufPrint(&line_buf, "export {s}={s}", .{ env_name, new_value }) catch continue;
             try new_content.appendSlice(allocator, new_line);
@@ -178,9 +161,7 @@ fn updateShellFile(allocator: std.mem.Allocator, path: []const u8, env_name: []c
         try new_content.appendSlice(allocator, new_line);
     }
 
-    const file = try std.fs.createFileAbsolute(path, .{});
-    defer file.close();
-    try file.writeAll(new_content.items);
+    try io_compat.writeFileAll(path, new_content.items);
 }
 
 fn clearEnvVarPosix(allocator: std.mem.Allocator, env_name: []const u8) !void {
@@ -198,13 +179,7 @@ fn clearEnvVarPosix(allocator: std.mem.Allocator, env_name: []const u8) !void {
 fn removeEnvFromShellFile(allocator: std.mem.Allocator, path: []const u8, env_name: []const u8) !void {
     var content: std.ArrayListUnmanaged(u8) = .empty;
     defer content.deinit(allocator);
-
-    const file = std.fs.openFileAbsolute(path, .{}) catch return;
-    defer file.close();
-
-    var buf: [65536]u8 = undefined;
-    const bytes_read = file.readAll(&buf) catch return;
-    try content.appendSlice(allocator, buf[0..bytes_read]);
+    if (!io_compat.readFileIntoList(allocator, path, &content)) return;
 
     var new_content: std.ArrayListUnmanaged(u8) = .empty;
     defer new_content.deinit(allocator);
@@ -225,16 +200,14 @@ fn removeEnvFromShellFile(allocator: std.mem.Allocator, path: []const u8, env_na
         if (line_iter.peek() != null) try new_content.append(allocator, '\n');
     }
 
-    const out_file = try std.fs.createFileAbsolute(path, .{});
-    defer out_file.close();
-    try out_file.writeAll(new_content.items);
+    try io_compat.writeFileAll(path, new_content.items);
 }
 
 // --- Windows Implementation ---
 
 fn readEnvVarWindows(allocator: std.mem.Allocator, env_name: []const u8) !?[]u8 {
     // Try process environment first
-    if (std.process.getEnvVarOwned(allocator, env_name) catch null) |val| {
+    if (io_compat.getEnv(allocator, env_name)) |val| {
         errdefer allocator.free(val);
         if (val.len > 0) {
             // Strip extra quotes if present (fix for setx bug)
@@ -258,11 +231,6 @@ fn readWindowsPersistentEnv(allocator: std.mem.Allocator, env_name: []const u8) 
     var cmd_buf: [512]u8 = undefined;
     const cmd = std.fmt.bufPrint(&cmd_buf, "[Environment]::GetEnvironmentVariable('{s}', 'User')", .{env_name}) catch return null;
 
-    var stdout_data: std.ArrayListUnmanaged(u8) = .empty;
-    defer stdout_data.deinit(allocator);
-    var stderr_data: std.ArrayListUnmanaged(u8) = .empty;
-    defer stderr_data.deinit(allocator);
-
     const args = [_][]const u8{
         "powershell.exe",
         "-NoProfile",
@@ -270,24 +238,19 @@ fn readWindowsPersistentEnv(allocator: std.mem.Allocator, env_name: []const u8) 
         cmd,
     };
 
-    var child = std.process.Child.init(&args, allocator);
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
+    const result = std.process.run(allocator, io_compat.io(), .{ .argv = &args }) catch return null;
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
 
-    child.spawn() catch return null;
-    child.collectOutput(allocator, &stdout_data, &stderr_data, 8192) catch return null;
-    const term = child.wait() catch return null;
-
-    switch (term) {
-        .Exited => |code| {
+    switch (result.term) {
+        .exited => |code| {
             if (code != 0) return null;
         },
         else => return null,
     }
 
-    const output = std.mem.trim(u8, stdout_data.items, " \t\r\n");
+    const output = std.mem.trim(u8, result.stdout, " \t\r\n");
     if (output.len > 0) {
-        // Strip any residual quotes from previous setx bug
         const clean = stripQuotes(output);
         return try allocator.dupe(u8, clean);
     }
@@ -296,29 +259,17 @@ fn readWindowsPersistentEnv(allocator: std.mem.Allocator, env_name: []const u8) 
 }
 
 /// Write env var to Windows User registry using PowerShell.
-/// This replaces the old setx approach to avoid the quote-wrapping bug.
 fn writeEnvVarWindows(allocator: std.mem.Allocator, env_name: []const u8, value: []const u8) !void {
     if (builtin.os.tag != .windows) return;
 
-    // Use PowerShell [Environment]::SetEnvironmentVariable() instead of setx
-    // to avoid the quote-inclusion bug where setx stores literal " characters
     var cmd_buf: [1024]u8 = undefined;
     const cmd = std.fmt.bufPrint(&cmd_buf, "[Environment]::SetEnvironmentVariable('{s}', '{s}', 'User')", .{ env_name, value }) catch return error.FormatError;
 
     const args = [_][]const u8{ "powershell.exe", "-NoProfile", "-Command", cmd };
 
-    var stdout_data: std.ArrayListUnmanaged(u8) = .empty;
-    defer stdout_data.deinit(allocator);
-    var stderr_data: std.ArrayListUnmanaged(u8) = .empty;
-    defer stderr_data.deinit(allocator);
-
-    var child = std.process.Child.init(&args, allocator);
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-
-    try child.spawn();
-    try child.collectOutput(allocator, &stdout_data, &stderr_data, 8192);
-    _ = try child.wait();
+    const result = try std.process.run(allocator, io_compat.io(), .{ .argv = &args });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
 }
 
 fn clearEnvVarWindows(allocator: std.mem.Allocator, env_name: []const u8) !void {
@@ -334,18 +285,9 @@ fn clearEnvVarWindows(allocator: std.mem.Allocator, env_name: []const u8) !void 
         cmd,
     };
 
-    var child = std.process.Child.init(&args, allocator);
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-
-    var stdout_data: std.ArrayListUnmanaged(u8) = .empty;
-    defer stdout_data.deinit(allocator);
-    var stderr_data: std.ArrayListUnmanaged(u8) = .empty;
-    defer stderr_data.deinit(allocator);
-
-    try child.spawn();
-    try child.collectOutput(allocator, &stdout_data, &stderr_data, 8192);
-    _ = try child.wait();
+    const result = try std.process.run(allocator, io_compat.io(), .{ .argv = &args });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
 }
 
 // --- Utility functions ---
@@ -370,10 +312,8 @@ pub fn extractJsonValue(allocator: std.mem.Allocator, content: []const u8, field
     const colon_pos = std.mem.indexOf(u8, after_key, ":") orelse return error.NotFound;
     const after_colon = after_key[colon_pos + 1 ..];
 
-    // Handle non-string values (booleans, numbers)
-    const trimmed = std.mem.trimLeft(u8, after_colon, " \t\r\n");
+    const trimmed = std.mem.trimStart(u8, after_colon, " \t\r\n");
     if (trimmed.len > 0 and trimmed[0] != '"') {
-        // Non-string value: read until comma, }, or newline
         var end: usize = 0;
         while (end < trimmed.len and trimmed[end] != ',' and trimmed[end] != '}' and trimmed[end] != '\n') : (end += 1) {}
         const val = std.mem.trim(u8, trimmed[0..end], " \t\r\n");
@@ -384,11 +324,10 @@ pub fn extractJsonValue(allocator: std.mem.Allocator, content: []const u8, field
     const q1 = std.mem.indexOf(u8, after_colon, "\"") orelse return error.NotFound;
     const val_start = after_colon[q1 + 1 ..];
 
-    // Find closing quote, skipping escaped quotes (\")
     var i: usize = 0;
     while (i < val_start.len) : (i += 1) {
         if (val_start[i] == '\\' and i + 1 < val_start.len) {
-            i += 1; // skip escaped character
+            i += 1;
             continue;
         }
         if (val_start[i] == '"') break;
