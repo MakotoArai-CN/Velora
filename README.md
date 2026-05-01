@@ -104,6 +104,10 @@ velora ow <别名> [模型]               # 应用到 OpenClaw
 # 浏览站点的全部模型
 velora models <别名>      # 或 velora m <别名>
 
+# CC Switch 配置导入 / 导出
+velora import ccs [配置文件]                  # 默认读取 ~/.ccs/config.yaml
+velora export ccs [配置文件或目录]             # 默认写入 ~/.ccs/config.yaml
+
 # 全自动模型调用测试 / 性能基准
 velora test                                 # 并行测试所有站点的模型可调用性
 velora test <别名>                          # 测试单个站点
@@ -119,8 +123,8 @@ velora set model_select_mode keyboard       # 或 velora s msm keyboard
 velora set model_call_timeout_ms 60000      # 或 velora s mt 60000
 
 # 帮助 / 用法示例
-velora --help                               # 命令、选项、设置概览
-velora help examples                        # 完整用法示例（已从默认 help 中折叠）
+velora --help                               # 命令参数速查
+velora help examples                        # 完整用法示例
 
 # 安装 / 卸载
 velora install
@@ -164,6 +168,8 @@ velora use cc openai claude-opus-4-6
 velora oc openai claude-haiku-4-5-20251001
 velora nb openai
 velora ow openai
+velora import ccs ~/.ccs/config.yaml          # 导入 CC Switch 配置
+velora export ccs ~/.ccs/config.yaml          # 导出为 CC Switch 配置
 velora m openai                              # 浏览 openai 站点的全部模型
 velora t                                     # 并行测试所有站点的模型
 velora t openai                              # 测试单个站点（带 spinner 进度）
@@ -173,7 +179,7 @@ velora s ap off                              # 关闭类型不匹配时的自动
 velora s alm off                             # 关闭添加/编辑时自动加载模型列表
 velora s msm keyboard                        # 使用方向键选择模型
 velora s mt 60000                            # 将模型调用测试超时设为 60 秒
-velora help examples                         # 完整示例（在默认 help 中已折叠）
+velora help examples                         # 完整示例
 ```
 
 ## 当前使用工具识别（list 中的 `[← cc, oc]` 标签）
@@ -187,6 +193,21 @@ velora help examples                         # 完整示例（在默认 help 中
 ```
 
 匹配规则：分别读取每个工具的真实配置文件 / 环境变量（Codex 读 `~/.codex/config.toml` 与对应 env_key；Claude Code 读 `~/.claude/settings.json` 中的 `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN`；OpenCode、Nanobot、OpenClaw 读各自的 JSON），然后用 `base_url` 或 `api_key` 任一匹配站点（解决了用户手动改 URL 后仍能识别的问题）。
+
+## URL 处理规则
+
+Velora 会保存用户输入的 `base_url`，不会在站点配置里随意追加、替换或删除路径。这样可以避免误伤使用路径区分协议的站点，例如：
+
+```text
+https://relay.example.com/openai
+https://relay.example.com/anthropic
+```
+
+应用到 Codex、OpenCode、Nanobot、OpenClaw 这类 OpenAI 兼容目标时，只有当站点 URL 明显是裸域名/根路径（例如 `https://relay.example.com`）时，写入目标工具的配置才会派生为 `https://relay.example.com/v1`。如果 URL 已经带有 `/openai`、`/anthropic`、`/v2`、`/api/...` 等路径，则保持原样。
+
+Claude Code 的 `ANTHROPIC_BASE_URL` 始终按站点保存的 URL 原样写入。对于同一服务用不同路径区分 OpenAI / Anthropic 协议的情况，建议分别保存为两个站点别名，或在应用到目标工具前确认目标工具需要的路径。
+
+`velora list` 的当前使用识别会把根路径和仅差一个结尾 `/v1` 的 URL 视为同一站点，避免因为 Codex 侧派生 `/v1` 导致 `[← cx]` 标签丢失。
 
 ## 并行连通性检测
 
@@ -230,11 +251,28 @@ velora t --perf       # 性能基准模式：交互选择站点 → 并行 bench
 - 每个工具可单独保存模型覆盖（`models_cx` / `models_cc` / `models_oc` / `models_nb` / `models_ow`），auto-reapply 时会按工具读取各自的模型
 - `velora list` 中 `[← cx, cc]` 这类标签会同时列出所有正在使用该站点的工具
 
+## CC Switch 导入 / 导出
+
+Velora 支持和 CC Switch 的配置互通：
+
+```bash
+velora import ccs                         # 默认读取 ~/.ccs/config.yaml
+velora import ccs ~/.ccs/config.yaml
+velora export ccs                         # 默认写入 ~/.ccs/config.yaml
+velora export ccs ~/.ccs                  # 写入指定目录下的 config.yaml
+velora export ccs ./config.yaml
+```
+
+导入时，Velora 会读取 `profiles` 中的 `settings_file` / `settings`，并从对应 JSON 的 `env` 中提取 `ANTHROPIC_AUTH_TOKEN`、`ANTHROPIC_BASE_URL`、`ANTHROPIC_MODEL` 或 `ANTHROPIC_DEFAULT_*_MODEL`。导入结果会保存为 `cc` 可用站点，并写入独立的 `models_cc`，不会把 GPT 系列模型作为 Claude Code 默认模型。
+
+导出时，Velora 会生成 CCS 的 `config.yaml` 和每个 profile 对应的 `.settings.json`。只有 Claude Code 兼容的站点会被导出；GPT / OpenAI 系列模型不会被导出为 CC profile，避免后续在 Claude Code 中误用。
+
 ## 模型配置
 
 - 每个站点都支持自定义 `model`
 - 同一个站点也支持按目标工具保存单独的模型覆盖
 - 当目标工具与站点原始类型不匹配时，`auto_pick_compatible_model` 默认会先读取远端模型列表，再自动选择该目标工具可用的兼容模型
+- `cc` 和 `cx` 的模型选择相互隔离：`gpt*` / `o*` 不会自动写入 Claude Code，`claude-*` 不会自动写入 Codex；GLM、Kimi 等未明确归类但可通过 Anthropic 协议使用的模型仍可用于 `cc`
 - `nb` / `ow` 当前按 OpenAI 系列模型自动选择；`oc` 可在 OpenAI / Claude 系列之间选择；`cc` 使用 Claude 系列
 - 用户也可以在 `use` 命令后直接追加模型名覆盖本次目标模型
 - 未手动指定时，会自动使用并写入默认模型：

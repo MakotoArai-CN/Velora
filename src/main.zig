@@ -11,6 +11,7 @@ const check_mod = @import("check.zig");
 const current_mod = @import("current.zig");
 const install_mod = @import("install.zig");
 const update_mod = @import("update.zig");
+const ccs_mod = @import("ccs.zig");
 const app = @import("app.zig");
 const io_compat = @import("io_compat.zig");
 
@@ -76,6 +77,8 @@ pub fn main(init: std.process.Init) !void {
         .set => |args| try runSet(gpa, w, caps, lang, args),
         .models => |args| try runModels(gpa, w, caps, lang, args),
         .model_test => |args| try runModelTest(gpa, w, caps, lang, args),
+        .import_ccs => |args| try runImportCcs(gpa, w, caps, lang, args),
+        .export_ccs => |args| try runExportCcs(gpa, w, caps, lang, args),
         .install => try runInstall(gpa, w, caps, lang),
         .uninstall => try runUninstall(gpa, w, caps, lang),
         .update_check => try runUpdate(gpa, w, caps, lang),
@@ -96,26 +99,15 @@ fn runAdd(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCa
 
     // Direct mode: all fields provided via CLI
     if (args.site_type != null and args.base_url != null and args.api_key != null) {
-        const normalized_base_url = try check_mod.normalizedAddBaseUrl(allocator, args.base_url.?);
-        defer allocator.free(normalized_base_url);
         const site = sites_mod.Site{
             .site_type = args.site_type.?,
-            .base_url = normalized_base_url,
+            .base_url = args.base_url.?,
             .api_key = args.api_key.?,
             .model = args.model orelse sites_mod.defaultModelForType(args.site_type.?),
             .default_tools_mask = sites_mod.toolMask(args.site_type.?),
         };
         try store.addOrUpdate(allocator, args.alias, site);
         try sites_mod.saveSites(allocator, &store);
-
-        if (check_mod.normalizeBaseUrlDisplayChanged(args.base_url.?, normalized_base_url)) {
-            var norm_buf: [512]u8 = undefined;
-            const norm_msg = std.fmt.bufPrint(&norm_buf, "{s}: {s}", .{
-                i18n.tr(lang, "Normalized Base URL", "已规范化 Base URL", "Base URL を正規化しました"),
-                normalized_base_url,
-            }) catch normalized_base_url;
-            try output.printInfo(w, norm_msg, caps);
-        }
 
         var msg_buf: [128]u8 = undefined;
         const msg = std.fmt.bufPrint(&msg_buf, "Site '{s}' added ({s})", .{ args.alias, site.site_type.displayName() }) catch "Site added";
@@ -130,22 +122,13 @@ fn runAdd(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCa
         var probe = try check_mod.probeAddEndpoint(allocator, raw_base_url, api_key);
         defer check_mod.freeAddProbeResult(allocator, &probe);
 
-        if (check_mod.normalizeBaseUrlDisplayChanged(raw_base_url, probe.normalized_base_url)) {
-            var norm_buf: [512]u8 = undefined;
-            const norm_msg = std.fmt.bufPrint(&norm_buf, "{s}: {s}", .{
-                i18n.tr(lang, "Normalized Base URL", "已规范化 Base URL", "Base URL を正規化しました"),
-                probe.normalized_base_url,
-            }) catch probe.normalized_base_url;
-            try output.printInfo(w, norm_msg, caps);
-        }
-
         try printProbeSummary(w, caps, lang, probe);
         var selected_buf: [5]sites_mod.SiteType = undefined;
         const selected_tools = askDefaultTools(w, caps, lang, probe, &selected_buf);
 
         var site = sites_mod.Site{
             .site_type = check_mod.probeSuggestedSiteType(probe),
-            .base_url = probe.normalized_base_url,
+            .base_url = raw_base_url,
             .api_key = api_key,
         };
         applyProbeDefaults(&site, probe, selected_tools);
@@ -212,22 +195,12 @@ fn runAdd(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCa
         // New site
         if (args.site_type) |explicit_type| {
             const raw_base_url = askBaseUrl(w, caps, lang, null);
-            const normalized_base_url = try check_mod.normalizedAddBaseUrl(allocator, raw_base_url);
-            defer allocator.free(normalized_base_url);
-            if (check_mod.normalizeBaseUrlDisplayChanged(raw_base_url, normalized_base_url)) {
-                var norm_buf: [512]u8 = undefined;
-                const norm_msg = std.fmt.bufPrint(&norm_buf, "{s}: {s}", .{
-                    i18n.tr(lang, "Normalized Base URL", "已规范化 Base URL", "Base URL を正規化しました"),
-                    normalized_base_url,
-                }) catch normalized_base_url;
-                try output.printInfo(w, norm_msg, caps);
-            }
             const api_key = askApiKey(w, caps, lang, null);
             const model = askModel(w, caps, lang, explicit_type, args.model);
 
             var site = sites_mod.Site{
                 .site_type = explicit_type,
-                .base_url = normalized_base_url,
+                .base_url = raw_base_url,
                 .api_key = api_key,
                 .model = model,
             };
@@ -240,19 +213,8 @@ fn runAdd(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCa
             try output.printSuccess(w, msg, caps);
         } else {
             const raw_base_url = askBaseUrl(w, caps, lang, null);
-            const normalized_base_url = try check_mod.normalizedAddBaseUrl(allocator, raw_base_url);
-            defer allocator.free(normalized_base_url);
-            if (check_mod.normalizeBaseUrlDisplayChanged(raw_base_url, normalized_base_url)) {
-                var norm_buf: [512]u8 = undefined;
-                const norm_msg = std.fmt.bufPrint(&norm_buf, "{s}: {s}", .{
-                    i18n.tr(lang, "Normalized Base URL", "已规范化 Base URL", "Base URL を正規化しました"),
-                    normalized_base_url,
-                }) catch normalized_base_url;
-                try output.printInfo(w, norm_msg, caps);
-                try w.flush();
-            }
             const api_key = askApiKey(w, caps, lang, null);
-            var probe = try check_mod.probeAddEndpoint(allocator, normalized_base_url, api_key);
+            var probe = try check_mod.probeAddEndpoint(allocator, raw_base_url, api_key);
             defer check_mod.freeAddProbeResult(allocator, &probe);
             try printProbeSummary(w, caps, lang, probe);
 
@@ -261,7 +223,7 @@ fn runAdd(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCa
 
             var site = sites_mod.Site{
                 .site_type = check_mod.probeSuggestedSiteType(probe),
-                .base_url = probe.normalized_base_url,
+                .base_url = raw_base_url,
                 .api_key = api_key,
             };
             applyProbeDefaults(&site, probe, selected_tools);
@@ -991,7 +953,18 @@ fn runUse(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCa
         allocator.free(models);
     };
 
-    if (mismatch and (settings.auto_pick_compatible_model or args.model != null)) {
+    const raw_tool_override = site.modelOverrideForTool(target_type);
+    const stored_override_incompatible = raw_tool_override.len > 0 and
+        !sites_mod.modelCompatibleForTool(target_type, raw_tool_override);
+    const primary_model_incompatible = raw_tool_override.len == 0 and
+        site.site_type == target_type and
+        site.model.len > 0 and
+        !sites_mod.modelCompatibleForTool(target_type, site.model);
+    const should_fetch_for_target = args.model != null or
+        ((mismatch or primary_model_incompatible or stored_override_incompatible) and
+            settings.auto_pick_compatible_model);
+
+    if (should_fetch_for_target) {
         fetched_models = check_mod.fetchModelList(allocator, site.base_url, site.api_key) catch null;
     }
 
@@ -1017,7 +990,10 @@ fn runUse(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCa
             try output.printWarning(w, warn_msg, caps);
             try w.flush();
         }
-    } else if (mismatch and settings.auto_pick_compatible_model and site.modelOverrideForTool(target_type).len == 0) {
+    } else if ((mismatch or primary_model_incompatible or stored_override_incompatible) and
+        settings.auto_pick_compatible_model and
+        (raw_tool_override.len == 0 or stored_override_incompatible))
+    {
         if (fetched_models) |models| {
             if (check_mod.pickBestCompatibleModel(models, target_type)) |picked| {
                 tool_model = picked;
@@ -2046,6 +2022,56 @@ fn interactiveSelectSites(
     return picked;
 }
 
+// --- CCS Import / Export ---
+
+fn runImportCcs(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCaps, lang: i18n.Language, args: cli.CcsArgs) !void {
+    try output.printSectionHeader(w, i18n.tr(lang, "Import CCS", "导入 CCS", "CCS インポート"), caps);
+
+    var store = try sites_mod.loadSites(allocator);
+    defer store.deinit(allocator);
+
+    const result = ccs_mod.importConfig(allocator, args.path, &store) catch |err| {
+        switch (err) {
+            error.ConfigNotFound => try output.printError(w, i18n.tr(lang, "CCS config not found", "未找到 CCS 配置文件", "CCS 設定ファイルが見つかりません"), caps),
+            else => try output.printError(w, i18n.tr(lang, "Failed to import CCS config", "导入 CCS 配置失败", "CCS 設定のインポートに失敗しました"), caps),
+        }
+        try w.flush();
+        return;
+    };
+    defer ccs_mod.freeImportResult(allocator, result);
+
+    try sites_mod.saveSites(allocator, &store);
+
+    var msg_buf: [160]u8 = undefined;
+    const msg = std.fmt.bufPrint(&msg_buf, "{d} imported, {d} skipped", .{ result.imported, result.skipped }) catch "Import complete";
+    try output.printSuccess(w, msg, caps);
+    try output.printKeyValue(w, "Config:", result.path, caps);
+    try w.flush();
+}
+
+fn runExportCcs(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCaps, lang: i18n.Language, args: cli.CcsArgs) !void {
+    try output.printSectionHeader(w, i18n.tr(lang, "Export CCS", "导出 CCS", "CCS エクスポート"), caps);
+
+    var store = try sites_mod.loadSites(allocator);
+    defer store.deinit(allocator);
+
+    const result = ccs_mod.exportConfig(allocator, args.path, &store) catch |err| {
+        switch (err) {
+            error.NoExportableProfiles => try output.printWarning(w, i18n.tr(lang, "No Claude Code compatible sites to export", "没有可导出的 Claude Code 兼容站点", "エクスポート可能な Claude Code 互換サイトがありません"), caps),
+            else => try output.printError(w, i18n.tr(lang, "Failed to export CCS config", "导出 CCS 配置失败", "CCS 設定のエクスポートに失敗しました"), caps),
+        }
+        try w.flush();
+        return;
+    };
+    defer ccs_mod.freeExportResult(allocator, result);
+
+    var msg_buf: [160]u8 = undefined;
+    const msg = std.fmt.bufPrint(&msg_buf, "{d} exported, {d} skipped", .{ result.exported, result.skipped }) catch "Export complete";
+    try output.printSuccess(w, msg, caps);
+    try output.printKeyValue(w, "Config:", result.path, caps);
+    try w.flush();
+}
+
 // --- Install / Uninstall ---
 
 fn runInstall(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCaps, lang: i18n.Language) !void {
@@ -2290,7 +2316,7 @@ fn askModel(w: *std.Io.Writer, caps: terminal.TermCaps, lang: i18n.Language, sit
 fn printProbeSummary(w: *std.Io.Writer, caps: terminal.TermCaps, lang: i18n.Language, probe: check_mod.AddProbeResult) !void {
     try output.printInfo(w, i18n.tr(lang, "Probe summary:", "探测结果:", "プローブ結果:"), caps);
     var url_buf: [512]u8 = undefined;
-    const url_msg = std.fmt.bufPrint(&url_buf, "  Base URL: {s}", .{probe.normalized_base_url}) catch probe.normalized_base_url;
+    const url_msg = std.fmt.bufPrint(&url_buf, "  Probe URL: {s}", .{probe.normalized_base_url}) catch probe.normalized_base_url;
     try output.printInfo(w, url_msg, caps);
     var models_buf: [128]u8 = undefined;
     const models_msg = std.fmt.bufPrint(&models_buf, "  Models: {d}", .{probe.model_count}) catch "Models";
@@ -2377,6 +2403,7 @@ fn applyProbeDefaults(site: *sites_mod.Site, probe: check_mod.AddProbeResult, se
 test {
     _ = @import("sites.zig");
     _ = @import("config.zig");
+    _ = @import("ccs.zig");
 }
 
 // --- Fuzzy matching ---

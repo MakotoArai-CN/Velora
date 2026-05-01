@@ -1385,6 +1385,7 @@ pub fn normalizeBaseUrlForProbe(allocator: std.mem.Allocator, base_url: []const 
     {
         return allocator.dupe(u8, trimmed);
     }
+    if (!isRootUrl(trimmed)) return allocator.dupe(u8, trimmed);
     if (std.mem.indexOf(u8, trimmed, "/v") != null) {
         if (std.mem.lastIndexOfScalar(u8, trimmed, '/')) |slash| {
             const tail = trimmed[slash..];
@@ -1396,6 +1397,21 @@ pub fn normalizeBaseUrlForProbe(allocator: std.mem.Allocator, base_url: []const 
     var buf: [1024]u8 = undefined;
     const normalized = std.fmt.bufPrint(&buf, "{s}/v1", .{trimmed}) catch return allocator.dupe(u8, trimmed);
     return allocator.dupe(u8, normalized);
+}
+
+fn isRootUrl(base_url: []const u8) bool {
+    var start: usize = 0;
+    if (std.mem.indexOf(u8, base_url, "://")) |scheme| start = scheme + 3;
+
+    var i = start;
+    while (i < base_url.len) : (i += 1) {
+        switch (base_url[i]) {
+            '/' => return false,
+            '?', '#' => return false,
+            else => {},
+        }
+    }
+    return true;
 }
 
 pub fn probeAddEndpoint(allocator: std.mem.Allocator, base_url: []const u8, api_key: []const u8) !AddProbeResult {
@@ -1607,9 +1623,9 @@ pub fn pickBestCompatibleModel(models: []const []const u8, target_type: sites_mo
 
 fn supportsModelFamily(target_type: sites_mod.SiteType, family: ModelFamily) bool {
     return switch (target_type) {
-        .cx => family == .openai,
-        .cc => family == .claude,
-        .oc, .nb, .ow => family == .openai or family == .claude,
+        .cx => family != .claude,
+        .cc => family != .openai,
+        .oc, .nb, .ow => true,
     };
 }
 
@@ -1670,6 +1686,19 @@ test "model family classification" {
     try std.testing.expectEqual(ModelFamily.openai, classifyModelFamily("o3"));
     try std.testing.expectEqual(ModelFamily.claude, classifyModelFamily("claude-opus-4-6[1m]"));
     try std.testing.expectEqual(ModelFamily.unknown, classifyModelFamily("gemini-2.5-pro"));
+}
+
+test "model compatibility blocks cross-family cc/cx mixups" {
+    try std.testing.expect(!isModelCompatibleForTool(.cc, "gpt5.5"));
+    try std.testing.expect(!isModelCompatibleForTool(.cx, "claude-opus-4-7"));
+    try std.testing.expect(isModelCompatibleForTool(.cc, "claude-opus-4-7"));
+    try std.testing.expect(isModelCompatibleForTool(.cc, "glm-4.6"));
+}
+
+test "normalizeBaseUrlForProbe preserves non-root protocol paths" {
+    const got = try normalizeBaseUrlForProbe(std.testing.allocator, "https://api.example.com/anthropic/");
+    defer std.testing.allocator.free(got);
+    try std.testing.expectEqualStrings("https://api.example.com/anthropic", got);
 }
 
 test "pick best compatible model" {

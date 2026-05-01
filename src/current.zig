@@ -371,6 +371,21 @@ fn updateDepthTrackingQuoted(trimmed: []const u8, depth: *i32) void {
     }
 }
 
+fn stripTrailingV1(url: []const u8) []const u8 {
+    const trimmed = std.mem.trimEnd(u8, url, "/ \t\r\n");
+    if (trimmed.len >= 3 and std.ascii.eqlIgnoreCase(trimmed[trimmed.len - 3 ..], "/v1")) {
+        return trimmed[0 .. trimmed.len - 3];
+    }
+    return trimmed;
+}
+
+fn baseUrlEquivalent(a: []const u8, b: []const u8) bool {
+    const na = std.mem.trimEnd(u8, a, "/ \t\r\n");
+    const nb = std.mem.trimEnd(u8, b, "/ \t\r\n");
+    if (std.ascii.eqlIgnoreCase(na, nb)) return true;
+    return std.ascii.eqlIgnoreCase(stripTrailingV1(na), stripTrailingV1(nb));
+}
+
 /// Fields captured from each tool's live config (and env vars, where applicable).
 /// Each slot may be null when the tool has no config or the field is missing.
 pub const ToolState = struct {
@@ -433,7 +448,7 @@ pub const CurrentTools = struct {
             }
             if (!hit) {
                 if (item.s.base_url) |cur_url| {
-                    if (norm_url.len > 0 and std.ascii.eqlIgnoreCase(cur_url, norm_url)) hit = true;
+                    if (norm_url.len > 0 and baseUrlEquivalent(cur_url, norm_url)) hit = true;
                 }
             }
             if (hit) mask |= sites_mod.toolMask(item.t);
@@ -464,6 +479,16 @@ test "matchSite matches on base_url" {
     try std.testing.expectEqual(sites_mod.toolMask(.cc), tools.matchSite("https://example.com", ""));
     try std.testing.expectEqual(sites_mod.toolMask(.cc), tools.matchSite("https://example.com/", ""));
     try std.testing.expectEqual(@as(u8, 0), tools.matchSite("https://other.example.com", ""));
+}
+
+test "matchSite treats trailing v1 as same site" {
+    const allocator = std.testing.allocator;
+    var tools = CurrentTools{
+        .cx = .{ .base_url = try allocator.dupe(u8, "https://api.example.com/v1") },
+    };
+    defer tools.deinit(allocator);
+
+    try std.testing.expectEqual(sites_mod.toolMask(.cx), tools.matchSite("https://api.example.com", ""));
 }
 
 test "matchSite matches on api_key when url differs" {

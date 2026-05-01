@@ -50,6 +50,10 @@ pub const TestArgs = struct {
     perf: bool = false,
 };
 
+pub const CcsArgs = struct {
+    path: ?[]const u8 = null,
+};
+
 pub const Command = union(enum) {
     add: AddArgs,
     edit: EditArgs,
@@ -59,6 +63,8 @@ pub const Command = union(enum) {
     set: SetArgs,
     models: ModelsArgs,
     model_test: TestArgs,
+    import_ccs: CcsArgs,
+    export_ccs: CcsArgs,
     install,
     uninstall,
     update_check, // --update: check and apply update
@@ -271,6 +277,20 @@ pub fn parseArgs(_: std.mem.Allocator, raw_argv: []const [:0]const u8) ParseErro
             }
         }
         config.command = .{ .model_test = args_out };
+    } else if (eql(sub, "import")) {
+        if (containsHelpArg(rest)) {
+            printHelp(lang);
+            return error.HelpRequested;
+        }
+        if (rest.len < 1 or !isCcsFormat(rest[0])) return error.InvalidArgument;
+        config.command = .{ .import_ccs = .{ .path = if (rest.len >= 2) rest[1] else null } };
+    } else if (eql(sub, "export")) {
+        if (containsHelpArg(rest)) {
+            printHelp(lang);
+            return error.HelpRequested;
+        }
+        if (rest.len < 1 or !isCcsFormat(rest[0])) return error.InvalidArgument;
+        config.command = .{ .export_ccs = .{ .path = if (rest.len >= 2) rest[1] else null } };
     } else if (eql(sub, "install") or eql(sub, "--install")) {
         config.command = .install;
     } else if (eql(sub, "uninstall") or eql(sub, "--uninstall") or eql(sub, "--del")) {
@@ -334,6 +354,17 @@ fn isHelpArg(s: []const u8) bool {
     return eql(s, "-h") or eql(s, "--help") or eql(s, "help");
 }
 
+fn containsHelpArg(args: []const []const u8) bool {
+    for (args) |arg| {
+        if (isHelpArg(arg)) return true;
+    }
+    return false;
+}
+
+fn isCcsFormat(s: []const u8) bool {
+    return eql(s, "ccs") or eql(s, "cc-switch") or eql(s, "ccswitch");
+}
+
 fn parseLang(s: []const u8) ?i18n.Language {
     if (eql(s, "en")) return .en;
     if (eql(s, "zh")) return .zh;
@@ -374,156 +405,87 @@ fn printHelp(lang: i18n.Language) void {
         .zh =>
         \\用法: velora <命令> [参数]
         \\
-        \\命令:
-        \\  add <别名>                         交互式添加站点
-        \\  add <类型> <别名> <URL> <Key> [模型] 一次性添加站点 (类型: cx, cc, oc, nb, ow)
-        \\  edit <别名>                        编辑站点配置
-        \\  del <别名>                         删除站点
-        \\  list                               显示站点列表（含连通性检测，并行）
-        \\  list -g                            全局检测（含已归档站点）
-        \\  list all                           显示详细站点信息
-        \\  list --sort=<模式>                 排序: time, alpha, tool, model
-        \\  use <别名> [模型]                  自动应用站点（根据类型）
-        \\  use <类型> <别名> [模型]           应用站点到指定工具，可覆盖模型
-        \\  cx use <别名> [模型]               应用站点到 Codex
-        \\  cc use <别名> [模型]               应用站点到 Claude Code
-        \\  oc use <别名> [模型]               应用站点到 OpenCode
-        \\  nb use <别名> [模型]               应用站点到 Nanobot
-        \\  ow use <别名> [模型]               应用站点到 OpenClaw
-        \\  models|m <别名>                    浏览站点支持的全部模型
-        \\  test|t [别名] [-p|--perf]          全自动检测模型调用 (--perf 进入性能基准测试,交互选择站点)
-        \\  set|s <选项> <on/off|值>           设置选项开关
-        \\  help examples                      显示完整用法示例
+        \\站点:
+        \\  add <别名>
+        \\  add <类型> <别名> <URL> <Key> [模型]
+        \\  edit <别名>
+        \\  del <别名>
+        \\  list [all|-g|--sort=<time|alpha|tool|model>]
         \\
-        \\设置选项 (缩写):
-        \\  model_check (mc)                   模型检测 (默认: on)
-        \\  list_latency (ll)                  列表延迟检测 (默认: on)
-        \\  auto_archive (aa)                  自动归档不可用站点 (默认: off)
-        \\  auto_pick_compatible_model (ap)    类型不匹配时自动选择兼容模型 (默认: on)
-        \\  auto_load_models (alm)             添加/编辑时自动加载模型列表 (默认: on)
-        \\  list_sort (ls)                     列表排序: time, alpha, tool, model (默认: time)
-        \\  model_select_mode (msm)            模型选择方式: number, keyboard (默认: number)
-        \\  model_call_timeout_ms (mt)         模型调用超时(毫秒) 范围 3000-600000 (默认: 30000)
+        \\应用:
+        \\  use <别名> [模型]
+        \\  use <类型> <别名> [模型]
+        \\  cx|cc|oc|nb|ow <别名> [模型]
         \\
-        \\类型:
-        \\  cx    Codex (OPENAI_API_KEY)
-        \\  cc    Claude Code (ANTHROPIC_AUTH_TOKEN)
-        \\  oc    OpenCode (~/.config/opencode/opencode.json)
-        \\  nb    Nanobot (~/.nanobot/config.json)
-        \\  ow    OpenClaw (~/.openclaw/openclaw.json)
+        \\工具:
+        \\  models <别名>
+        \\  test [别名] [-p|--perf]
+        \\  import ccs [配置文件]
+        \\  export ccs [配置文件或目录]
+        \\  set <选项> <on|off|值>
         \\
-        \\选项:
-        \\  -h, --help             显示帮助
-        \\  --examples             显示完整用法示例
-        \\  -v, --version          显示版本（检查更新）
-        \\  --update               检查并自动更新
-        \\  -l, --lang <LANG>      语言: en, zh, ja
+        \\类型: cx Codex, cc Claude Code, oc OpenCode, nb Nanobot, ow OpenClaw
+        \\选项: -l/--lang <en|zh|ja>, -v/--version, --update, -h/--help
         \\
         ,
         .ja =>
         \\使い方: velora <コマンド> [引数]
         \\
-        \\コマンド:
-        \\  add <エイリアス>                       サイトを対話式で追加
-        \\  add <タイプ> <エイリアス> <URL> <Key> [モデル] サイトを一括で追加 (タイプ: cx, cc, oc, nb, ow)
-        \\  edit <エイリアス>                      サイトの設定を編集
-        \\  del <エイリアス>                       サイトを削除
-        \\  list                                  サイト一覧表示（接続確認、並列）
-        \\  list -g                               グローバル検出（アーカイブ含む）
-        \\  list all                              サイト詳細表示
-        \\  list --sort=<モード>                  ソート: time, alpha, tool, model
-        \\  use <エイリアス> [モデル]              サイトを自動適用（タイプに基づく）
-        \\  use <タイプ> <エイリアス> [モデル]     指定ツールに適用し、モデルを上書き可能
-        \\  cx use <エイリアス> [モデル]           サイトをCodexに適用
-        \\  cc use <エイリアス> [モデル]           サイトをClaude Codeに適用
-        \\  oc use <エイリアス> [モデル]           サイトをOpenCodeに適用
-        \\  nb use <エイリアス> [モデル]           サイトをNanobotに適用
-        \\  ow use <エイリアス> [モデル]           サイトをOpenClawに適用
-        \\  models|m <エイリアス>                  サイトの全モデルを表示
-        \\  test|t [エイリアス] [-p|--perf]        モデル呼び出し自動検出 (--perf でベンチマーク・対話選択)
-        \\  set|s <項目> <on/off|値>              設定の切り替え
-        \\  help examples                         使用例の一覧を表示
+        \\サイト:
+        \\  add <エイリアス>
+        \\  add <タイプ> <エイリアス> <URL> <Key> [モデル]
+        \\  edit <エイリアス>
+        \\  del <エイリアス>
+        \\  list [all|-g|--sort=<time|alpha|tool|model>]
         \\
-        \\設定項目 (略称):
-        \\  model_check (mc)                      モデル検出 (デフォルト: on)
-        \\  list_latency (ll)                     リスト遅延チェック (デフォルト: on)
-        \\  auto_archive (aa)                     不可用サイト自動アーカイブ (デフォルト: off)
-        \\  auto_pick_compatible_model (ap)       タイプ不一致時に互換モデルを自動選択 (デフォルト: on)
-        \\  auto_load_models (alm)                追加/編集時にモデル一覧を自動取得 (デフォルト: on)
-        \\  list_sort (ls)                        リストソート: time, alpha, tool, model (デフォルト: time)
-        \\  model_select_mode (msm)               モデル選択: number, keyboard (デフォルト: number)
-        \\  model_call_timeout_ms (mt)            モデル呼び出しタイムアウト(ms) 3000-600000 (デフォルト: 30000)
+        \\適用:
+        \\  use <エイリアス> [モデル]
+        \\  use <タイプ> <エイリアス> [モデル]
+        \\  cx|cc|oc|nb|ow <エイリアス> [モデル]
         \\
-        \\タイプ:
-        \\  cx    Codex (OPENAI_API_KEY)
-        \\  cc    Claude Code (ANTHROPIC_AUTH_TOKEN)
-        \\  oc    OpenCode (~/.config/opencode/opencode.json)
-        \\  nb    Nanobot (~/.nanobot/config.json)
-        \\  ow    OpenClaw (~/.openclaw/openclaw.json)
+        \\ツール:
+        \\  models <エイリアス>
+        \\  test [エイリアス] [-p|--perf]
+        \\  import ccs [設定ファイル]
+        \\  export ccs [設定ファイルまたはディレクトリ]
+        \\  set <項目> <on|off|値>
         \\
-        \\オプション:
-        \\  -h, --help             ヘルプを表示
-        \\  --examples             使用例の一覧を表示
-        \\  -v, --version          バージョンを表示（更新確認）
-        \\  --update               更新を確認して適用
-        \\  -l, --lang <LANG>      言語: en, zh, ja
+        \\タイプ: cx Codex, cc Claude Code, oc OpenCode, nb Nanobot, ow OpenClaw
+        \\オプション: -l/--lang <en|zh|ja>, -v/--version, --update, -h/--help
         \\
         ,
         .en =>
         \\Usage: velora <command> [args]
         \\
-        \\Commands:
-        \\  add <alias>                        Add a site interactively
-        \\  add <type> <alias> <url> <key> [model] Add a site directly (type: cx, cc, oc, nb, ow)
-        \\  edit <alias>                       Edit site configuration
-        \\  del <alias>                        Delete a site
-        \\  list                               List sites with connectivity check (parallel)
-        \\  list -g                            Global check (including archived)
-        \\  list all                           List sites with full details
-        \\  list --sort=<mode>                 Sort: time, alpha, tool, model
-        \\  use <alias> [model]                Apply site config (auto-detect type)
-        \\  use <type> <alias> [model]         Apply to a target tool and optionally override model
-        \\  cx use <alias> [model]             Apply site config to Codex
-        \\  cc use <alias> [model]             Apply site config to Claude Code
-        \\  oc use <alias> [model]             Apply site config to OpenCode
-        \\  nb use <alias> [model]             Apply site config to Nanobot
-        \\  ow use <alias> [model]             Apply site config to OpenClaw
-        \\  models|m <alias>                   Browse all models for a site
-        \\  test|t [alias] [-p|--perf]         Auto-test model calls (--perf benchmark with interactive site selection)
-        \\  set|s <option> <on/off|value>      Toggle settings
-        \\  help examples                      Show full usage examples
+        \\Sites:
+        \\  add <alias>
+        \\  add <type> <alias> <url> <key> [model]
+        \\  edit <alias>
+        \\  del <alias>
+        \\  list [all|-g|--sort=<time|alpha|tool|model>]
         \\
-        \\Settings (shorthand):
-        \\  model_check (mc)                   Model detection on use (default: on)
-        \\  list_latency (ll)                  Latency check on list (default: on)
-        \\  auto_archive (aa)                  Auto-archive unreachable sites (default: off)
-        \\  auto_pick_compatible_model (ap)    Auto-pick compatible model on type mismatch (default: on)
-        \\  auto_load_models (alm)             Auto-load model list on add/edit (default: on)
-        \\  list_sort (ls)                     List sort: time, alpha, tool, model (default: time)
-        \\  model_select_mode (msm)            Model picker mode: number, keyboard (default: number)
-        \\  model_call_timeout_ms (mt)         Model call timeout in ms, 3000-600000 (default: 30000)
+        \\Apply:
+        \\  use <alias> [model]
+        \\  use <type> <alias> [model]
+        \\  cx|cc|oc|nb|ow <alias> [model]
         \\
-        \\Types:
-        \\  cx    Codex (OPENAI_API_KEY)
-        \\  cc    Claude Code (ANTHROPIC_AUTH_TOKEN)
-        \\  oc    OpenCode (~/.config/opencode/opencode.json)
-        \\  nb    Nanobot (~/.nanobot/config.json)
-        \\  ow    OpenClaw (~/.openclaw/openclaw.json)
+        \\Tools:
+        \\  models <alias>
+        \\  test [alias] [-p|--perf]
+        \\  import ccs [config-file]
+        \\  export ccs [config-file-or-dir]
+        \\  set <option> <on|off|value>
         \\
-        \\Options:
-        \\  -h, --help             Show help
-        \\  --examples             Show full usage examples
-        \\  -v, --version          Show version (checks for updates)
-        \\  --update               Check and apply update
-        \\  -l, --lang <LANG>      Language: en, zh, ja
+        \\Types: cx Codex, cc Claude Code, oc OpenCode, nb Nanobot, ow OpenClaw
+        \\Options: -l/--lang <en|zh|ja>, -v/--version, --update, -h/--help
         \\
         ,
     };
 
     const hint = switch (lang) {
-        .zh => "提示: 运行 'velora help examples' 查看完整用法示例。",
-        .ja => "ヒント: 'velora help examples' で全ての使用例を表示。",
-        .en => "Tip: run 'velora help examples' to see all usage examples.",
+        .zh => "完整说明见 README.md。",
+        .ja => "詳細は README.md を参照してください。",
+        .en => "See README.md for full documentation.",
     };
 
     w.print("{s}{s}{s} v{s}\n\n", .{ cyan, title, reset, main_mod.version }) catch {};

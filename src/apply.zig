@@ -25,6 +25,40 @@ fn openAiModelRef(buf: []u8, model: []const u8) []const u8 {
     return providerModelRef(buf, "openai", model);
 }
 
+fn normalizeOpenAIBaseUrl(allocator: std.mem.Allocator, base_url: []const u8) ![]u8 {
+    const trimmed = std.mem.trimEnd(u8, base_url, "/ \t\r\n");
+    if (trimmed.len == 0) return allocator.dupe(u8, base_url);
+    if (std.mem.endsWith(u8, trimmed, "/v1")) return allocator.dupe(u8, trimmed);
+    if (!isRootUrl(trimmed)) return allocator.dupe(u8, trimmed);
+    if (std.mem.indexOf(u8, trimmed, "/v") != null) {
+        if (std.mem.lastIndexOfScalar(u8, trimmed, '/')) |slash| {
+            const tail = trimmed[slash..];
+            if (std.mem.startsWith(u8, tail, "/v") and tail.len >= 3 and std.ascii.isDigit(tail[2])) {
+                return allocator.dupe(u8, trimmed);
+            }
+        }
+    }
+
+    var buf: [1024]u8 = undefined;
+    const normalized = std.fmt.bufPrint(&buf, "{s}/v1", .{trimmed}) catch return allocator.dupe(u8, trimmed);
+    return allocator.dupe(u8, normalized);
+}
+
+fn isRootUrl(base_url: []const u8) bool {
+    var start: usize = 0;
+    if (std.mem.indexOf(u8, base_url, "://")) |scheme| start = scheme + 3;
+
+    var i = start;
+    while (i < base_url.len) : (i += 1) {
+        switch (base_url[i]) {
+            '/' => return false,
+            '?', '#' => return false,
+            else => {},
+        }
+    }
+    return true;
+}
+
 /// Read entire file into an ArrayListUnmanaged via chunked reads.
 fn readFileIntoList(allocator: std.mem.Allocator, path: []const u8, list: *std.ArrayListUnmanaged(u8)) bool {
     return io_compat.readFileIntoList(allocator, path, list);
@@ -37,9 +71,11 @@ pub fn applyToCodex(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: termi
     try w.flush();
 
     const model = tool_model;
+    const base_url = try normalizeOpenAIBaseUrl(allocator, site.base_url);
+    defer allocator.free(base_url);
 
     // 1. Update base_url and model in ~/.codex/config.toml
-    const toml_updated = updateCodexToml(allocator, site.base_url, model) catch |err| {
+    const toml_updated = updateCodexToml(allocator, base_url, model) catch |err| {
         try output.printWarning(w, i18n.tr(lang, "Failed to update Codex config.toml", "更新 Codex config.toml 失败", "Codex config.toml の更新に失敗しました"), caps);
         try w.flush();
         return err;
@@ -66,7 +102,7 @@ pub fn applyToCodex(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: termi
     const masked = sites_mod.maskKey(&masked_buf, site.api_key);
     const key_info = std.fmt.bufPrint(&key_info_buf, "{s} = {s}", .{ env_key.key, masked }) catch "?";
     try output.printSuccess(w, key_info, caps);
-    try output.printKeyValue(w, "Base URL:", site.base_url, caps);
+    try output.printKeyValue(w, "Base URL:", base_url, caps);
     try output.printKeyValue(w, "Model:", model, caps);
     try w.flush();
 }
@@ -432,8 +468,10 @@ pub fn applyToOpenCode(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: te
         tool_model
     else
         std.fmt.bufPrint(&pm_buf, "openai/{s}", .{tool_model}) catch tool_model;
+    const base_url = try normalizeOpenAIBaseUrl(allocator, site.base_url);
+    defer allocator.free(base_url);
 
-    updateOpenCodeConfig(allocator, site.api_key, site.base_url, model) catch |err| {
+    updateOpenCodeConfig(allocator, site.api_key, base_url, model) catch |err| {
         try output.printError(w, i18n.tr(lang, "Failed to update OpenCode config", "更新 OpenCode 配置失败", "OpenCode 設定の更新に失敗しました"), caps);
         try w.flush();
         return err;
@@ -444,7 +482,7 @@ pub fn applyToOpenCode(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: te
     var info_buf: [128]u8 = undefined;
     const info = std.fmt.bufPrint(&info_buf, "apiKey = {s}", .{masked}) catch "?";
     try output.printSuccess(w, info, caps);
-    try output.printKeyValue(w, "Base URL:", site.base_url, caps);
+    try output.printKeyValue(w, "Base URL:", base_url, caps);
     try output.printKeyValue(w, "Model:", model, caps);
     try w.flush();
 }
@@ -749,8 +787,10 @@ pub fn applyToNanobot(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: ter
 
     var pm_buf: [512]u8 = undefined;
     const model = openAiModelRef(&pm_buf, tool_model);
+    const base_url = try normalizeOpenAIBaseUrl(allocator, site.base_url);
+    defer allocator.free(base_url);
 
-    updateNanobotConfig(allocator, site.api_key, site.base_url, model) catch |err| {
+    updateNanobotConfig(allocator, site.api_key, base_url, model) catch |err| {
         try output.printError(w, i18n.tr(lang, "Failed to update Nanobot config", "更新 Nanobot 配置失败", "Nanobot 設定の更新に失敗しました"), caps);
         try w.flush();
         return err;
@@ -761,7 +801,7 @@ pub fn applyToNanobot(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: ter
     var info_buf: [128]u8 = undefined;
     const info = std.fmt.bufPrint(&info_buf, "providers.openai.apiKey = {s}", .{masked}) catch "?";
     try output.printSuccess(w, info, caps);
-    try output.printKeyValue(w, "Base URL:", site.base_url, caps);
+    try output.printKeyValue(w, "Base URL:", base_url, caps);
     try output.printKeyValue(w, "Model:", model, caps);
     try w.flush();
 }
@@ -933,8 +973,10 @@ pub fn applyToOpenClaw(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: te
     try w.flush();
 
     const model = tool_model;
+    const base_url = try normalizeOpenAIBaseUrl(allocator, site.base_url);
+    defer allocator.free(base_url);
 
-    updateOpenClawConfig(allocator, site.api_key, site.base_url, model) catch |err| {
+    updateOpenClawConfig(allocator, site.api_key, base_url, model) catch |err| {
         try output.printError(w, i18n.tr(lang, "Failed to update OpenClaw config", "更新 OpenClaw 配置失败", "OpenClaw 設定の更新に失敗しました"), caps);
         try w.flush();
         return err;
@@ -945,7 +987,7 @@ pub fn applyToOpenClaw(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: te
     var info_buf: [128]u8 = undefined;
     const info = std.fmt.bufPrint(&info_buf, "models.providers.velora.apiKey = {s}", .{masked}) catch "?";
     try output.printSuccess(w, info, caps);
-    try output.printKeyValue(w, "Base URL:", site.base_url, caps);
+    try output.printKeyValue(w, "Base URL:", base_url, caps);
     try output.printKeyValue(w, "Model:", model, caps);
     try w.flush();
 }
@@ -1079,4 +1121,22 @@ fn writeNewOpenClawConfig(allocator: std.mem.Allocator, path: []const u8, api_ke
         "}\n");
 
     try io_compat.writeFileAll(path, out.items);
+}
+
+test "normalizeOpenAIBaseUrl appends v1 when missing" {
+    const got = try normalizeOpenAIBaseUrl(std.testing.allocator, "https://api.example.com/");
+    defer std.testing.allocator.free(got);
+    try std.testing.expectEqualStrings("https://api.example.com/v1", got);
+}
+
+test "normalizeOpenAIBaseUrl keeps existing v1" {
+    const got = try normalizeOpenAIBaseUrl(std.testing.allocator, "https://api.example.com/v1/");
+    defer std.testing.allocator.free(got);
+    try std.testing.expectEqualStrings("https://api.example.com/v1", got);
+}
+
+test "normalizeOpenAIBaseUrl preserves protocol path" {
+    const got = try normalizeOpenAIBaseUrl(std.testing.allocator, "https://api.example.com/openai/");
+    defer std.testing.allocator.free(got);
+    try std.testing.expectEqualStrings("https://api.example.com/openai", got);
 }

@@ -51,6 +51,40 @@ pub fn defaultModelForType(site_type: SiteType) []const u8 {
     };
 }
 
+const ModelFamily = enum {
+    openai,
+    claude,
+    unknown,
+};
+
+fn stripProviderPrefix(model: []const u8) []const u8 {
+    if (std.mem.indexOfScalar(u8, model, '/')) |slash| {
+        if (slash + 1 < model.len) return model[slash + 1 ..];
+    }
+    return model;
+}
+
+fn classifyModelFamily(model: []const u8) ModelFamily {
+    const raw = stripProviderPrefix(model);
+    if (std.mem.startsWith(u8, raw, "claude-")) return .claude;
+    if (std.mem.startsWith(u8, raw, "gpt") or
+        std.mem.startsWith(u8, raw, "o1") or
+        std.mem.startsWith(u8, raw, "o3") or
+        std.mem.startsWith(u8, raw, "o4"))
+    {
+        return .openai;
+    }
+    return .unknown;
+}
+
+pub fn modelCompatibleForTool(tool_type: SiteType, model: []const u8) bool {
+    return switch (tool_type) {
+        .cx => classifyModelFamily(model) != .claude,
+        .cc => classifyModelFamily(model) != .openai,
+        .oc, .nb, .ow => true,
+    };
+}
+
 pub const SiteSelectionMode = enum {
     manual_defaults,
     last_used,
@@ -132,7 +166,7 @@ pub const Site = struct {
     models_ow: []const u8 = "",
 
     pub fn effectiveModel(self: Site) []const u8 {
-        if (self.model.len > 0) return self.model;
+        if (self.model.len > 0 and modelCompatibleForTool(self.site_type, self.model)) return self.model;
         return defaultModelForType(self.site_type);
     }
 
@@ -152,7 +186,7 @@ pub const Site = struct {
     /// 3. Default for the tool type
     pub fn effectiveModelForTool(self: Site, tool_type: SiteType) []const u8 {
         const override = self.modelOverrideForTool(tool_type);
-        if (override.len > 0) return override;
+        if (override.len > 0 and modelCompatibleForTool(tool_type, override)) return override;
         if (self.site_type == tool_type) return self.effectiveModel();
         return defaultModelForType(tool_type);
     }
@@ -1274,6 +1308,31 @@ test "effectiveModelForTool with per-tool overrides" {
     try std.testing.expectEqualStrings("gpt-5.4", site.effectiveModelForTool(.cx));
     // Non-configured tool type uses its default
     try std.testing.expectEqualStrings(app.default_model_oc, site.effectiveModelForTool(.oc));
+}
+
+test "effectiveModelForTool does not apply OpenAI model to Claude Code" {
+    const site = Site{
+        .site_type = .cc,
+        .base_url = "",
+        .api_key = "",
+        .model = "gpt5.5",
+    };
+
+    try std.testing.expectEqualStrings(app.default_model_cc, site.effectiveModelForTool(.cc));
+}
+
+test "effectiveModelForTool keeps isolated cc and cx models" {
+    const site = Site{
+        .site_type = .cc,
+        .base_url = "",
+        .api_key = "",
+        .model = "claude-opus-4-7",
+        .models_cx = "gpt5.5",
+        .models_cc = "claude-opus-4-7",
+    };
+
+    try std.testing.expectEqualStrings("claude-opus-4-7", site.effectiveModelForTool(.cc));
+    try std.testing.expectEqualStrings("gpt5.5", site.effectiveModelForTool(.cx));
 }
 
 test "remove frees entry and shifts remaining sites" {
