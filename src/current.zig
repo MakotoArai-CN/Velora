@@ -303,15 +303,15 @@ fn readOpenClawConfig(allocator: std.mem.Allocator) OpenClawConfigFields {
     if (!readFileIntoList(allocator, path, &content)) return .{};
 
     var result: OpenClawConfigFields = .{};
-    var in_velora = false;
+    var in_openclaw_provider = false;
     var line_iter = std.mem.splitScalar(u8, content.items, '\n');
     while (line_iter.next()) |line| {
         const trimmed = std.mem.trim(u8, line, " \t\r");
-        if (std.mem.indexOf(u8, trimmed, "\"velora\"") != null and std.mem.indexOf(u8, trimmed, "{") != null) {
-            in_velora = true;
+        if (isOpenClawProviderStart(trimmed)) {
+            in_openclaw_provider = true;
             continue;
         }
-        if (!in_velora) continue;
+        if (!in_openclaw_provider) continue;
         if (result.base_url == null and std.mem.indexOf(u8, trimmed, "\"baseUrl\"") != null) {
             if (extractJsonLineStringValue(trimmed)) |val| {
                 result.base_url = normalizeBaseUrl(allocator, val) catch null;
@@ -322,10 +322,25 @@ fn readOpenClawConfig(allocator: std.mem.Allocator) OpenClawConfigFields {
             }
         }
         if (std.mem.eql(u8, trimmed, "}") or std.mem.eql(u8, trimmed, "},")) {
-            in_velora = false;
+            in_openclaw_provider = false;
         }
     }
     return result;
+}
+
+fn isOpenClawProviderStart(trimmed: []const u8) bool {
+    if (std.mem.indexOf(u8, trimmed, "{") == null) return false;
+    for (app.openclaw_provider_names) |name| {
+        if (isOpenClawProviderStartNamed(trimmed, name)) return true;
+    }
+    return false;
+}
+
+fn isOpenClawProviderStartNamed(trimmed: []const u8, provider_name: []const u8) bool {
+    if (std.mem.indexOf(u8, trimmed, "{") == null) return false;
+    var needle_buf: [64]u8 = undefined;
+    const needle = std.fmt.bufPrint(&needle_buf, "\"{s}\"", .{provider_name}) catch return false;
+    return std.mem.indexOf(u8, trimmed, needle) != null;
 }
 
 /// Extract the string value after `: "..."` on a single JSON line.
@@ -394,7 +409,7 @@ pub const ToolState = struct {
 };
 
 /// Currently-applied config snapshot for each of the five tools. Used to
-/// attach "[← cc, oc]" style tags to matching sites in `velora ls`.
+/// attach "[← cc, oc]" style tags to matching sites in `avm ls`.
 pub const CurrentTools = struct {
     cx: ToolState = .{},
     cc: ToolState = .{},

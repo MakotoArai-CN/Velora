@@ -1,6 +1,6 @@
-# Velora
+# avm
 
-`Velora` 是一个使用 Zig 编写的多站点 API Key 管理器，用于统一管理并快速切换 Codex、Claude Code、OpenCode 等工具的 API Key 配置。
+`avm` 是一个使用 Zig 编写的多站点 API Key 管理器，用于统一管理并快速切换 Codex、Claude Code、OpenCode 等工具的 API Key 配置。
 
 ## 支持平台
 
@@ -41,97 +41,97 @@ zig build test
 ### Linux x86_64
 
 ```bash
-curl -fsSL -o velora-linux-x86_64 https://github.com/MakotoArai-CN/Velora/releases/latest/download/velora-linux-x86_64 && chmod +x ./velora-linux-x86_64 && ./velora-linux-x86_64 --install
+curl -fsSL -o avm-linux-x86_64 https://github.com/MakotoArai-CN/avm/releases/latest/download/avm-linux-x86_64 && chmod +x ./avm-linux-x86_64 && ./avm-linux-x86_64 --install
 ```
 
 ### Alpine x86_64
 
 ```bash
-curl -fsSL -o velora-alpine-x86_64 https://github.com/MakotoArai-CN/Velora/releases/latest/download/velora-alpine-x86_64 && chmod +x ./velora-alpine-x86_64 && ./velora-alpine-x86_64 --install
+curl -fsSL -o avm-alpine-x86_64 https://github.com/MakotoArai-CN/avm/releases/latest/download/avm-alpine-x86_64 && chmod +x ./avm-alpine-x86_64 && ./avm-alpine-x86_64 --install
 ```
 
 ### macOS Apple Silicon
 
 ```bash
-curl -fsSL -o velora-macos-aarch64 https://github.com/MakotoArai-CN/Velora/releases/latest/download/velora-macos-aarch64 && chmod +x ./velora-macos-aarch64 && ./velora-macos-aarch64 --install
+curl -fsSL -o avm-macos-aarch64 https://github.com/MakotoArai-CN/avm/releases/latest/download/avm-macos-aarch64 && chmod +x ./avm-macos-aarch64 && ./avm-macos-aarch64 --install
 ```
 
 ### FreeBSD x86_64
 
 ```bash
-fetch -o velora-freebsd-x86_64 https://github.com/MakotoArai-CN/Velora/releases/latest/download/velora-freebsd-x86_64 && chmod +x ./velora-freebsd-x86_64 && ./velora-freebsd-x86_64 --install
+fetch -o avm-freebsd-x86_64 https://github.com/MakotoArai-CN/avm/releases/latest/download/avm-freebsd-x86_64 && chmod +x ./avm-freebsd-x86_64 && ./avm-freebsd-x86_64 --install
 ```
 
 ### Windows x86_64
 
 ```powershell
-Invoke-WebRequest https://github.com/MakotoArai-CN/Velora/releases/latest/download/velora-windows-x86_64.exe -OutFile .\velora.exe; .\velora.exe --install
+Invoke-WebRequest https://github.com/MakotoArai-CN/avm/releases/latest/download/avm-windows-x86_64.exe -OutFile .\avm.exe; .\avm.exe --install
 ```
 
 安装完成后，新终端即可直接运行：
 
 ```bash
-velora
+avm
 ```
 
 ## 常用命令
 
 ```bash
 # 添加站点（交互式）
-velora add <别名>
+avm add <别名>
 
 # 添加站点（直接指定，可选自定义模型）
-velora add <类型> <别名> <URL> <Key> [模型]
+avm add <类型> <别名> <URL> <Key> [模型]
 
 # 编辑 / 删除站点
-velora edit <别名>
-velora del <别名>
+avm edit <别名>
+avm del <别名>
 
 # 查看站点列表（并行连通性检测，并标记当前使用的工具）
-velora list          # 或 velora ls
-velora list -g       # 全局检测（包含已归档站点）
-velora list all
+avm list          # 或 avm ls
+avm list -g       # 全局检测（包含已归档站点）
+avm list all
 
 # 应用站点配置到指定工具
-velora use <别名> [模型]              # 自动检测类型，可选覆盖模型
-velora use <类型> <别名> [模型]       # 指定目标工具，可选覆盖模型
-velora cx <别名> [模型]               # 应用到 Codex
-velora cc <别名> [模型]               # 应用到 Claude Code
-velora oc <别名> [模型]               # 应用到 OpenCode
-velora nb <别名> [模型]               # 应用到 Nanobot
-velora ow <别名> [模型]               # 应用到 OpenClaw
+avm use <别名> [模型]              # 自动检测类型，可选覆盖模型
+avm use <类型> <别名> [模型]       # 指定目标工具，可选覆盖模型
+avm cx <别名> [模型]               # 应用到 Codex
+avm cc <别名> [模型]               # 应用到 Claude Code
+avm oc <别名> [模型]               # 应用到 OpenCode
+avm nb <别名> [模型]               # 应用到 Nanobot
+avm ow <别名> [模型]               # 应用到 OpenClaw
 
 # 浏览站点的全部模型
-velora models <别名>      # 或 velora m <别名>
+avm models <别名>      # 或 avm m <别名>
 
 # CC Switch 配置导入 / 导出
-velora import ccs [配置文件]                  # 默认读取 ~/.ccs/config.yaml
-velora export ccs [配置文件或目录]             # 默认写入 ~/.ccs/config.yaml
+avm import ccs [配置文件]                  # 默认读取 ~/.ccs/config.yaml
+avm export ccs [配置文件或目录]             # 默认写入 ~/.ccs/config.yaml
 
 # 全自动模型调用测试 / 性能基准
-velora test                                 # 并行测试所有站点的模型可调用性
-velora test <别名>                          # 测试单个站点
-velora test --perf                          # 性能基准（交互式选站，按工具类型筛选）
+avm test                                 # 并行测试所有站点的模型可调用性
+avm test <别名>                          # 测试单个站点
+avm test --perf                          # 性能基准（交互式选站，按工具类型筛选）
 
 # 设置选项
-velora set model_check off                  # 或 velora s mc off
-velora set list_latency off                 # 或 velora s ll off
-velora set auto_archive on                  # 或 velora s aa on
-velora set auto_pick_compatible_model off   # 或 velora s ap off
-velora set auto_load_models off             # 或 velora s alm off
-velora set model_select_mode keyboard       # 或 velora s msm keyboard
-velora set model_call_timeout_ms 60000      # 或 velora s mt 60000
+avm set model_check off                  # 或 avm s mc off
+avm set list_latency off                 # 或 avm s ll off
+avm set auto_archive on                  # 或 avm s aa on
+avm set auto_pick_compatible_model off   # 或 avm s ap off
+avm set auto_load_models off             # 或 avm s alm off
+avm set model_select_mode keyboard       # 或 avm s msm keyboard
+avm set model_call_timeout_ms 60000      # 或 avm s mt 60000
 
 # 帮助 / 用法示例
-velora --help                               # 命令参数速查
-velora help examples                        # 完整用法示例
+avm --help                               # 命令参数速查
+avm help examples                        # 完整用法示例
 
 # 安装 / 卸载
-velora install
-velora uninstall
+avm install
+avm uninstall
 
 # 检查并自动更新
-velora --update
+avm --update
 ```
 
 ### 命令缩写
@@ -160,31 +160,31 @@ velora --update
 ## 用法示例
 
 ```bash
-velora add openai
-velora add cx openai https://api.example.com/v1 sk-xxx
-velora add cc claude https://api.example.com sk-ant claude-opus-4-6
-velora use openai
-velora use cc openai claude-opus-4-6
-velora oc openai claude-haiku-4-5-20251001
-velora nb openai
-velora ow openai
-velora import ccs ~/.ccs/config.yaml          # 导入 CC Switch 配置
-velora export ccs ~/.ccs/config.yaml          # 导出为 CC Switch 配置
-velora m openai                              # 浏览 openai 站点的全部模型
-velora t                                     # 并行测试所有站点的模型
-velora t openai                              # 测试单个站点（带 spinner 进度）
-velora t --perf                              # 交互式选择站点 + 性能基准
-velora s mc off                              # 关闭模型检测，use 更快
-velora s ap off                              # 关闭类型不匹配时的自动兼容模型选择
-velora s alm off                             # 关闭添加/编辑时自动加载模型列表
-velora s msm keyboard                        # 使用方向键选择模型
-velora s mt 60000                            # 将模型调用测试超时设为 60 秒
-velora help examples                         # 完整示例
+avm add openai
+avm add cx openai https://api.example.com/v1 sk-xxx
+avm add cc claude https://api.example.com sk-ant claude-opus-4-6
+avm use openai
+avm use cc openai claude-opus-4-6
+avm oc openai claude-haiku-4-5-20251001
+avm nb openai
+avm ow openai
+avm import ccs ~/.ccs/config.yaml          # 导入 CC Switch 配置
+avm export ccs ~/.ccs/config.yaml          # 导出为 CC Switch 配置
+avm m openai                              # 浏览 openai 站点的全部模型
+avm t                                     # 并行测试所有站点的模型
+avm t openai                              # 测试单个站点（带 spinner 进度）
+avm t --perf                              # 交互式选择站点 + 性能基准
+avm s mc off                              # 关闭模型检测，use 更快
+avm s ap off                              # 关闭类型不匹配时的自动兼容模型选择
+avm s alm off                             # 关闭添加/编辑时自动加载模型列表
+avm s msm keyboard                        # 使用方向键选择模型
+avm s mt 60000                            # 将模型调用测试超时设为 60 秒
+avm help examples                         # 完整示例
 ```
 
 ## 当前使用工具识别（list 中的 `[← cc, oc]` 标签）
 
-`velora list` 在每个站点行尾会显示一个加粗的标签，列出当前正指向该站点的工具，例如：
+`avm list` 在每个站点行尾会显示一个加粗的标签，列出当前正指向该站点的工具，例如：
 
 ```
   ✓ openai (Claude Code) 234ms [← cc, oc]
@@ -196,7 +196,7 @@ velora help examples                         # 完整示例
 
 ## URL 处理规则
 
-Velora 会保存用户输入的 `base_url`，不会在站点配置里随意追加、替换或删除路径。这样可以避免误伤使用路径区分协议的站点，例如：
+avm 会保存用户输入的 `base_url`，不会在站点配置里随意追加、替换或删除路径。这样可以避免误伤使用路径区分协议的站点，例如：
 
 ```text
 https://relay.example.com/openai
@@ -207,18 +207,18 @@ https://relay.example.com/anthropic
 
 Claude Code 的 `ANTHROPIC_BASE_URL` 始终按站点保存的 URL 原样写入。对于同一服务用不同路径区分 OpenAI / Anthropic 协议的情况，建议分别保存为两个站点别名，或在应用到目标工具前确认目标工具需要的路径。
 
-`velora list` 的当前使用识别会把根路径和仅差一个结尾 `/v1` 的 URL 视为同一站点，避免因为 Codex 侧派生 `/v1` 导致 `[← cx]` 标签丢失。
+`avm list` 的当前使用识别会把根路径和仅差一个结尾 `/v1` 的 URL 视为同一站点，避免因为 Codex 侧派生 `/v1` 导致 `[← cx]` 标签丢失。
 
 ## 并行连通性检测
 
-`velora list` 的连通性检测会并行执行：每个站点独占一个工作线程，主线程轮询 `done` 标志并按到达顺序刷新对应行。整体耗时由"最慢的那个站点"决定（默认 15 秒超时上限），不再随站点数线性增长。
+`avm list` 的连通性检测会并行执行：每个站点独占一个工作线程，主线程轮询 `done` 标志并按到达顺序刷新对应行。整体耗时由"最慢的那个站点"决定（默认 15 秒超时上限），不再随站点数线性增长。
 
 ## 模型调用测试与性能基准（v1.1.8 新增）
 
 ```bash
-velora t              # 并行测试所有未归档站点的模型可调用性
-velora t openai       # 单站点测试（单行 spinner，结束后被结果替换）
-velora t --perf       # 性能基准模式：交互选择站点 → 并行 benchmark
+avm t              # 并行测试所有未归档站点的模型可调用性
+avm t openai       # 单站点测试（单行 spinner，结束后被结果替换）
+avm t --perf       # 性能基准模式：交互选择站点 → 并行 benchmark
 ```
 
 - 默认模式调用 `testModelCall`，根据模型族（Claude / OpenAI / 未知）自动尝试 `/v1/messages`、`/v1/chat/completions`、`/v1/responses` 三种接口。
@@ -228,7 +228,7 @@ velora t --perf       # 性能基准模式：交互选择站点 → 并行 bench
 
 ## use 时的模型检测优化（v1.1.8）
 
-`velora use` 不再因为 `/v1/models` 端点受限而误报"无法检测模型（可能需要认证）"。新流程：
+`avm use` 不再因为 `/v1/models` 端点受限而误报"无法检测模型（可能需要认证）"。新流程：
 
 1. 先做一次真实模型调用测试。
 2. 再尝试列出 `/v1/models`。
@@ -236,36 +236,36 @@ velora t --perf       # 性能基准模式：交互选择站点 → 并行 bench
 
 ## 编辑后自动重新应用
 
-`velora edit <别名>` 修改站点配置（URL / Key / 模型 / 类型）后，会自动检测当前哪些工具正在使用该站点（基于编辑前的 `base_url` / `api_key` 与各工具配置文件 / 环境变量的匹配），并将更新后的配置实时写回这些工具的配置文件。**无需在 edit 之后再手动执行 `use`。**
+`avm edit <别名>` 修改站点配置（URL / Key / 模型 / 类型）后，会自动检测当前哪些工具正在使用该站点（基于编辑前的 `base_url` / `api_key` 与各工具配置文件 / 环境变量的匹配），并将更新后的配置实时写回这些工具的配置文件。**无需在 edit 之后再手动执行 `use`。**
 
-例如：当前 `cx` 正在使用 `yuchen` 站点，执行 `velora edit yuchen` 修改 URL 或 Key 之后，`~/.codex/config.toml` 与 `OPENAI_API_KEY` 环境变量会被同步刷新。如果同一个站点同时被多个工具使用（例如 `cx` 与 `cc` 同时指向 `yuchen`），所有匹配工具都会被一并更新。
+例如：当前 `cx` 正在使用 `yuchen` 站点，执行 `avm edit yuchen` 修改 URL 或 Key 之后，`~/.codex/config.toml` 与 `OPENAI_API_KEY` 环境变量会被同步刷新。如果同一个站点同时被多个工具使用（例如 `cx` 与 `cc` 同时指向 `yuchen`），所有匹配工具都会被一并更新。
 
-匹配逻辑与 `velora list` 中的 `[← cc, oc]` 标签完全一致——通过 `base_url` 或 `api_key` 任一命中即视为匹配（兼容用户手动改 URL 后仍能识别的情况）。
+匹配逻辑与 `avm list` 中的 `[← cc, oc]` 标签完全一致——通过 `base_url` 或 `api_key` 任一命中即视为匹配（兼容用户手动改 URL 后仍能识别的情况）。
 
 ## 单站点应用到多个工具
 
 同一个站点可以同时配置为多个工具的默认目标（站点结构中的 `default_tools_mask` 是位掩码，覆盖 `cx` / `cc` / `oc` / `nb` / `ow`）。
 
-- 当一个站点的 `default_tools_mask` 包含多个工具时，运行 `velora use <别名>`（不指定具体工具）会依次将该站点应用到所有勾选的工具
-- 显式 `velora cx <别名>` / `velora cc <别名>` 等命令仍可单独应用到指定工具
+- 当一个站点的 `default_tools_mask` 包含多个工具时，运行 `avm use <别名>`（不指定具体工具）会依次将该站点应用到所有勾选的工具
+- 显式 `avm cx <别名>` / `avm cc <别名>` 等命令仍可单独应用到指定工具
 - 每个工具可单独保存模型覆盖（`models_cx` / `models_cc` / `models_oc` / `models_nb` / `models_ow`），auto-reapply 时会按工具读取各自的模型
-- `velora list` 中 `[← cx, cc]` 这类标签会同时列出所有正在使用该站点的工具
+- `avm list` 中 `[← cx, cc]` 这类标签会同时列出所有正在使用该站点的工具
 
 ## CC Switch 导入 / 导出
 
-Velora 支持和 CC Switch 的配置互通：
+avm 支持和 CC Switch 的配置互通：
 
 ```bash
-velora import ccs                         # 默认读取 ~/.ccs/config.yaml
-velora import ccs ~/.ccs/config.yaml
-velora export ccs                         # 默认写入 ~/.ccs/config.yaml
-velora export ccs ~/.ccs                  # 写入指定目录下的 config.yaml
-velora export ccs ./config.yaml
+avm import ccs                         # 默认读取 ~/.ccs/config.yaml
+avm import ccs ~/.ccs/config.yaml
+avm export ccs                         # 默认写入 ~/.ccs/config.yaml
+avm export ccs ~/.ccs                  # 写入指定目录下的 config.yaml
+avm export ccs ./config.yaml
 ```
 
-导入时，Velora 会读取 `profiles` 中的 `settings_file` / `settings`，并从对应 JSON 的 `env` 中提取 `ANTHROPIC_AUTH_TOKEN`、`ANTHROPIC_BASE_URL`、`ANTHROPIC_MODEL` 或 `ANTHROPIC_DEFAULT_*_MODEL`。导入结果会保存为 `cc` 可用站点，并写入独立的 `models_cc`，不会把 GPT 系列模型作为 Claude Code 默认模型。
+导入时，avm 会读取 `profiles` 中的 `settings_file` / `settings`，并从对应 JSON 的 `env` 中提取 `ANTHROPIC_AUTH_TOKEN`、`ANTHROPIC_BASE_URL`、`ANTHROPIC_MODEL` 或 `ANTHROPIC_DEFAULT_*_MODEL`。导入结果会保存为 `cc` 可用站点，并写入独立的 `models_cc`，不会把 GPT 系列模型作为 Claude Code 默认模型。
 
-导出时，Velora 会生成 CCS 的 `config.yaml` 和每个 profile 对应的 `.settings.json`。只有 Claude Code 兼容的站点会被导出；GPT / OpenAI 系列模型不会被导出为 CC profile，避免后续在 Claude Code 中误用。
+导出时，avm 会生成 CCS 的 `config.yaml` 和每个 profile 对应的 `.settings.json`。只有 Claude Code 兼容的站点会被导出；GPT / OpenAI 系列模型不会被导出为 CC profile，避免后续在 Claude Code 中误用。
 
 ## 模型配置
 
@@ -285,19 +285,19 @@ velora export ccs ./config.yaml
 
 ## 归档与全局检测
 
-- `velora list`：仅检查未归档站点
-- `velora list -g`：检查全部站点，包括已归档站点
+- `avm list`：仅检查未归档站点
+- `avm list -g`：检查全部站点，包括已归档站点
 - `auto_archive` 开启后，不可达站点会自动归档
 - 已归档站点在全局检测中恢复可用时会自动取消归档
-- `velora list all` 会显示详细信息，并保留归档状态展示
+- `avm list all` 会显示详细信息，并保留归档状态展示
 
 ## 用户数据位置
 
-- `~/.velora/sites.json`：站点配置（类型、URL、API Key、主模型、按工具模型覆盖、归档状态、多工具默认设置）
-- `~/.velora/bin`：已安装的可执行文件
+- `~/.avm/sites.json`：站点配置（类型、URL、API Key、主模型、按工具模型覆盖、归档状态、多工具默认设置）
+- `~/.avm/bin`：已安装的可执行文件
 
 ## LICENSE
 
 本项目使用 [AGPL-3.0](LICENSE) 协议，未经允许不得用于商业用途，二次修改请务必保留版权声明。
 
-[![Star History Chart](https://api.star-history.com/svg?repos=MakotoArai-CN/Velora&type=date&legend=top-left)](https://www.star-history.com/#MakotoArai-CN/Velora&type=date&legend=top-left)
+[![Star History Chart](https://api.star-history.com/svg?repos=MakotoArai-CN/avm&type=date&legend=top-left)](https://www.star-history.com/#MakotoArai-CN/avm&type=date&legend=top-left)

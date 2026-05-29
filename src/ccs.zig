@@ -334,7 +334,7 @@ fn sanitizeProfileName(allocator: std.mem.Allocator, alias: []const u8) ![]u8 {
         const ok = std.ascii.isAlphanumeric(ch) or ch == '-' or ch == '_' or ch == '.';
         try out.append(allocator, if (ok) ch else '_');
     }
-    if (out.items.len == 0) try out.appendSlice(allocator, "velora");
+    if (out.items.len == 0) try out.appendSlice(allocator, app.command_name);
     return out.toOwnedSlice(allocator);
 }
 

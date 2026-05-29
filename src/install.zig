@@ -272,7 +272,7 @@ fn updatePathShellFile(allocator: std.mem.Allocator, path: []const u8, bin_dir: 
     var line_iter = std.mem.splitScalar(u8, content.items, '\n');
     while (line_iter.next()) |line| {
         const trimmed = std.mem.trim(u8, line, " \t\r");
-        if (std.mem.eql(u8, trimmed, app.path_marker)) {
+        if (std.mem.eql(u8, trimmed, app.path_marker) or std.mem.eql(u8, trimmed, app.legacy_path_marker)) {
             found_marker = true;
             _ = line_iter.next();
             continue;

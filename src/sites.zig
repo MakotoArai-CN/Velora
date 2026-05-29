@@ -509,13 +509,8 @@ pub const SitesStore = struct {
 };
 
 pub fn getSitesFilePath(allocator: std.mem.Allocator) ![]u8 {
-    const home = config_mod.getHomeDir(allocator) orelse return error.NoHomeDir;
-    defer allocator.free(home);
-    const dir = try std.fs.path.join(allocator, &.{ home, app.config_dir_name });
+    const dir = try config_mod.ensureAppDir(allocator);
     defer allocator.free(dir);
-
-    // Ensure directory exists
-    try io_compat.makeDirIfMissing(dir);
 
     return try std.fs.path.join(allocator, &.{ dir, app.sites_filename });
 }

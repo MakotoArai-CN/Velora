@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Velora is a multi-site API Key manager written in Zig. It manages and switches API Key configurations for Codex (`cx`), Claude Code (`cc`), OpenCode (`oc`), Nanobot (`nb`), and OpenClaw (`ow`) across their respective config files.
+avm is a multi-site API Key manager written in Zig. It manages and switches API Key configurations for Codex (`cx`), Claude Code (`cc`), OpenCode (`oc`), Nanobot (`nb`), and OpenClaw (`ow`) across their respective config files.
 
 ## Build & Test Commands
 
@@ -20,14 +20,14 @@ The build system cross-compiles for 18 targets (Linux, Alpine/musl, Windows, mac
 ## Architecture
 
 - **Entry point**: `src/main.zig` — wires CLI parsing to command handlers (`runAdd`, `runEdit`, `runDel`, `runList`, `runUse`, `runModels`, `runModelTest`, `runInstall`, `runUpdate`). Also contains interactive input helpers and the version constant. `runList` runs connectivity checks in parallel via heap-allocated `CheckTask` (refcount-2) workers and repaints rows in place. `runModelTest` does the same with `ModelTestTask` workers and a spinner animation. `runEdit` after saving will load `CurrentTools`, match the *old* `base_url`/`api_key` against live tool configs, and auto-reapply the updated site to every matching tool (no separate `use` needed). The match runs against pre-edit values so URL/key changes still find the right tools.
-- **`src/cli.zig`** — Argument parsing. Produces a `Config` struct with a `Command` tagged union. No external arg-parsing library. Help is split: `printHelp` shows commands/options + a hint, `printExamples` (invoked via `velora help examples` or `--examples`) shows the full usage examples.
+- **`src/cli.zig`** — Argument parsing. Produces a `Config` struct with a `Command` tagged union. No external arg-parsing library. Help is split: `printHelp` shows commands/options + a hint, `printExamples` (invoked via `avm help examples` or `--examples`) shows the full usage examples.
 - **`src/app.zig`** — Compile-time constants: app name, config paths, GitHub repo URL, default models per tool type.
-- **`src/sites.zig`** — `SitesStore` (fixed-capacity array of up to 64 sites), JSON load/save for `~/.velora/sites.json`. Manual JSON parsing (no std.json). Per-site multi-tool defaults (`default_tools_mask`), per-tool model overrides (`models_cx`/`cc`/`oc`/`nb`/`ow`), selection mode, and settings management.
+- **`src/sites.zig`** — `SitesStore` (fixed-capacity array of up to 64 sites), JSON load/save for `~/.avm/sites.json`. Manual JSON parsing (no std.json). Per-site multi-tool defaults (`default_tools_mask`), per-tool model overrides (`models_cx`/`cc`/`oc`/`nb`/`ow`), selection mode, and settings management.
 - **`src/apply.zig`** — Writes site configs to target tool config files: Codex TOML (`~/.codex/config.toml`), Claude Code JSON (`~/.claude/settings.json`), OpenCode JSON (`~/.config/opencode/opencode.json`), Nanobot JSON (`~/.nanobot/config.json`), OpenClaw JSON (`~/.openclaw/openclaw.json`). Line-by-line text manipulation.
 - **`src/check.zig`** — HTTP connectivity checks, model detection, model family classification, compatibility checks, model call testing (`testModelCall`), and benchmark POST (`benchmarkModel` returning `BenchResult` with `tokens_per_sec` parsed from `usage.completion_tokens`/`usage.output_tokens`). Uses heap-allocated refcounted contexts for thread+timeout patterns. `checkConnectivityInner` is `pub` so parallel workers can call it directly.
 - **`src/current.zig`** — Reads each tool's currently-applied config (Codex TOML proxy section, Claude Code env block, OpenCode/Nanobot/OpenClaw JSON provider sections) and exposes `CurrentTools.matchSite(base_url, api_key)` returning a `u8` bitmask of tools currently pointed at a given site. Match succeeds on either base_url or api_key (handles URL drift while keys stay consistent).
 - **`src/env.zig`** — Cross-platform environment variable persistence (writes to shell profile on POSIX, registry on Windows).
-- **`src/install.zig`** — Self-install/uninstall to `~/.velora/bin` with PATH management.
+- **`src/install.zig`** — Self-install/uninstall to `~/.avm/bin` with PATH management.
 - **`src/update.zig`** — GitHub releases API check and self-update.
 - **`src/i18n.zig`** — Trilingual support (en/zh/ja) with OS locale detection. `tr()` function takes all three translations inline.
 - **`src/output.zig`** — Terminal output formatting with Miku-themed colors.
@@ -51,7 +51,7 @@ Minimum Zig version: **0.16.0** (specified in `build.zig.zon`).
 
 ### 0.16 migration notes
 
-The 0.16 "I/O as an Interface" rework moved file I/O, environment variables, process spawning, sleep, and timestamps into the `std.Io` namespace. Velora wraps these in `src/io_compat.zig`, which stores the `init.io` instance passed to `main` and exposes helpers (`readFileIntoList`, `writeFileAll`, `makeDirIfMissing`, `pathExists`, `getEnv`, `selfExePath`, `milliTimestamp`, `sleepNs`, `stdoutWriter`/`stderrWriter`, etc). Most modules call the helpers rather than `std.Io` directly to keep call sites short.
+The 0.16 "I/O as an Interface" rework moved file I/O, environment variables, process spawning, sleep, and timestamps into the `std.Io` namespace. avm wraps these in `src/io_compat.zig`, which stores the `init.io` instance passed to `main` and exposes helpers (`readFileIntoList`, `writeFileAll`, `makeDirIfMissing`, `pathExists`, `getEnv`, `selfExePath`, `milliTimestamp`, `sleepNs`, `stdoutWriter`/`stderrWriter`, etc). Most modules call the helpers rather than `std.Io` directly to keep call sites short.
 
 Notable cascading changes:
 - `pub fn main` now takes `init: std.process.Init` so Zig 0.16 can hand env vars, args, and the application `Io` explicitly. `main` calls `io_compat.setIo(init.io)` and `io_compat.setEnvironMap(init.environ_map)` once at startup so helpers can resolve I/O and env lookups.

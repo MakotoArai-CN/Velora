@@ -21,11 +21,18 @@ pub fn getAppDir(allocator: std.mem.Allocator) ![]u8 {
     return try std.fs.path.join(allocator, &.{ home, app.config_dir_name });
 }
 
+pub fn getLegacyAppDir(allocator: std.mem.Allocator) ![]u8 {
+    const home = getHomeDir(allocator) orelse return error.NoHomeDir;
+    defer allocator.free(home);
+    return try std.fs.path.join(allocator, &.{ home, app.legacy_config_dir_name });
+}
+
 pub fn ensureAppDir(allocator: std.mem.Allocator) ![]u8 {
     const app_dir = try getAppDir(allocator);
     errdefer allocator.free(app_dir);
 
     try io_compat.makeDirIfMissing(app_dir);
+    try copyLegacySitesIfMissing(allocator, app_dir);
     return app_dir;
 }
 
@@ -46,6 +53,24 @@ pub fn getInstalledExecutablePath(allocator: std.mem.Allocator) ![]u8 {
     const bin_dir = try getInstallBinDir(allocator);
     defer allocator.free(bin_dir);
     return try std.fs.path.join(allocator, &.{ bin_dir, app.executableName() });
+}
+
+fn copyLegacySitesIfMissing(allocator: std.mem.Allocator, app_dir: []const u8) !void {
+    const target_path = try std.fs.path.join(allocator, &.{ app_dir, app.sites_filename });
+    defer allocator.free(target_path);
+    if (io_compat.pathExists(target_path)) return;
+
+    const legacy_dir = getLegacyAppDir(allocator) catch return;
+    defer allocator.free(legacy_dir);
+
+    const legacy_path = try std.fs.path.join(allocator, &.{ legacy_dir, app.sites_filename });
+    defer allocator.free(legacy_path);
+    if (!io_compat.pathExists(legacy_path)) return;
+
+    io_compat.copyFileAbsolute(legacy_path, target_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
 }
 
 fn makeNestedDir(path: []const u8) !void {

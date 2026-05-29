@@ -44,7 +44,7 @@ pub fn main(init: std.process.Init) !void {
                 var stderr_buffer: [512]u8 = undefined;
                 var stderr_writer: std.Io.File.Writer = undefined;
                 const w = io_compat.stderrWriter(&stderr_buffer, &stderr_writer);
-                w.print("Invalid argument. Use 'velora --help' for usage.\n", .{}) catch {};
+                w.print("Invalid argument. Use 'avm --help' for usage.\n", .{}) catch {};
                 w.flush() catch {};
                 return;
             },
@@ -397,7 +397,7 @@ fn runList(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermC
     defer store.deinit(allocator);
 
     if (store.count == 0) {
-        try output.printInfo(w, i18n.tr(lang, "No sites configured. Use 'velora add<alias>' to add one.", "未配置站点，使用 'velora add<别名>' 添加", "サイトが未設定です。'velora add<エイリアス>' で追加してください"), caps);
+        try output.printInfo(w, i18n.tr(lang, "No sites configured. Use 'avm add<alias>' to add one.", "未配置站点，使用 'avm add<别名>' 添加", "サイトが未設定です。'avm add<エイリアス>' で追加してください"), caps);
         try w.flush();
         return;
     }
@@ -475,7 +475,7 @@ fn runList(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermC
     }
 
     if (check_count == 0) {
-        try output.printInfo(w, i18n.tr(lang, "No active sites. Use 'velora list -g' to check archived sites.", "无活跃站点。使用 'velora list -g' 检查已归档站点", "アクティブなサイトがありません。'velora list -g' でアーカイブ済みサイトを確認"), caps);
+        try output.printInfo(w, i18n.tr(lang, "No active sites. Use 'avm list -g' to check archived sites.", "无活跃站点。使用 'avm list -g' 检查已归档站点", "アクティブなサイトがありません。'avm list -g' でアーカイブ済みサイトを確認"), caps);
         try w.flush();
         return;
     }
@@ -1916,7 +1916,7 @@ fn repaintModelTestRowFinal(
     try w.print("{s}", .{down});
 }
 
-/// Interactive picker for `velora test --perf`. Prompts the user for an
+/// Interactive picker for `avm test --perf`. Prompts the user for an
 /// optional tool-type filter, then a comma-separated list of site indices
 /// (or "a"/"all" for everything in the filtered set).
 /// Writes selected indices into `out` (sliced from the store) and returns
@@ -2118,7 +2118,7 @@ fn runUninstall(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.
 fn runVersion(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.TermCaps, lang: i18n.Language) !void {
     // Print version only - clean single line
     var ver_buf: [128]u8 = undefined;
-    const ver_msg = std.fmt.bufPrint(&ver_buf, "VELORA v{s} - {s}", .{
+    const ver_msg = std.fmt.bufPrint(&ver_buf, "avm v{s} - {s}", .{
         version,
         i18n.tr(lang, "Multi-Site API Key Manager", "多站点 API Key 管理器", "マルチサイト APIキー マネージャー"),
     }) catch version;
@@ -2137,7 +2137,7 @@ fn runVersion(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: terminal.Te
     if (info.has_update) {
         const latest = info.latest_version orelse "?";
         var msg_buf: [128]u8 = undefined;
-        const msg = std.fmt.bufPrint(&msg_buf, "{s} v{s} {s} (velora --update)", .{
+        const msg = std.fmt.bufPrint(&msg_buf, "{s} v{s} {s} (avm --update)", .{
             i18n.tr(lang, "New version available:", "有新版本:", "新バージョンあり:"),
             latest,
             i18n.tr(lang, "available", "待更新", "利用可能"),

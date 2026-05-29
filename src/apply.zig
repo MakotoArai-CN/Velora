@@ -985,7 +985,7 @@ pub fn applyToOpenClaw(allocator: std.mem.Allocator, w: *std.Io.Writer, caps: te
     var masked_buf: [64]u8 = undefined;
     const masked = sites_mod.maskKey(&masked_buf, site.api_key);
     var info_buf: [128]u8 = undefined;
-    const info = std.fmt.bufPrint(&info_buf, "models.providers.velora.apiKey = {s}", .{masked}) catch "?";
+    const info = std.fmt.bufPrint(&info_buf, "models.providers.{s}.apiKey = {s}", .{ app.openclaw_provider_name, masked }) catch "?";
     try output.printSuccess(w, info, caps);
     try output.printKeyValue(w, "Base URL:", base_url, caps);
     try output.printKeyValue(w, "Model:", model, caps);
@@ -1019,6 +1019,7 @@ fn updateOpenClawConfig(allocator: std.mem.Allocator, api_key: []const u8, base_
     // For OpenClaw, rewrite the whole file with updated provider and model
     // This is simpler than line-by-line editing for the nested JSON5 structure
     const content = existing.items;
+    const has_current_provider = hasOpenClawProvider(content, app.openclaw_provider_name);
 
     // Try to update "primary" field under agents.defaults.model
     var result: std.ArrayListUnmanaged(u8) = .empty;
@@ -1026,16 +1027,20 @@ fn updateOpenClawConfig(allocator: std.mem.Allocator, api_key: []const u8, base_
 
     // For existing files, do line-by-line replacement of known fields
     var line_iter = std.mem.splitScalar(u8, content, '\n');
-    var in_velora_provider = false;
+    var in_openclaw_provider = false;
     while (line_iter.next()) |line| {
         const trimmed = std.mem.trim(u8, line, " \t\r");
 
-        // Track if we're inside a "velora" provider block
-        if (std.mem.indexOf(u8, trimmed, "\"velora\"") != null and std.mem.indexOf(u8, trimmed, "{") != null) {
-            in_velora_provider = true;
+        if (isOpenClawProviderStart(trimmed)) {
+            in_openclaw_provider = true;
+            if (!has_current_provider and isOpenClawProviderStartNamed(trimmed, app.legacy_openclaw_provider_name)) {
+                try appendOpenClawProviderLine(allocator, &result, line, app.openclaw_provider_name);
+                if (line_iter.peek() != null) try result.append(allocator, '\n');
+                continue;
+            }
         }
 
-        if (in_velora_provider) {
+        if (in_openclaw_provider) {
             if (std.mem.indexOf(u8, trimmed, "\"apiKey\"") != null) {
                 const trailing_comma = trimmed.len > 0 and trimmed[trimmed.len - 1] == ',';
                 try result.appendSlice(allocator, "        \"apiKey\": \"");
@@ -1054,9 +1059,8 @@ fn updateOpenClawConfig(allocator: std.mem.Allocator, api_key: []const u8, base_
                 if (line_iter.peek() != null) try result.append(allocator, '\n');
                 continue;
             }
-            // End of velora provider block
             if (std.mem.eql(u8, trimmed, "}") or std.mem.eql(u8, trimmed, "},")) {
-                in_velora_provider = false;
+                in_openclaw_provider = false;
             }
         }
 
@@ -1071,7 +1075,7 @@ fn updateOpenClawConfig(allocator: std.mem.Allocator, api_key: []const u8, base_
             const indent = indent_buf[0..@min(indent_count, 32)];
             @memset(indent, ' ');
             var model_val_buf: [512]u8 = undefined;
-            const model_val = providerModelRef(&model_val_buf, "velora", model);
+            const model_val = providerModelRef(&model_val_buf, app.openclaw_provider_name, model);
             var line_buf: [512]u8 = undefined;
             const new_line = std.fmt.bufPrint(&line_buf, "{s}\"primary\": \"{s}\"{s}", .{
                 indent, model_val, if (trailing_comma) "," else "",
@@ -1093,12 +1097,14 @@ fn writeNewOpenClawConfig(allocator: std.mem.Allocator, path: []const u8, api_ke
     defer out.deinit(allocator);
 
     var model_val_buf: [512]u8 = undefined;
-    const model_val = providerModelRef(&model_val_buf, "velora", model);
+    const model_val = providerModelRef(&model_val_buf, app.openclaw_provider_name, model);
 
     try out.appendSlice(allocator, "{\n" ++
         "  \"models\": {\n" ++
         "    \"providers\": {\n" ++
-        "      \"velora\": {\n");
+        "      \"");
+    try out.appendSlice(allocator, app.openclaw_provider_name);
+    try out.appendSlice(allocator, "\": {\n");
     try out.appendSlice(allocator, "        \"baseUrl\": \"");
     try out.appendSlice(allocator, base_url);
     try out.appendSlice(allocator, "\",\n");
@@ -1121,6 +1127,38 @@ fn writeNewOpenClawConfig(allocator: std.mem.Allocator, path: []const u8, api_ke
         "}\n");
 
     try io_compat.writeFileAll(path, out.items);
+}
+
+fn isOpenClawProviderStart(trimmed: []const u8) bool {
+    if (std.mem.indexOf(u8, trimmed, "{") == null) return false;
+    for (app.openclaw_provider_names) |name| {
+        if (isOpenClawProviderStartNamed(trimmed, name)) return true;
+    }
+    return false;
+}
+
+fn isOpenClawProviderStartNamed(trimmed: []const u8, provider_name: []const u8) bool {
+    if (std.mem.indexOf(u8, trimmed, "{") == null) return false;
+    var needle_buf: [64]u8 = undefined;
+    const needle = std.fmt.bufPrint(&needle_buf, "\"{s}\"", .{provider_name}) catch return false;
+    return std.mem.indexOf(u8, trimmed, needle) != null;
+}
+
+fn hasOpenClawProvider(content: []const u8, provider_name: []const u8) bool {
+    var needle_buf: [64]u8 = undefined;
+    const needle = std.fmt.bufPrint(&needle_buf, "\"{s}\"", .{provider_name}) catch return false;
+    return std.mem.indexOf(u8, content, needle) != null;
+}
+
+fn appendOpenClawProviderLine(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), original_line: []const u8, provider_name: []const u8) !void {
+    var indent_count: usize = 0;
+    for (original_line) |ch| {
+        if (ch == ' ') indent_count += 1 else break;
+    }
+    try out.appendNTimes(allocator, ' ', indent_count);
+    try out.append(allocator, '"');
+    try out.appendSlice(allocator, provider_name);
+    try out.appendSlice(allocator, "\": {");
 }
 
 test "normalizeOpenAIBaseUrl appends v1 when missing" {

@@ -1,6 +1,6 @@
 //! Compatibility shims for Zig 0.16's I/O-as-Interface migration.
 //!
-//! Most of Velora's I/O is synchronous and would gain nothing from explicit async
+//! Most of avm's I/O is synchronous and would gain nothing from explicit async
 //! control flow. To minimize signature churn from the 0.15->0.16 migration, we
 //! keep the call sites routed through this module while using the `Io` instance
 //! that Zig passes to `main` at startup.

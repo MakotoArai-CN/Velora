@@ -1,5 +1,5 @@
 const std = @import("std");
-const app_name = "velora";
+const app_name = "avm";
 const version = parseZonVersion();
 
 fn parseZonVersion() []const u8 {
@@ -116,7 +116,7 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| {
         run_cmd.addArgs(args);
     }
-    const run_step = b.step("run", "Run velora (native)");
+    const run_step = b.step("run", "Run avm (native)");
     run_step.dependOn(&run_cmd.step);
 
     const test_module = b.createModule(.{
@@ -127,7 +127,7 @@ pub fn build(b: *std.Build) void {
     addVersionModule(b, test_module);
 
     const exe_unit_tests = b.addTest(.{
-        .name = "velora-test",
+        .name = "avm-test",
         .root_module = test_module,
     });
 

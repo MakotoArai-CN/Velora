@@ -143,7 +143,7 @@ pub fn parseArgs(_: std.mem.Allocator, raw_argv: []const [:0]const u8) ParseErro
     var config: Config = .{ .language = lang, .command = .help };
 
     if (eql(sub, "-h") or eql(sub, "--help") or eql(sub, "help")) {
-        // `velora help examples` / `velora --help examples` → only the examples section
+        // `avm help examples` / `avm --help examples` → only the examples section
         if (rest.len > 0 and (eql(rest[0], "examples") or eql(rest[0], "example") or eql(rest[0], "ex"))) {
             printExamples(lang);
             return error.HelpRequested;
@@ -237,13 +237,13 @@ pub fn parseArgs(_: std.mem.Allocator, raw_argv: []const [:0]const u8) ParseErro
             printHelp(lang);
             return error.HelpRequested;
         }
-        // velora use <alias> [model]  or  velora use <type> <alias> [model]
+        // avm use <alias> [model]  or  avm use <type> <alias> [model]
         if (rest.len < 1) return error.InvalidArgument;
         if (SiteType.fromString(rest[0])) |st| {
             if (rest.len < 2) return error.InvalidArgument;
             config.command = .{ .use = .{ .site_type = st, .alias = rest[1], .model = if (rest.len >= 3) rest[2] else null } };
         } else {
-            // velora use <alias> [model] - auto-detect type from stored site
+            // avm use <alias> [model] - auto-detect type from stored site
             config.command = .{ .use = .{ .site_type = null, .alias = rest[0], .model = if (rest.len >= 2) rest[1] else null } };
         }
     } else if (eql(sub, "set") or eql(sub, "s")) {
@@ -251,7 +251,7 @@ pub fn parseArgs(_: std.mem.Allocator, raw_argv: []const [:0]const u8) ParseErro
             printHelp(lang);
             return error.HelpRequested;
         }
-        // velora set <key> <value>  /  velora s mc off
+        // avm set <key> <value>  /  avm s mc off
         if (rest.len < 2) return error.InvalidArgument;
         config.command = .{ .set = .{ .key = expandSettingKey(rest[0]), .value = rest[1] } };
     } else if (eql(sub, "models") or eql(sub, "m")) {
@@ -259,7 +259,7 @@ pub fn parseArgs(_: std.mem.Allocator, raw_argv: []const [:0]const u8) ParseErro
             printHelp(lang);
             return error.HelpRequested;
         }
-        // velora models <alias>  /  velora m <alias>
+        // avm models <alias>  /  avm m <alias>
         if (rest.len < 1) return error.InvalidArgument;
         config.command = .{ .models = .{ .alias = rest[0] } };
     } else if (eql(sub, "test") or eql(sub, "t")) {
@@ -267,7 +267,7 @@ pub fn parseArgs(_: std.mem.Allocator, raw_argv: []const [:0]const u8) ParseErro
             printHelp(lang);
             return error.HelpRequested;
         }
-        // velora test [alias] [-p|--perf]
+        // avm test [alias] [-p|--perf]
         var args_out: TestArgs = .{};
         for (rest) |arg| {
             if (eql(arg, "-p") or eql(arg, "--perf") or eql(arg, "--bench")) {
@@ -307,7 +307,7 @@ pub fn parseArgs(_: std.mem.Allocator, raw_argv: []const [:0]const u8) ParseErro
 fn parseAdd(rest: []const []const u8) ParseError!Command {
     if (rest.len == 0) return error.InvalidArgument;
 
-    // Check if first arg is a type (cx/cc) -> direct mode: velora add<type> <alias> <url> <key> [model]
+    // Check if first arg is a type (cx/cc) -> direct mode: avm add<type> <alias> <url> <key> [model]
     if (SiteType.fromString(rest[0])) |st| {
         if (rest.len >= 4) {
             return .{ .add = .{
@@ -318,7 +318,7 @@ fn parseAdd(rest: []const []const u8) ParseError!Command {
                 .model = if (rest.len >= 5) rest[4] else null,
             } };
         }
-        // velora add<type> <alias> -> interactive with type pre-set
+        // avm add<type> <alias> -> interactive with type pre-set
         if (rest.len >= 2) {
             return .{ .add = .{
                 .alias = rest[1],
@@ -328,19 +328,19 @@ fn parseAdd(rest: []const []const u8) ParseError!Command {
         return error.InvalidArgument;
     }
 
-    // velora add<alias> -> fully interactive
+    // avm add<alias> -> fully interactive
     return .{ .add = .{
         .alias = rest[0],
     } };
 }
 
 fn parseUse(st: SiteType, rest: []const []const u8) ParseError!Command {
-    // veloracx use <alias> [model] or veloracx <alias> [model]
+    // avm cx use <alias> [model] or avm cx <alias> [model]
     if (rest.len >= 2 and eql(rest[0], "use")) {
         return .{ .use = .{ .site_type = st, .alias = rest[1], .model = if (rest.len >= 3) rest[2] else null } };
     }
     if (rest.len >= 1 and !eql(rest[0], "use")) {
-        // veloracx <alias> [model] (shorthand)
+        // avm cx <alias> [model] (shorthand)
         return .{ .use = .{ .site_type = st, .alias = rest[0], .model = if (rest.len >= 2) rest[1] else null } };
     }
     return error.InvalidArgument;
@@ -396,14 +396,14 @@ fn printHelp(lang: i18n.Language) void {
     const reset = if (caps.color) output.Color.reset else "";
 
     const title = switch (lang) {
-        .zh => "velora - 多站点 API Key 管理器",
-        .ja => "velora - マルチサイト APIキー マネージャー",
-        .en => "velora - Multi-Site API Key Manager",
+        .zh => "avm - 多站点 API Key 管理器",
+        .ja => "avm - マルチサイト APIキー マネージャー",
+        .en => "avm - Multi-Site API Key Manager",
     };
 
     const body = switch (lang) {
         .zh =>
-        \\用法: velora <命令> [参数]
+        \\用法: avm <命令> [参数]
         \\
         \\站点:
         \\  add <别名>
@@ -429,7 +429,7 @@ fn printHelp(lang: i18n.Language) void {
         \\
         ,
         .ja =>
-        \\使い方: velora <コマンド> [引数]
+        \\使い方: avm <コマンド> [引数]
         \\
         \\サイト:
         \\  add <エイリアス>
@@ -455,7 +455,7 @@ fn printHelp(lang: i18n.Language) void {
         \\
         ,
         .en =>
-        \\Usage: velora <command> [args]
+        \\Usage: avm <command> [args]
         \\
         \\Sites:
         \\  add <alias>
@@ -505,130 +505,130 @@ fn printExamples(lang: i18n.Language) void {
     const reset = if (caps.color) output.Color.reset else "";
 
     const title = switch (lang) {
-        .zh => "velora 用法示例",
-        .ja => "velora 使用例",
-        .en => "velora usage examples",
+        .zh => "avm 用法示例",
+        .ja => "avm 使用例",
+        .en => "avm usage examples",
     };
 
     const body = switch (lang) {
         .zh =>
         \\添加 / 编辑 / 删除站点:
-        \\  velora add openai                              # 交互式添加
-        \\  velora add cx openai https://api.example.com/v1 sk-xxx
-        \\  velora add cc claude https://api.example.com sk-ant claude-opus-4-6
-        \\  velora edit openai                             # 编辑现有站点
-        \\  velora del openai                              # 删除站点
+        \\  avm add openai                              # 交互式添加
+        \\  avm add cx openai https://api.example.com/v1 sk-xxx
+        \\  avm add cc claude https://api.example.com sk-ant claude-opus-4-6
+        \\  avm edit openai                             # 编辑现有站点
+        \\  avm del openai                              # 删除站点
         \\
         \\应用站点到工具:
-        \\  velora use openai                              # 自动选默认工具
-        \\  velora use cc openai claude-opus-4-6           # 指定目标工具+模型
-        \\  velora cx use openai                           # 缩写: 应用到 Codex
-        \\  velora cc use claude
-        \\  velora oc use openai claude-haiku-4-5-20251001
-        \\  velora nb use openai
-        \\  velora ow use openai
+        \\  avm use openai                              # 自动选默认工具
+        \\  avm use cc openai claude-opus-4-6           # 指定目标工具+模型
+        \\  avm cx use openai                           # 缩写: 应用到 Codex
+        \\  avm cc use claude
+        \\  avm oc use openai claude-haiku-4-5-20251001
+        \\  avm nb use openai
+        \\  avm ow use openai
         \\
         \\查看站点列表:
-        \\  velora list                                    # 默认: 并行连通性检测 + [← 当前使用工具] 标签
-        \\  velora list -g                                 # 含已归档站点
-        \\  velora list all                                # 详细信息（base_url, key, model）
-        \\  velora list --sort=alpha                       # 排序: time / alpha / tool / model
-        \\  velora list -s tool
+        \\  avm list                                    # 默认: 并行连通性检测 + [← 当前使用工具] 标签
+        \\  avm list -g                                 # 含已归档站点
+        \\  avm list all                                # 详细信息（base_url, key, model）
+        \\  avm list --sort=alpha                       # 排序: time / alpha / tool / model
+        \\  avm list -s tool
         \\
         \\模型调用测试 (新增):
-        \\  velora t                                       # 并行测试所有站点的模型可调用性
-        \\  velora t openai                                # 测试单个站点
-        \\  velora t --perf                                # 性能基准测试 (交互式选择站点)
+        \\  avm t                                       # 并行测试所有站点的模型可调用性
+        \\  avm t openai                                # 测试单个站点
+        \\  avm t --perf                                # 性能基准测试 (交互式选择站点)
         \\
         \\浏览模型 / 设置:
-        \\  velora m openai
-        \\  velora s mc off                                # 关闭 use 时模型检测
-        \\  velora s ll off                                # 关闭 list 时延迟检测
-        \\  velora s aa on                                 # 开启自动归档
-        \\  velora s ap off                                # 关闭类型不匹配时的自动兼容模型选择
-        \\  velora s alm off                               # 关闭添加/编辑时自动加载模型列表
-        \\  velora s msm keyboard                          # 使用方向键选择模型
-        \\  velora s ls alpha                              # 默认列表排序按 alpha
+        \\  avm m openai
+        \\  avm s mc off                                # 关闭 use 时模型检测
+        \\  avm s ll off                                # 关闭 list 时延迟检测
+        \\  avm s aa on                                 # 开启自动归档
+        \\  avm s ap off                                # 关闭类型不匹配时的自动兼容模型选择
+        \\  avm s alm off                               # 关闭添加/编辑时自动加载模型列表
+        \\  avm s msm keyboard                          # 使用方向键选择模型
+        \\  avm s ls alpha                              # 默认列表排序按 alpha
         \\
         ,
         .ja =>
         \\サイトの追加 / 編集 / 削除:
-        \\  velora add openai                              # 対話式で追加
-        \\  velora add cx openai https://api.example.com/v1 sk-xxx
-        \\  velora add cc claude https://api.example.com sk-ant claude-opus-4-6
-        \\  velora edit openai                             # 既存サイトを編集
-        \\  velora del openai                              # サイト削除
+        \\  avm add openai                              # 対話式で追加
+        \\  avm add cx openai https://api.example.com/v1 sk-xxx
+        \\  avm add cc claude https://api.example.com sk-ant claude-opus-4-6
+        \\  avm edit openai                             # 既存サイトを編集
+        \\  avm del openai                              # サイト削除
         \\
         \\ツールへ適用:
-        \\  velora use openai                              # デフォルトツールへ自動適用
-        \\  velora use cc openai claude-opus-4-6           # ツールとモデルを指定
-        \\  velora cx use openai                           # 略記: Codex へ適用
-        \\  velora cc use claude
-        \\  velora oc use openai claude-haiku-4-5-20251001
-        \\  velora nb use openai
-        \\  velora ow use openai
+        \\  avm use openai                              # デフォルトツールへ自動適用
+        \\  avm use cc openai claude-opus-4-6           # ツールとモデルを指定
+        \\  avm cx use openai                           # 略記: Codex へ適用
+        \\  avm cc use claude
+        \\  avm oc use openai claude-haiku-4-5-20251001
+        \\  avm nb use openai
+        \\  avm ow use openai
         \\
         \\サイト一覧:
-        \\  velora list                                    # 並列接続テスト + [← 使用中ツール] タグ
-        \\  velora list -g                                 # アーカイブ済みも含む
-        \\  velora list all                                # 詳細表示
-        \\  velora list --sort=alpha                       # ソート: time / alpha / tool / model
-        \\  velora list -s tool
+        \\  avm list                                    # 並列接続テスト + [← 使用中ツール] タグ
+        \\  avm list -g                                 # アーカイブ済みも含む
+        \\  avm list all                                # 詳細表示
+        \\  avm list --sort=alpha                       # ソート: time / alpha / tool / model
+        \\  avm list -s tool
         \\
         \\モデル呼び出しテスト (新機能):
-        \\  velora t                                       # 全サイトのモデル呼び出しを並列検証
-        \\  velora t openai                                # 単一サイトのテスト
-        \\  velora t --perf                                # ベンチマーク (対話的にサイト選択)
+        \\  avm t                                       # 全サイトのモデル呼び出しを並列検証
+        \\  avm t openai                                # 単一サイトのテスト
+        \\  avm t --perf                                # ベンチマーク (対話的にサイト選択)
         \\
         \\モデル一覧 / 設定:
-        \\  velora m openai
-        \\  velora s mc off                                # use 時のモデル検出を無効
-        \\  velora s ll off                                # list 時の遅延チェックを無効
-        \\  velora s aa on                                 # 自動アーカイブを有効
-        \\  velora s ap off                                # 互換モデル自動選択を無効
-        \\  velora s alm off                               # 追加/編集時のモデル一覧自動取得を無効
-        \\  velora s msm keyboard                          # 矢印キーでモデル選択
-        \\  velora s ls alpha                              # 既定ソートを alpha に
+        \\  avm m openai
+        \\  avm s mc off                                # use 時のモデル検出を無効
+        \\  avm s ll off                                # list 時の遅延チェックを無効
+        \\  avm s aa on                                 # 自動アーカイブを有効
+        \\  avm s ap off                                # 互換モデル自動選択を無効
+        \\  avm s alm off                               # 追加/編集時のモデル一覧自動取得を無効
+        \\  avm s msm keyboard                          # 矢印キーでモデル選択
+        \\  avm s ls alpha                              # 既定ソートを alpha に
         \\
         ,
         .en =>
         \\Add / edit / remove sites:
-        \\  velora add openai                              # interactive add
-        \\  velora add cx openai https://api.example.com/v1 sk-xxx
-        \\  velora add cc claude https://api.example.com sk-ant claude-opus-4-6
-        \\  velora edit openai                             # edit an existing site
-        \\  velora del openai                              # remove a site
+        \\  avm add openai                              # interactive add
+        \\  avm add cx openai https://api.example.com/v1 sk-xxx
+        \\  avm add cc claude https://api.example.com sk-ant claude-opus-4-6
+        \\  avm edit openai                             # edit an existing site
+        \\  avm del openai                              # remove a site
         \\
         \\Apply a site to a tool:
-        \\  velora use openai                              # auto-pick default tool
-        \\  velora use cc openai claude-opus-4-6           # explicit tool + model override
-        \\  velora cx use openai                           # short form: apply to Codex
-        \\  velora cc use claude
-        \\  velora oc use openai claude-haiku-4-5-20251001
-        \\  velora nb use openai
-        \\  velora ow use openai
+        \\  avm use openai                              # auto-pick default tool
+        \\  avm use cc openai claude-opus-4-6           # explicit tool + model override
+        \\  avm cx use openai                           # short form: apply to Codex
+        \\  avm cc use claude
+        \\  avm oc use openai claude-haiku-4-5-20251001
+        \\  avm nb use openai
+        \\  avm ow use openai
         \\
         \\Listing sites:
-        \\  velora list                                    # parallel reachability check + [← in-use] tag
-        \\  velora list -g                                 # include archived sites
-        \\  velora list all                                # full details (base_url, key, model)
-        \\  velora list --sort=alpha                       # sort: time / alpha / tool / model
-        \\  velora list -s tool
+        \\  avm list                                    # parallel reachability check + [← in-use] tag
+        \\  avm list -g                                 # include archived sites
+        \\  avm list all                                # full details (base_url, key, model)
+        \\  avm list --sort=alpha                       # sort: time / alpha / tool / model
+        \\  avm list -s tool
         \\
         \\Model call tests (new):
-        \\  velora t                                       # test every site's model in parallel
-        \\  velora t openai                                # single-site test
-        \\  velora t --perf                                # interactive benchmark (multi-select)
+        \\  avm t                                       # test every site's model in parallel
+        \\  avm t openai                                # single-site test
+        \\  avm t --perf                                # interactive benchmark (multi-select)
         \\
         \\Browse models / settings:
-        \\  velora m openai
-        \\  velora s mc off                                # disable model detection on use
-        \\  velora s ll off                                # disable latency check on list
-        \\  velora s aa on                                 # enable auto-archive
-        \\  velora s ap off                                # disable compatible-model auto-pick
-        \\  velora s alm off                               # disable model-list picker on add/edit
-        \\  velora s msm keyboard                          # choose models with arrow keys
-        \\  velora s ls alpha                              # default list sort to alpha
+        \\  avm m openai
+        \\  avm s mc off                                # disable model detection on use
+        \\  avm s ll off                                # disable latency check on list
+        \\  avm s aa on                                 # enable auto-archive
+        \\  avm s ap off                                # disable compatible-model auto-pick
+        \\  avm s alm off                               # disable model-list picker on add/edit
+        \\  avm s msm keyboard                          # choose models with arrow keys
+        \\  avm s ls alpha                              # default list sort to alpha
         \\
         ,
     };
@@ -644,9 +644,9 @@ fn printVersion(lang: i18n.Language) void {
     const w = io_compat.stdoutWriter(&stdout_buffer, &stdout_writer);
 
     switch (lang) {
-        .zh => w.print("VELORAv{s} - 多站点 API Key 管理器\n", .{main_mod.version}) catch {},
-        .ja => w.print("VELORAv{s} - マルチサイト APIキー マネージャー\n", .{main_mod.version}) catch {},
-        .en => w.print("VELORAv{s} - Multi-Site API Key Manager\n", .{main_mod.version}) catch {},
+        .zh => w.print("avm v{s} - 多站点 API Key 管理器\n", .{main_mod.version}) catch {},
+        .ja => w.print("avm v{s} - マルチサイト APIキー マネージャー\n", .{main_mod.version}) catch {},
+        .en => w.print("avm v{s} - Multi-Site API Key Manager\n", .{main_mod.version}) catch {},
     }
     w.flush() catch {};
 }

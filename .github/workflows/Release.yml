@@ -1,4 +1,4 @@
-﻿name: Build & Release
+name: Build & Release
 
 on:
   push:
@@ -72,7 +72,7 @@ jobs:
           zig build --release=fast
           mkdir -p release
           cd zig-out/bin
-          for f in velora-*; do
+          for f in avm-*; do
             [ -f "$f" ] || continue
             case "$f" in
               *.pdb)
@@ -141,7 +141,7 @@ jobs:
             done
             echo ""
             echo "---"
-            echo "> **Linux/macOS/FreeBSD**: download the raw binary, add execute permission if needed, then run \`--install\` | **Windows**: run \`velora-*.exe --install\` directly | **Alpine**: choose \`velora-alpine-*\` (musl)"
+            echo "> **Linux/macOS/FreeBSD**: download the raw binary, add execute permission if needed, then run \`--install\` | **Windows**: run \`avm-*.exe --install\` directly | **Alpine**: choose \`avm-alpine-*\` (musl)"
             echo "EOF"
           } >> $GITHUB_OUTPUT
 
